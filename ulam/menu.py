@@ -133,7 +133,7 @@ def _configure_prover(config: dict) -> None:
     prove["mode"] = mode
     solver = _prompt(
         "Default solver (auto|search|script)",
-        default=prove.get("solver", "auto"),
+        default=prove.get("solver", "script"),
     ).strip().lower()
     if solver not in {"auto", "search", "script"}:
         solver = "auto"
@@ -342,7 +342,7 @@ def _build_args_from_config(
         instruction=instruction,
         context=context_files,
         prove_mode=prove.get("mode", "tactic"),
-        solver=prove.get("solver", "auto"),
+        solver=prove.get("solver", "script"),
         lemma_max=int(prove.get("lemma_max", 60)),
         lemma_depth=int(prove.get("lemma_depth", 60)),
         openai_key=openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", ""),
