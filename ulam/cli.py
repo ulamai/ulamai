@@ -327,6 +327,8 @@ def run_prove(args: argparse.Namespace) -> None:
         print("by")
         for line in result.proof:
             print(f"  {line}")
+        if _write_proof_to_file(args.file, args.theorem, result.proof):
+            print(f"Wrote proof to: {args.file}")
         return
 
     print("Failed to solve.")
@@ -814,6 +816,37 @@ def _is_lean_mismatch_error(exc: Exception) -> bool:
         or "lean version mismatch" in text
         or "server failed to emit ready signal" in text
     )
+
+
+def _write_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> bool:
+    if not proof:
+        return False
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    match = re.search(rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b", text)
+    if match is None:
+        return False
+    sorry_match = re.search(r"\bsorry\b", text[match.start() :])
+    if sorry_match is None:
+        return False
+    start = match.start() + sorry_match.start()
+    end = match.start() + sorry_match.end()
+    line_start = text.rfind("\n", 0, start) + 1
+    indent = text[line_start:start]
+    prefix = text[:start]
+    has_by = re.search(r":=\s*by\s*$", prefix) is not None or re.search(r"\bby\s*$", prefix) is not None
+    if has_by:
+        proof_block = "\n".join(f"{indent}{line}" for line in proof)
+    else:
+        proof_block = "by\n" + "\n".join(f"{indent}{line}" for line in proof)
+    new_text = text[:start] + proof_block + text[end:]
+    try:
+        file_path.write_text(new_text, encoding="utf-8")
+    except Exception:
+        return False
+    return True
 
 
 def _preflight_lean_alignment(args: argparse.Namespace) -> None:
