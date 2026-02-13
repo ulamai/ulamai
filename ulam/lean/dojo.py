@@ -33,13 +33,35 @@ class LeanDojoRunner(LeanRunner):
         self._states: dict[str, Any] = {}
 
     def start(self, file_path: Path, theorem: str) -> ProofState:
+        text = file_path.read_text(encoding="utf-8")
+        file_imports, body_text = _split_imports(text)
+        strip_imports, cleaned_body = _strip_import_lines(body_text)
+        merged_imports = file_imports + [imp for imp in strip_imports if imp not in file_imports]
+        imports = self._config.imports or merged_imports or None
+
         if self._server is None:
             project_path = self._config.project_path or _find_project_root(file_path)
-            self._server = _create_server(self._Server, project_path, self._config.imports)
+            self._server = _create_server(self._Server, project_path, imports)
 
-        text = file_path.read_text(encoding="utf-8")
-        target_index = _find_target_sorry_index(text, theorem)
-        units = _load_sorries(self._server, text)
+        text_for_dojo = cleaned_body if merged_imports else text
+        try:
+            target_index = _find_target_sorry_index(text_for_dojo, theorem)
+        except RuntimeError as exc:
+            found = _list_theorems(text_for_dojo)
+            if len(found) == 1:
+                print(
+                    f"Warning: theorem `{theorem}` not found; using `{found[0]}` from {file_path}."
+                )
+                target_index = _find_target_sorry_index(text_for_dojo, found[0])
+            else:
+                found_msg = "none" if not found else ", ".join(found[:10])
+                if len(found) > 10:
+                    found_msg += ", ..."
+                raise RuntimeError(
+                    f"{exc} Found theorems: {found_msg}. "
+                    "Ensure the file contains the target theorem."
+                ) from exc
+        units = _load_sorries(self._server, text_for_dojo)
         if target_index >= len(units):
             raise RuntimeError(
                 f"Expected at least {target_index + 1} `sorry` goals, found {len(units)}. "
@@ -119,17 +141,21 @@ def _create_server(Server: Any, project_path: Path, imports: Optional[list[str]]
 
 def _find_project_root(file_path: Path) -> Path:
     for parent in [file_path.parent, *file_path.parents]:
-        if (parent / "lakefile.lean").exists() or (parent / "lean-toolchain").exists():
+        if (
+            (parent / "lakefile.lean").exists()
+            or (parent / "lakefile.toml").exists()
+            or (parent / "lean-toolchain").exists()
+        ):
             return parent
     return file_path.parent
 
 
 def _find_target_sorry_index(text: str, theorem: str) -> int:
-    match = re.search(rf"\\b(theorem|lemma|example)\\s+{re.escape(theorem)}\\b", text)
+    match = re.search(rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b", text)
     if match is None:
         raise RuntimeError(f"Could not find theorem `{theorem}` in file.")
 
-    pattern = re.compile(r"\\bsorry\\b")
+    pattern = re.compile(r"\bsorry\b")
     prefix = text[: match.start()]
     prefix_count = len(pattern.findall(prefix))
     suffix = text[match.start() :]
@@ -140,6 +166,60 @@ def _find_target_sorry_index(text: str, theorem: str) -> int:
             "Add a `sorry` placeholder for LeanDojoRunner."
         )
     return prefix_count
+
+
+def _list_theorems(text: str) -> list[str]:
+    names: list[str] = []
+    for match in re.finditer(r"\b(?:theorem|lemma|example)\s+([A-Za-z0-9_']+)\b", text):
+        names.append(match.group(1))
+    return names
+
+
+def _split_imports(text: str) -> tuple[list[str], str]:
+    lines = text.splitlines()
+    imports: list[str] = []
+    body: list[str] = []
+    in_header = True
+    in_block_comment = False
+
+    for line in lines:
+        stripped = line.strip()
+        if in_header:
+            if in_block_comment:
+                if "-/" in stripped:
+                    in_block_comment = False
+                continue
+            if not stripped:
+                continue
+            if stripped.startswith("--"):
+                continue
+            if stripped.startswith("/-"):
+                if "-/" not in stripped:
+                    in_block_comment = True
+                continue
+            if stripped.startswith("import "):
+                remainder = stripped[len("import ") :].strip()
+                if remainder:
+                    imports.extend(remainder.split())
+                continue
+            in_header = False
+        body.append(line)
+
+    return imports, "\n".join(body).lstrip("\n")
+
+
+def _strip_import_lines(text: str) -> tuple[list[str], str]:
+    imports: list[str] = []
+    body: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("import "):
+            remainder = stripped[len("import ") :].strip()
+            if remainder:
+                imports.extend(remainder.split())
+            continue
+        body.append(line)
+    return imports, "\n".join(body).lstrip("\n")
 
 
 def _load_sorries(server: Any, text: str) -> list[Any]:
