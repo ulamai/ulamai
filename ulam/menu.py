@@ -31,9 +31,10 @@ def run_menu() -> None:
         print("1. Configure LLM (Codex/OpenAI, Claude, Ollama)")
         print("2. Prove with natural language guidance")
         print("3. Formalize .tex to Lean")
-        print("4. Exit")
+        print("4. Settings")
+        print("5. Exit")
         print()
-        choice = _prompt("Select option", default="4")
+        choice = _prompt("Select option", default="5")
         if choice == "1":
             _configure_llm(config)
             save_config(config)
@@ -45,6 +46,10 @@ def run_menu() -> None:
             _menu_formalize(config)
             continue
         if choice == "4":
+            _configure_prover(config)
+            save_config(config)
+            continue
+        if choice == "5":
             print("Goodbye.")
             return
         print("Invalid choice.\n")
@@ -120,6 +125,32 @@ def _configure_ollama(config: dict) -> None:
     section["model"] = _prompt("Model", default=section.get("model", "llama3.1"))
 
 
+def _configure_prover(config: dict) -> None:
+    prove = config.setdefault("prove", {})
+    mode = _prompt("Default proof mode (tactic|lemma)", default=prove.get("mode", "tactic")).strip().lower()
+    if mode not in {"tactic", "lemma"}:
+        mode = "tactic"
+    prove["mode"] = mode
+    solver = _prompt(
+        "Default solver (auto|search|script)",
+        default=prove.get("solver", "auto"),
+    ).strip().lower()
+    if solver not in {"auto", "search", "script"}:
+        solver = "auto"
+    prove["solver"] = solver
+    lemma_max = _prompt("Lemma max count", default=str(prove.get("lemma_max", 60))).strip()
+    lemma_depth = _prompt("Lemma max depth", default=str(prove.get("lemma_depth", 60))).strip()
+    try:
+        prove["lemma_max"] = max(1, int(lemma_max))
+    except Exception:
+        prove["lemma_max"] = 60
+    try:
+        prove["lemma_depth"] = max(1, int(lemma_depth))
+    except Exception:
+        prove["lemma_depth"] = 60
+    print("\nSaved prover settings.\n")
+
+
 def _menu_prove(config: dict) -> None:
     instruction = _prompt_multiline("Enter guidance for the prover")
     print("Optional: provide a Lean file path to run immediately, or leave blank to auto-generate from text.")
@@ -127,6 +158,14 @@ def _menu_prove(config: dict) -> None:
     theorem = ""
     extra_paths = _prompt("Additional context files (.lean/.tex), comma-separated", default="")
     context_files = _parse_paths(extra_paths)
+    prove_defaults = config.get("prove", {})
+    prove_mode = _prompt(
+        "Proof mode (tactic|lemma)", default=prove_defaults.get("mode", "tactic")
+    ).strip().lower()
+    if prove_mode not in {"tactic", "lemma"}:
+        prove_mode = "tactic"
+    config.setdefault("prove", {})["mode"] = prove_mode
+    save_config(config)
 
     if file_path:
         theorem = _prompt("Theorem name", default="").strip()
@@ -195,6 +234,7 @@ def _menu_prove(config: dict) -> None:
         return
 
     args = _build_args_from_config(config, file_path, theorem, instruction, context_files)
+    args.prove_mode = prove_mode
     if lean_project is None:
         args.lean = "mock"
         args.lean_project = None
@@ -275,6 +315,7 @@ def _build_args_from_config(
     anthropic = config.get("anthropic", {})
     embed = config.get("embed", {})
     lean = config.get("lean", {})
+    prove = config.get("prove", {})
     openai_model = openai.get("model", "gpt-4.1")
     if provider == "codex_cli":
         openai_model = openai.get("codex_model") or openai_model or _default_codex_model(openai)
@@ -300,6 +341,10 @@ def _build_args_from_config(
         trace=Path("run.jsonl"),
         instruction=instruction,
         context=context_files,
+        prove_mode=prove.get("mode", "tactic"),
+        solver=prove.get("solver", "auto"),
+        lemma_max=int(prove.get("lemma_max", 60)),
+        lemma_depth=int(prove.get("lemma_depth", 60)),
         openai_key=openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", ""),
         openai_base_url=openai.get("base_url", "https://api.openai.com"),
         openai_model=openai_model,
@@ -377,7 +422,7 @@ def _generate_lean_stub(
     if not lean_statement:
         raise RuntimeError("LLM did not return a Lean statement.")
 
-    lean_code = _wrap_statement(theorem, lean_statement)
+    lean_code = _wrap_statement(theorem, lean_statement, original=statement)
     output_path = _generated_lean_path(config, theorem)
     output_path.write_text(lean_code, encoding="utf-8")
     return output_path
@@ -396,14 +441,18 @@ def _generated_lean_path(config: dict, theorem: str) -> Path:
     return out_dir / f"{safe}_{timestamp}.lean"
 
 
-def _wrap_statement(theorem: str, statement: str) -> str:
+def _wrap_statement(theorem: str, statement: str, original: str | None = None) -> str:
     stmt = statement.strip().rstrip(".")
     if not stmt:
         return ""
+    header = ""
+    if original:
+        header = "/- ULAMAI_ORIGINAL_STATEMENT\n" + original.strip() + "\n-/\n\n"
     return (
-        "import Mathlib\n\n"
-        f"theorem {theorem} : {stmt} := by\n"
-        "  sorry\n"
+        header
+        + "import Mathlib\n\n"
+        + f"theorem {theorem} : {stmt} := by\n"
+        + "  sorry\n"
     )
 
 

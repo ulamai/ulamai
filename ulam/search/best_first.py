@@ -31,6 +31,7 @@ def best_first_search(
     retriever: Retriever,
     trace: TraceLogger,
     config: RunConfig,
+    mode: str = "tactic",
 ) -> SearchResult:
     initial_state = runner.start(config.file_path, config.theorem)
     _log(config, f"[init] state={initial_state.key}")
@@ -55,6 +56,7 @@ def best_first_search(
             config.suggestions_per_state,
             instruction=config.instruction,
             context=config.context,
+            mode=mode,
         )
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
@@ -95,6 +97,7 @@ def best_first_search(
                     failed_tactic=tactic,
                     error=result.error or "unknown error",
                     config=config,
+                    mode=mode,
                 )
                 if repaired.solved:
                     return SearchResult(True, node.proof + [repaired.tactic], steps, None)
@@ -127,6 +130,7 @@ def _attempt_repair(
     failed_tactic: str,
     error: str,
     config: RunConfig,
+    mode: str = "tactic",
 ) -> _RepairResult:
     retrieved = retriever.retrieve(state, k=8)
     suggestions = llm.repair(
@@ -137,6 +141,7 @@ def _attempt_repair(
         config.repair_attempts,
         instruction=config.instruction,
         context=config.context,
+        mode=mode,
     )
     for tactic in suggestions:
         cache_key = (state.key, tactic)
@@ -153,6 +158,88 @@ def _attempt_repair(
         if result.ok and result.new_state is not None:
             return _RepairResult(False, tactic, result.new_state)
     return _RepairResult(False, failed_tactic, None)
+
+
+def scripted_search(
+    runner,
+    llm: LLMClient,
+    retriever: Retriever,
+    trace: TraceLogger,
+    config: RunConfig,
+) -> SearchResult:
+    state = runner.start(config.file_path, config.theorem)
+    _log(config, f"[init] state={state.key}")
+    if config.instruction:
+        _log(config, f"[instruction] {config.instruction}")
+
+    proof: list[str] = []
+    steps = 0
+    last_error: str | None = None
+    last_tactic: str | None = None
+    repair_budget = config.repair_attempts
+
+    while steps < config.max_steps:
+        _log(config, f"[state] {state.key} {_summarize_state(state.pretty)}")
+        retrieved = retriever.retrieve(state, k=8)
+        if retrieved:
+            _log(config, f"[retriever] {len(retrieved)} premises")
+        if last_error and repair_budget > 0:
+            _log(config, "[repair] requesting script")
+            suggestions = llm.repair(
+                state,
+                retrieved,
+                last_tactic or "",
+                last_error,
+                config.suggestions_per_state,
+                instruction=config.instruction,
+                context=config.context,
+                mode="script",
+            )
+            repair_budget -= 1
+        else:
+            _log(config, f"[llm] requesting script ({config.suggestions_per_state} lines)")
+            suggestions = llm.propose(
+                state,
+                retrieved,
+                config.suggestions_per_state,
+                instruction=config.instruction,
+                context=config.context,
+                mode="script",
+            )
+            repair_budget = config.repair_attempts
+
+        if suggestions:
+            _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
+        else:
+            return SearchResult(False, proof, steps, "LLM returned no tactics")
+
+        progressed = False
+        for tactic in suggestions:
+            if steps >= config.max_steps:
+                break
+            result = runner.apply(state, tactic, config.timeout_s)
+            steps += 1
+            trace.log_step(_step_from_result(state, tactic, result, cached=False))
+            _log(config, _format_result(tactic, result, cached=False))
+            if result.ok and result.is_solved:
+                proof.append(tactic)
+                return SearchResult(True, proof, steps, None)
+            if result.ok and result.new_state is not None:
+                proof.append(tactic)
+                state = result.new_state
+                last_error = None
+                last_tactic = None
+                progressed = True
+                continue
+
+            last_error = result.error or "unknown error"
+            last_tactic = tactic
+            break
+
+        if not progressed and last_error and repair_budget <= 0:
+            return SearchResult(False, proof, steps, last_error)
+
+    return SearchResult(False, proof, steps, "Search exhausted or max steps reached")
 
 
 def _step_from_result(

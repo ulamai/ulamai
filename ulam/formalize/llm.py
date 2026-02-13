@@ -36,6 +36,46 @@ class FormalizationLLM:
         prompt = _build_statement_repair_prompt(lean_code, name, tex_statement, context)
         return self._call(prompt)
 
+    def plan_lemmas(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        original_statement: str,
+        context: str,
+    ) -> str:
+        prompt = _build_lemma_plan_prompt(
+            theorem_name, theorem_statement, original_statement, context
+        )
+        return self._call(prompt)
+
+    def expand_lemmas(
+        self,
+        lemma_name: str,
+        lemma_statement: str,
+        last_goal: str,
+        failures: list[str],
+        successes: list[str],
+        context: str,
+    ) -> str:
+        prompt = _build_lemma_expand_prompt(
+            lemma_name, lemma_statement, last_goal, failures, successes, context
+        )
+        return self._call(prompt)
+
+    def summarize_attempt(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        last_goal: str,
+        failures: list[str],
+        successes: list[str],
+        context: str,
+    ) -> str:
+        prompt = _build_summary_prompt(
+            theorem_name, theorem_statement, last_goal, failures, successes, context
+        )
+        return self._call(prompt)
+
     def _call(self, prompt: str) -> str:
         if self._provider == "openai":
             return _call_openai(self._config, prompt)
@@ -150,6 +190,86 @@ def _build_statement_repair_prompt(lean_code: str, name: str, tex_statement: str
     if context:
         prompt += "Context files:\n" + context + "\n\n"
     prompt += "Return ONLY the updated Lean file."
+    return prompt
+
+
+def _build_lemma_plan_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    original_statement: str,
+    context: str,
+) -> str:
+    prompt = (
+        "You are a Lean 4 assistant. Produce a lemma-first proof plan as Lean code.\n"
+        "- Output Lean code only.\n"
+        "- Introduce helper definitions/lemmas if needed.\n"
+        "- Use `by sorry` for proofs.\n"
+        f"- The final theorem MUST be named `{theorem_name}`.\n"
+        f"- The final theorem statement MUST be: {theorem_statement}\n\n"
+        "Original informal statement:\n"
+        f"{original_statement}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY Lean code."
+    return prompt
+
+
+def _build_lemma_expand_prompt(
+    lemma_name: str,
+    lemma_statement: str,
+    last_goal: str,
+    failures: list[str],
+    successes: list[str],
+    context: str,
+) -> str:
+    failure_block = "\n".join(f"- {item}" for item in failures[:12])
+    success_block = "\n".join(f"- {item}" for item in successes[:12])
+    prompt = (
+        "You are a Lean 4 assistant. Suggest new helper lemmas/defs to prove a stuck lemma.\n"
+        "- Output Lean code only.\n"
+        "- Do NOT restate the target lemma.\n"
+        "- Use `by sorry` for proofs.\n\n"
+        f"Stuck lemma name: {lemma_name}\n"
+        f"Stuck lemma statement:\n{lemma_statement}\n\n"
+        f"Last goal:\n{last_goal}\n\n"
+        "Recent failed tactics/errors:\n"
+        f"{failure_block}\n\n"
+        "Recent successful tactics:\n"
+        f"{success_block}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY Lean code for new helper declarations."
+    return prompt
+
+
+def _build_summary_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    last_goal: str,
+    failures: list[str],
+    successes: list[str],
+    context: str,
+) -> str:
+    failure_block = "\n".join(f"- {item}" for item in failures[:12])
+    success_block = "\n".join(f"- {item}" for item in successes[:12])
+    prompt = (
+        "You are a Lean 4 assistant. Summarize a failed proof attempt and propose next steps.\n"
+        "- Keep it short and actionable.\n"
+        "- Prefer Lean tactics/lemmas likely to work.\n"
+        "- Do not output code fences.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        f"Last goal:\n{last_goal}\n\n"
+        "Recent failed tactics/errors:\n"
+        f"{failure_block}\n\n"
+        "Recent successful tactics:\n"
+        f"{success_block}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return a brief summary and 3-7 next-step suggestions."
     return prompt
 
 
