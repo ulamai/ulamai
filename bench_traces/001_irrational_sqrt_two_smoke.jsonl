@@ -1,0 +1,1 @@
+{"state_key": "mock:irrational_sqrt_two_smoke", "state_pretty": "goal: irrational_sqrt_two_smoke", "tactic": "simpa using irrational_sqrt_two", "ok": true, "error": null, "new_state_key": null, "solved": true, "cached": false}

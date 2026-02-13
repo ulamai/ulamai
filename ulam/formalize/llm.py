@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+from typing import Iterable
+
+
+class FormalizationLLM:
+    def __init__(self, provider: str, config: dict) -> None:
+        self._provider = provider
+        self._config = config
+
+    def statement(self, text: str, context: str) -> str:
+        prompt = _build_statement_prompt(text, context)
+        return self._call(prompt)
+
+    def draft(self, tex: str, context: str, hints: list[str]) -> str:
+        prompt = _build_draft_prompt(tex, context, hints)
+        return self._call(prompt)
+
+    def repair(self, lean_code: str, error: str, context: str) -> str:
+        prompt = _build_repair_prompt(lean_code, error, context)
+        return self._call(prompt)
+
+    def improve(self, lean_code: str, failures: list[str], context: str) -> str:
+        prompt = _build_improve_prompt(lean_code, failures, context)
+        return self._call(prompt)
+
+    def equivalence_check(self, tex_statement: str, lean_statement: str) -> dict:
+        prompt = _build_equivalence_prompt(tex_statement, lean_statement)
+        raw = self._call(prompt)
+        return _parse_equivalence(raw)
+
+    def repair_statement(self, lean_code: str, name: str, tex_statement: str, context: str) -> str:
+        prompt = _build_statement_repair_prompt(lean_code, name, tex_statement, context)
+        return self._call(prompt)
+
+    def _call(self, prompt: str) -> str:
+        if self._provider == "openai":
+            return _call_openai(self._config, prompt)
+        if self._provider == "ollama":
+            return _call_ollama(self._config, prompt)
+        if self._provider == "anthropic":
+            return _call_anthropic(self._config, prompt)
+        if self._provider == "codex_cli":
+            return _call_codex_cli(self._config, prompt)
+        if self._provider == "claude_cli":
+            return _call_claude_cli(self._config, prompt)
+        return ""
+
+
+def _build_draft_prompt(tex: str, context: str, hints: list[str]) -> str:
+    hint_block = "\n\n".join(hints)
+    prompt = (
+        "You are a Lean 4 formalization assistant. Output Lean code only.\n"
+        "Task: formalize the following LaTeX into Lean 4.\n"
+        "- Add missing definitions.\n"
+        "- Use `sorry` for incomplete proofs.\n"
+        "- Keep theorem names stable and human-readable.\n\n"
+        "LaTeX:\n"
+        f"{tex}\n\n"
+    )
+    if hint_block:
+        prompt += "Hints from theorem/proof text:\n" + hint_block + "\n\n"
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY Lean code."
+    return prompt
+
+
+def _build_statement_prompt(text: str, context: str) -> str:
+    prompt = (
+        "You are a Lean 4 formalization assistant.\n"
+        "Convert the following informal statement into a Lean 4 proposition.\n"
+        "- Return ONLY the Lean proposition (type), without `theorem`/`lemma` keywords.\n"
+        "- Do not include any proofs or code fences.\n"
+        "- If the statement is already Lean, return it unchanged.\n\n"
+        "Statement:\n"
+        f"{text}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY the Lean proposition."
+    return prompt
+
+
+def _build_repair_prompt(lean_code: str, error: str, context: str) -> str:
+    prompt = (
+        "You are a Lean 4 formalization assistant. Output Lean code only.\n"
+        "The following Lean file fails to typecheck. Fix it.\n"
+        "- Preserve existing structure where possible.\n"
+        "- If needed, add imports or small helper lemmas.\n\n"
+        "Lean file:\n"
+        f"{lean_code}\n\n"
+        "Lean error:\n"
+        f"{error}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY corrected Lean code."
+    return prompt
+
+
+def _build_improve_prompt(lean_code: str, failures: list[str], context: str) -> str:
+    failure_block = "\n".join(f"- {item}" for item in failures)
+    prompt = (
+        "You are a Lean 4 formalization assistant. Output Lean code only.\n"
+        "Some theorems remain unsolved. Improve the Lean file by:\n"
+        "- Adding missing intermediate lemmas.\n"
+        "- Tweaking statements to match intended informal meaning.\n"
+        "- Preserving already solved proofs.\n\n"
+        "Lean file:\n"
+        f"{lean_code}\n\n"
+        "Unsolved items:\n"
+        f"{failure_block}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY updated Lean code."
+    return prompt
+
+
+def _build_equivalence_prompt(tex_statement: str, lean_statement: str) -> str:
+    prompt = (
+        "You compare informal math statements to Lean statements.\n"
+        "Return a JSON object with fields: match (yes|no|unknown), reason.\n"
+        "Only return JSON.\n\n"
+        "Informal statement:\n"
+        f"{tex_statement}\n\n"
+        "Lean statement:\n"
+        f"{lean_statement}\n"
+    )
+    return prompt
+
+
+def _build_statement_repair_prompt(lean_code: str, name: str, tex_statement: str, context: str) -> str:
+    prompt = (
+        "You are a Lean 4 formalization assistant. Output Lean code only.\n"
+        "Update the statement of the declaration below to match the informal statement.\n"
+        "- Preserve existing proofs where possible.\n"
+        "- If the proof no longer matches, replace with `by sorry`.\n"
+        "- Do not change unrelated declarations.\n\n"
+        f"Declaration name: {name}\n\n"
+        "Informal statement:\n"
+        f"{tex_statement}\n\n"
+        "Current Lean file:\n"
+        f"{lean_code}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    prompt += "Return ONLY the updated Lean file."
+    return prompt
+
+
+def _call_openai(config: dict, prompt: str) -> str:
+    openai = config.get("openai", {})
+    api_key = openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
+    if not api_key:
+        return ""
+    base_url = openai.get("base_url", "https://api.openai.com").rstrip("/")
+    model = openai.get("model", "gpt-4.1")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a Lean 4 formalization assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 3000,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=120.0) as resp:
+        raw = resp.read().decode("utf-8")
+    return _extract_openai(raw)
+
+
+def _call_ollama(config: dict, prompt: str) -> str:
+    ollama = config.get("ollama", {})
+    base_url = ollama.get("base_url", "http://localhost:11434").rstrip("/")
+    model = ollama.get("model", "llama3.1")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a Lean 4 formalization assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120.0) as resp:
+        raw = resp.read().decode("utf-8")
+    return _extract_ollama(raw)
+
+
+def _call_anthropic(config: dict, prompt: str) -> str:
+    anthropic = config.get("anthropic", {})
+    api_key = anthropic.get("api_key", "") or anthropic.get("setup_token", "")
+    api_key = api_key or os.environ.get("ULAM_ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return ""
+    base_url = anthropic.get("base_url", "https://api.anthropic.com").rstrip("/")
+    model = anthropic.get("model", "claude-3-5-sonnet-20240620")
+    payload = {
+        "model": model,
+        "max_tokens": 3000,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/v1/messages",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=120.0) as resp:
+        raw = resp.read().decode("utf-8")
+    return _extract_anthropic(raw)
+
+
+def _extract_openai(raw: str) -> str:
+    data = json.loads(raw)
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    msg = choices[0]
+    if "message" in msg and "content" in msg["message"]:
+        return msg["message"]["content"]
+    if "text" in msg:
+        return msg["text"]
+    return ""
+
+
+def _extract_ollama(raw: str) -> str:
+    data = json.loads(raw)
+    message = data.get("message")
+    if not message or "content" not in message:
+        return ""
+    return message["content"]
+
+
+def _extract_anthropic(raw: str) -> str:
+    data = json.loads(raw)
+    content = data.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "\n".join(parts)
+    return data.get("text", "") if isinstance(data.get("text", ""), str) else ""
+
+
+def _call_codex_cli(config: dict, prompt: str) -> str:
+    from ..llm.cli_utils import codex_exec
+
+    openai = config.get("openai", {})
+    model = openai.get("codex_model") or openai.get("model") or None
+    system = "You are a Lean 4 formalization assistant. Output Lean code only."
+    return codex_exec(system, prompt, model=model)
+
+
+def _call_claude_cli(config: dict, prompt: str) -> str:
+    from ..llm.cli_utils import claude_print
+
+    anthropic = config.get("anthropic", {})
+    model = anthropic.get("claude_model") or anthropic.get("model") or None
+    system = "You are a Lean 4 formalization assistant. Output Lean code only."
+    return claude_print(system, prompt, model=model)
+
+
+def _parse_equivalence(raw: str) -> dict:
+    if not raw.strip():
+        return {"match": "unknown", "reason": "empty response"}
+    text = raw.strip()
+    try:
+        return json.loads(_extract_json(text))
+    except Exception:
+        match = "unknown"
+        reason = "unparsed response"
+        lowered = text.lower()
+        if "match" in lowered and "yes" in lowered:
+            match = "yes"
+        elif "match" in lowered and "no" in lowered:
+            match = "no"
+        return {"match": match, "reason": reason, "raw": text[:400]}
+
+
+def _extract_json(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ulam-prover"
+version = "0.1.0"
+description = "Truth-first Lean 4 theorem prover CLI"
+readme = "readme.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+ulam = "ulam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ulam*"]
