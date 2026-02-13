@@ -90,7 +90,10 @@ class LeanDojoRunner(LeanRunner):
             )
         _ = timeout_s
         try:
-            new_state = self._server.goal_tactic(goal_state, 0, tactic)
+            if _goal_tactic_uses_index(self._server):
+                new_state = self._server.goal_tactic(goal_state, 0, tactic)
+            else:
+                new_state = self._server.goal_tactic(goal_state, tactic)
         except Exception as exc:  # pragma: no cover - depends on external Lean server
             return TacticResult(
                 ok=False,
@@ -137,6 +140,23 @@ def _create_server(Server: Any, project_path: Path, imports: Optional[list[str]]
     if imports and "imports" in sig.parameters:
         kwargs["imports"] = imports
     return Server(**kwargs)
+
+
+def _goal_tactic_uses_index(server: Any) -> bool:
+    try:
+        sig = inspect.signature(server.goal_tactic)
+    except Exception:
+        return False
+    params = list(sig.parameters.values())
+    if len(params) < 3:
+        return False
+    second = params[1].name
+    third = params[2].name if len(params) > 2 else ""
+    if second in {"goal_id", "goalId", "goal", "idx", "index"}:
+        return True
+    if third == "tactic" and second in {"goal", "goal_id", "idx", "index"}:
+        return True
+    return False
 
 
 def _find_project_root(file_path: Path) -> Path:
