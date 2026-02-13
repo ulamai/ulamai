@@ -1,12 +1,12 @@
 Metadata-Version: 2.4
 Name: ulam-prover
-Version: 0.1.0
+Version: 0.1.1
 Summary: Truth-first Lean 4 theorem prover CLI
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 
-# Ulam Prover
+# Ulam AI
 
 A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that combines:
 
@@ -15,7 +15,7 @@ A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that c
 - **Retrieval** (premise selection from mathlib / local repos)
 - **Search + caching** (best-first / beam + transposition table)
 
-Ulam Prover is designed to plug into **Codex / Claude Code / Ollama** (or any OpenAI-compatible endpoint) and produce **machine-checked Lean 4 proofs**.
+Ulam AI is designed to plug into **Codex / Claude Code / Ollama** (or any OpenAI-compatible endpoint) and produce **machine-checked Lean 4 proofs**.
 
 ---
 
@@ -249,15 +249,15 @@ Menu config file:
 
 ## Product description
 
-### What Ulam Prover is
-Ulam Prover is a CLI tool that:
+### What Ulam AI is
+Ulam AI is a CLI tool that:
 1) opens a Lean goal (from a theorem in a file or a snippet),
 2) repeatedly asks an LLM for a **single next action** (tactic line or small lemma),
 3) executes it in Lean,
 4) uses errors as feedback to **repair** and **backtrack**,
 5) returns a final verified Lean proof (or a replayable failure trace).
 
-### What Ulam Prover is *not* (yet)
+### What Ulam AI is *not* (yet)
 - Not an IDE replacement (but it can generate patches you apply in your editor)
 - Not a fully-fledged RL system on day 1
 - Not “autoformalize any paper” out of the gate (that’s a later module)
