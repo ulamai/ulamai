@@ -15,6 +15,7 @@ class LLMClient(ABC):
         k: int,
         instruction: str | None = None,
         context: Iterable[str] | None = None,
+        mode: str = "tactic",
     ) -> list[str]:
         raise NotImplementedError
 
@@ -27,7 +28,19 @@ class LLMClient(ABC):
         k: int,
         instruction: str | None = None,
         context: Iterable[str] | None = None,
+        mode: str = "tactic",
     ) -> list[str]:
-        _ = failed_tactic
-        _ = error
-        return self.propose(state, retrieved, k, instruction=instruction, context=context)
+        extra = (
+            "Previous tactic failed.\n"
+            f"Tactic: {failed_tactic}\n"
+            f"Lean error: {error}\n"
+        )
+        merged = _merge_instruction(instruction, extra)
+        return self.propose(state, retrieved, k, instruction=merged, context=context, mode=mode)
+
+
+def _merge_instruction(instruction: str | None, extra: str) -> str:
+    base = instruction.strip() if instruction else ""
+    if base:
+        return base + "\n\n" + extra
+    return extra

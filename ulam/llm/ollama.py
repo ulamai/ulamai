@@ -22,8 +22,11 @@ class OllamaClient(LLMClient):
         k: int,
         instruction: str | None = None,
         context: Iterable[str] | None = None,
+        mode: str = "tactic",
     ) -> list[str]:
-        system, user = build_prompt(state, retrieved, k, instruction=instruction, context=context)
+        system, user = build_prompt(
+            state, retrieved, k, instruction=instruction, context=context, mode=mode
+        )
         payload = {
             "model": self._model,
             "messages": [

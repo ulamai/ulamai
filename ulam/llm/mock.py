@@ -14,9 +14,11 @@ class MockLLMClient(LLMClient):
         k: int,
         instruction: str | None = None,
         context: Iterable[str] | None = None,
+        mode: str = "tactic",
     ) -> list[str]:
         _ = instruction
         _ = context
+        _ = mode
         suggestions: list[str] = []
         retrieved_text = " ".join(retrieved).lower()
         if "irrational_sqrt_two" in state.pretty or "irrational_sqrt_two" in retrieved_text:

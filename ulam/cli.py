@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .lean.base import LeanRunner
@@ -37,7 +38,7 @@ from .retrieve import (
     OpenAIEmbeddingClient,
     SimpleRetriever,
 )
-from .search import best_first_search
+from .search import best_first_search, scripted_search
 from .trace import TraceLogger
 from .types import RunConfig
 
@@ -113,6 +114,30 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--seed", type=int, default=0)
     prove.add_argument("--trace", type=Path, default=Path("run.jsonl"))
     prove.add_argument("--verbose", action="store_true", help="print search/LLM logs")
+    prove.add_argument(
+        "--prove-mode",
+        choices=["tactic", "lemma"],
+        default="tactic",
+        help="proof search mode",
+    )
+    prove.add_argument(
+        "--solver",
+        choices=["auto", "search", "script"],
+        default="auto",
+        help="tactic solver (auto=script for lemma-first, search otherwise)",
+    )
+    prove.add_argument(
+        "--lemma-max",
+        type=int,
+        default=60,
+        help="maximum number of lemmas (lemma-first mode)",
+    )
+    prove.add_argument(
+        "--lemma-depth",
+        type=int,
+        default=60,
+        help="maximum lemma expansion depth (lemma-first mode)",
+    )
 
     prove.add_argument("--openai-key", default=os.environ.get("ULAM_OPENAI_API_KEY", ""))
     prove.add_argument(
@@ -260,7 +285,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run_prove(args: argparse.Namespace) -> None:
-    context = _read_context_files(args.context)
+    context = "\n\n".join(_read_context_files(args.context))
     config = RunConfig(
         file_path=args.file,
         theorem=args.theorem,
@@ -278,6 +303,8 @@ def run_prove(args: argparse.Namespace) -> None:
     _preflight_lean_alignment(args)
 
     def _run_once() -> SearchResult:
+        solver = _resolve_solver(args)
+        solver = _resolve_solver(args)
         if config.verbose:
             model = ""
             if args.llm in {"openai", "codex_cli"}:
@@ -297,21 +324,33 @@ def run_prove(args: argparse.Namespace) -> None:
             if args.context:
                 print(f"[run] context_files={len(args.context)}")
             print(f"[run] trace={config.trace_path}")
+            print(f"[run] solver={solver}")
 
         runner = _make_runner(args)
         llm = _make_llm(args)
         retriever = _make_retriever(args)
         trace = TraceLogger(config.trace_path)
         try:
+            if solver == "script":
+                return scripted_search(runner, llm, retriever, trace, config)
             return best_first_search(runner, llm, retriever, trace, config)
         finally:
             trace.close()
             runner.close()
 
     try:
+        if args.prove_mode == "lemma":
+            run_prove_lemma_first(args)
+            return
         result = _run_once()
     except Exception as exc:
-        if args.lean == "dojo" and _is_lean_mismatch_error(exc):
+        if args.lean == "dojo" and _is_parse_error(exc):
+            if _attempt_statement_repair(args, exc):
+                print("Retrying prover after statement repair...")
+                result = _run_once()
+            else:
+                raise
+        elif args.lean == "dojo" and _is_lean_mismatch_error(exc):
             print("Lean toolchain mismatch detected. Attempting to repair...")
             if _repair_lean_toolchain(args):
                 print("Retrying prover after toolchain repair...")
@@ -333,6 +372,456 @@ def run_prove(args: argparse.Namespace) -> None:
 
     print("Failed to solve.")
     print(result.error or "unknown error")
+    _summarize_failed_run(args)
+
+
+def run_prove_lemma_first(args: argparse.Namespace) -> None:
+    print("Lemma-first mode: generating lemma plan...")
+    _preflight_lean_alignment(args)
+    if not _has_lemma_plan(args.file):
+        try:
+            plan = _generate_lemma_plan(args)
+        except Exception as exc:
+            print(f"Failed to generate lemma plan: {exc}")
+            return
+        if not plan.declarations:
+            print("Lemma plan produced no declarations. Aborting.")
+            return
+        if not _write_lemma_plan(args, plan):
+            print("Failed to write lemma plan to file.")
+            return
+
+    try:
+        file_text = args.file.read_text(encoding="utf-8")
+    except Exception:
+        print("Failed to read lemma plan file.")
+        return
+
+    decls = _extract_decl_names(file_text)
+    if not decls:
+        print("No lemma/theorem declarations found in plan.")
+        return
+
+    max_lemmas = max(1, int(getattr(args, "lemma_max", 60)))
+    max_depth = max(1, int(getattr(args, "lemma_depth", 60)))
+    queue: list[tuple[str, int]] = [
+        (name, 0) for name in decls if _decl_needs_proof(file_text, name)
+    ]
+    solved: set[str] = set()
+    attempts: dict[str, int] = {}
+    if not queue:
+        print("All lemmas already solved.")
+        return
+    total_decl_count = _count_decl_names(args.file)
+    completed = total_decl_count - len(queue)
+
+    while queue:
+        print(f"[lemma-first] Progress {completed}/{total_decl_count} solved")
+        name, depth = queue.pop(0)
+        if name in solved:
+            continue
+        attempts[name] = attempts.get(name, 0) + 1
+        print(f"[lemma-first] Proving {name}...")
+        result = _run_search_for_theorem(args, name)
+        if result is None:
+            print("Aborted.")
+            return
+        if result.solved:
+            _write_proof_to_file(args.file, name, result.proof)
+            solved.add(name)
+            completed += 1
+            continue
+
+        print(f"Failed to solve lemma {name}.")
+        total_lemmas = _count_decl_names(args.file)
+        if total_lemmas >= max_lemmas or depth >= max_depth:
+            print("Lemma-first limits reached; stopping.")
+            _summarize_failed_run_for(
+                args,
+                name,
+                _trace_path_for_theorem(args, name),
+                note=f"lemma-first limits reached (lemmas={total_lemmas}, depth={depth})",
+            )
+            _cleanup_failed_lemmas(args.file)
+            return
+
+        expanded = _expand_lemmas_for_failure(args, name)
+        if not expanded:
+            _summarize_failed_run_for(
+                args, name, _trace_path_for_theorem(args, name)
+            )
+            _cleanup_failed_lemmas(args.file)
+            return
+        for new_name in reversed(expanded):
+            queue.insert(0, (new_name, depth + 1))
+        queue.insert(0, (name, depth))
+
+    print("Lemma-first mode complete.")
+
+
+@dataclass(frozen=True)
+class LemmaPlan:
+    lean_code: str
+    declarations: list[str]
+
+
+LEMMA_PLAN_MARKER = "ULAMAI_LEMMA_PLAN"
+
+
+def _generate_lemma_plan(args: argparse.Namespace) -> LemmaPlan:
+    theorem_stmt, original_stmt = _extract_theorem_statement(args.file, args.theorem)
+    if not theorem_stmt:
+        raise RuntimeError("Could not read theorem statement.")
+    config = _formalization_config_from_args(args)
+    llm = FormalizationLLM(args.llm, config)
+    context = "\n\n".join(_read_context_files(args.context))
+    plan_code = llm.plan_lemmas(
+        theorem_name=args.theorem,
+        theorem_statement=theorem_stmt,
+        original_statement=original_stmt or theorem_stmt,
+        context=context,
+    )
+    normalized = _normalize_plan_code(plan_code, args.theorem, theorem_stmt, original_stmt)
+    decls = _extract_decl_names(normalized)
+    return LemmaPlan(lean_code=normalized, declarations=decls)
+
+
+def _normalize_plan_code(code: str, theorem: str, statement: str, original: str | None) -> str:
+    text = (code or "").strip()
+    if not text:
+        text = f"import Mathlib\n\n" f"theorem {theorem} : {statement} := by\n  sorry\n"
+    if "import" not in text.splitlines()[0:5]:
+        text = "import Mathlib\n\n" + text
+    if not re.search(rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b", text):
+        text = (
+            text
+            + "\n\n"
+            + f"theorem {theorem} : {statement} := by\n"
+            + "  sorry\n"
+        )
+    if original:
+        header = (
+            "/- ULAMAI_ORIGINAL_STATEMENT\n"
+            + original.strip()
+            + "\n-/\n\n"
+            + f"/- {LEMMA_PLAN_MARKER} -/\n\n"
+        )
+        if "ULAMAI_ORIGINAL_STATEMENT" not in text:
+            text = header + text
+    text = _ensure_lemma_list_block(text)
+    return text
+
+
+def _extract_decl_names(text: str) -> list[str]:
+    names: list[str] = []
+    for match in re.finditer(r"\b(?:theorem|lemma|example)\s+([A-Za-z0-9_']+)\b", text):
+        names.append(match.group(1))
+    return names
+
+
+def _decl_needs_proof(text: str, name: str) -> bool:
+    block = _decl_block(text, name)
+    if not block:
+        return False
+    return re.search(r"\bsorry\b", block) is not None
+
+
+def _decl_block(text: str, name: str) -> str:
+    pattern = re.compile(rf"^\s*(theorem|lemma|example)\s+{re.escape(name)}\b", re.M)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    start = match.start()
+    next_match = pattern.search(text, match.end())
+    end = next_match.start() if next_match else len(text)
+    return text[start:end]
+
+
+def _count_decl_names(file_path: Path) -> int:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    return len(_extract_decl_names(text))
+
+
+def _write_lemma_plan(args: argparse.Namespace, plan: LemmaPlan) -> bool:
+    try:
+        args.file.write_text(plan.lean_code, encoding="utf-8")
+    except Exception:
+        return False
+    _update_lemma_list_block(args.file)
+    return True
+
+
+def _has_lemma_plan(file_path: Path) -> bool:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    return LEMMA_PLAN_MARKER in text
+
+
+def _expand_lemmas_for_failure(args: argparse.Namespace, lemma_name: str) -> list[str]:
+    trace_path = _trace_path_for_theorem(args, lemma_name)
+    steps = _read_trace_steps(trace_path, max_lines=200) if trace_path else []
+    last_goal = steps[-1].get("state_pretty", "") if steps else ""
+    failures = []
+    successes = []
+    for step in steps:
+        tactic = step.get("tactic", "")
+        ok = step.get("ok", False)
+        if ok:
+            if tactic:
+                successes.append(tactic)
+            continue
+        err = step.get("error") or "error"
+        if tactic:
+            failures.append(f"{tactic}: {err}")
+        else:
+            failures.append(str(err))
+
+    lemma_statement, original_statement = _extract_theorem_statement(args.file, lemma_name)
+    if not lemma_statement:
+        return []
+
+    config = _formalization_config_from_args(args)
+    llm = FormalizationLLM(args.llm, config)
+    context = _read_context_files(args.context)
+    print(f"[lemma-first] Expanding lemma {lemma_name}...")
+    snippet = llm.expand_lemmas(
+        lemma_name=lemma_name,
+        lemma_statement=lemma_statement,
+        last_goal=last_goal,
+        failures=_dedupe_items(failures),
+        successes=_dedupe_items(successes),
+        context=context,
+    )
+    if not snippet.strip():
+        return []
+    return _insert_lemmas_before(args.file, lemma_name, snippet)
+
+
+def _insert_lemmas_before(file_path: Path, target_name: str, snippet: str) -> list[str]:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    clean_snippet = _strip_imports_from_snippet(snippet)
+    clean_snippet = _remove_decl_by_name(clean_snippet, target_name)
+    blocks = _split_decl_blocks(clean_snippet)
+    if not blocks:
+        return []
+
+    existing = set(_extract_decl_names(text))
+    kept_blocks: list[str] = []
+    new_names: list[str] = []
+    for name, block in blocks:
+        if name in existing:
+            continue
+        kept_blocks.append(block.rstrip() + "\n")
+        new_names.append(name)
+
+    if not kept_blocks:
+        return []
+
+    match = re.search(rf"\b(theorem|lemma|example)\s+{re.escape(target_name)}\b", text)
+    if match is None:
+        return []
+    insert_at = match.start()
+    insert_block = "\n".join(kept_blocks).rstrip() + "\n\n"
+    new_text = text[:insert_at] + insert_block + text[insert_at:]
+    try:
+        file_path.write_text(new_text, encoding="utf-8")
+    except Exception:
+        return []
+    _update_lemma_list_block(file_path)
+    return new_names
+
+
+def _strip_imports_from_snippet(snippet: str) -> str:
+    lines = []
+    for line in snippet.splitlines():
+        if line.strip().startswith("import "):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _split_decl_blocks(text: str) -> list[tuple[str, str]]:
+    pattern = re.compile(r"^\s*(theorem|lemma|example|def|abbrev|structure)\s+([A-Za-z0-9_']+)\b", re.M)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return []
+    blocks: list[tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        name = match.group(2)
+        block = text[start:end].rstrip()
+        blocks.append((name, block))
+    return blocks
+
+
+def _remove_decl_by_name(text: str, name: str) -> str:
+    pattern = re.compile(rf"^\s*(theorem|lemma|example|def|abbrev|structure)\s+{re.escape(name)}\b", re.M)
+    match = pattern.search(text)
+    if not match:
+        return text
+    start = match.start()
+    next_match = pattern.search(text, match.end())
+    end = next_match.start() if next_match else len(text)
+    return (text[:start] + text[end:]).strip()
+
+
+def _ensure_lemma_list_block(text: str) -> str:
+    if "ULAMAI_LEMMA_LIST" in text:
+        return text
+    decls = _extract_decl_names(text)
+    statuses = _lemma_status_map(text)
+    block_lines = []
+    for name in decls:
+        status = statuses.get(name, "unknown")
+        block_lines.append(f"- {name}  [{status}]")
+    block = "/- ULAMAI_LEMMA_LIST\n" + "\n".join(block_lines) + "\n-/\n\n"
+    return block + text
+
+
+def _update_lemma_list_block(file_path: Path) -> None:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    decls = _extract_decl_names(text)
+    statuses = _lemma_status_map(text)
+    block_lines = []
+    for name in decls:
+        status = statuses.get(name, "unknown")
+        block_lines.append(f"- {name}  [{status}]")
+    block = "/- ULAMAI_LEMMA_LIST\n" + "\n".join(block_lines) + "\n-/"
+    if "ULAMAI_LEMMA_LIST" in text:
+        new_text = re.sub(
+            r"/-\s*ULAMAI_LEMMA_LIST.*?-/",
+            block,
+            text,
+            flags=re.S,
+        )
+    else:
+        new_text = block + "\n\n" + text
+    if new_text != text:
+        try:
+            file_path.write_text(new_text, encoding="utf-8")
+        except Exception:
+            return
+
+
+def _lemma_status_map(text: str) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for name in _extract_decl_names(text):
+        block = _decl_block(text, name)
+        if not block:
+            continue
+        if re.search(r"\bsorry\b", block):
+            statuses[name] = "sorry"
+        else:
+            statuses[name] = "solved"
+    return statuses
+
+
+def _cleanup_failed_lemmas(file_path: Path) -> None:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    cleaned = re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+    try:
+        file_path.write_text(cleaned, encoding="utf-8")
+    except Exception:
+        return
+    _update_lemma_list_block(file_path)
+
+
+def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchResult | None:
+    context = _read_context_files(args.context)
+    trace_path = _trace_path_for_theorem(args, theorem)
+    config = RunConfig(
+        file_path=args.file,
+        theorem=theorem,
+        max_steps=args.max_steps,
+        beam_width=args.beam,
+        suggestions_per_state=args.k,
+        timeout_s=args.timeout,
+        repair_attempts=args.repair,
+        seed=args.seed,
+        trace_path=trace_path,
+        instruction=args.instruction.strip() if args.instruction else None,
+        context=context,
+        verbose=bool(args.verbose),
+    )
+
+    def _run_once() -> SearchResult:
+        if config.verbose:
+            model = ""
+            if args.llm in {"openai", "codex_cli"}:
+                model = args.openai_model
+            elif args.llm in {"anthropic", "claude_cli"}:
+                model = args.anthropic_model
+            elif args.llm == "ollama":
+                model = args.ollama_model
+            label = args.llm
+            if model:
+                label = f"{label} ({model})"
+            print(f"[run] llm={label}")
+            print(f"[run] lean={args.lean} file={args.file} theorem={theorem}")
+            if args.instruction:
+                lines = len(args.instruction.splitlines())
+                print(f"[run] instruction_lines={lines}")
+            if args.context:
+                print(f"[run] context_files={len(args.context)}")
+            print(f"[run] trace={config.trace_path}")
+            print(f"[run] solver={solver}")
+
+        runner = _make_runner(args)
+        llm = _make_llm(args)
+        retriever = _make_retriever(args)
+        trace = TraceLogger(config.trace_path)
+        try:
+            if solver == "script":
+                return scripted_search(runner, llm, retriever, trace, config)
+            return best_first_search(runner, llm, retriever, trace, config)
+        finally:
+            trace.close()
+            runner.close()
+
+    try:
+        return _run_once()
+    except Exception as exc:
+        if args.lean == "dojo" and _is_parse_error(exc):
+            if _attempt_statement_repair(args, exc):
+                return _run_once()
+            return None
+        if args.lean == "dojo" and _is_lean_mismatch_error(exc):
+            print("Lean toolchain mismatch detected. Attempting to repair...")
+            if _repair_lean_toolchain(args):
+                print("Retrying prover after toolchain repair...")
+                return _run_once()
+        return None
+
+
+def _trace_path_for_theorem(args: argparse.Namespace, theorem: str) -> Path | None:
+    trace_path = args.trace
+    if trace_path is not None and trace_path.name == "run.jsonl":
+        return trace_path.with_name(f"run_{theorem}.jsonl")
+    return trace_path
+
+
+def _resolve_solver(args: argparse.Namespace) -> str:
+    solver = getattr(args, "solver", "auto") or "auto"
+    if solver not in {"auto", "search", "script"}:
+        solver = "auto"
+    if solver == "auto":
+        return "script" if getattr(args, "prove_mode", "tactic") == "lemma" else "search"
+    return solver
 
 
 def run_replay(args: argparse.Namespace) -> None:
@@ -818,6 +1307,68 @@ def _is_lean_mismatch_error(exc: Exception) -> bool:
     )
 
 
+def _is_parse_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "unexpected token" in text
+        or "function expected at" in text
+        or "parse error" in text
+        or "invalid 'import' command" in text
+    )
+
+
+def _extract_original_statement(text: str) -> str:
+    match = re.search(r"/-\s*ULAMAI_ORIGINAL_STATEMENT\s*(.*?)\s*-/", text, re.S)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _formalization_config_from_args(args: argparse.Namespace) -> dict:
+    return {
+        "llm_provider": args.llm,
+        "openai": {
+            "api_key": args.openai_key,
+            "base_url": args.openai_base_url,
+            "model": args.openai_model,
+            "codex_model": args.openai_model,
+        },
+        "anthropic": {
+            "api_key": args.anthropic_key,
+            "setup_token": args.anthropic_setup_token,
+            "base_url": args.anthropic_base_url,
+            "model": args.anthropic_model,
+            "claude_model": args.anthropic_model,
+        },
+        "ollama": {
+            "base_url": args.ollama_base_url,
+            "model": args.ollama_model,
+        },
+    }
+
+
+def _attempt_statement_repair(args: argparse.Namespace, exc: Exception) -> bool:
+    file_path = args.file
+    try:
+        lean_code = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    original = _extract_original_statement(lean_code)
+    if not original:
+        return False
+    config = _formalization_config_from_args(args)
+    llm = FormalizationLLM(args.llm, config)
+    print("Statement parse failed; asking LLM to repair the theorem statement...")
+    repaired = llm.repair_statement(lean_code, args.theorem, original, context="")
+    if not repaired.strip():
+        return False
+    try:
+        file_path.write_text(repaired, encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
 def _write_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> bool:
     if not proof:
         return False
@@ -835,18 +1386,136 @@ def _write_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> boo
     end = match.start() + sorry_match.end()
     line_start = text.rfind("\n", 0, start) + 1
     indent = text[line_start:start]
-    prefix = text[:start]
+    prefix = text[:line_start]
     has_by = re.search(r":=\s*by\s*$", prefix) is not None or re.search(r"\bby\s*$", prefix) is not None
     if has_by:
         proof_block = "\n".join(f"{indent}{line}" for line in proof)
     else:
         proof_block = "by\n" + "\n".join(f"{indent}{line}" for line in proof)
-    new_text = text[:start] + proof_block + text[end:]
+    new_text = prefix + proof_block + text[end:]
     try:
         file_path.write_text(new_text, encoding="utf-8")
     except Exception:
         return False
     return True
+
+
+def _summarize_failed_run(args: argparse.Namespace) -> None:
+    _summarize_failed_run_for(args, args.theorem, args.trace)
+
+
+def _summarize_failed_run_for(
+    args: argparse.Namespace, theorem: str, trace_path: Path | None, note: str | None = None
+) -> None:
+    if trace_path is None or str(trace_path) == "-":
+        return
+    try:
+        steps = _read_trace_steps(trace_path, max_lines=200)
+    except Exception:
+        return
+    if not steps:
+        return
+
+    last_goal = steps[-1].get("state_pretty", "")
+    failures = []
+    successes = []
+    for step in steps:
+        tactic = step.get("tactic", "")
+        ok = step.get("ok", False)
+        if ok:
+            if tactic:
+                successes.append(tactic)
+            continue
+        err = step.get("error") or "error"
+        if tactic:
+            failures.append(f"{tactic}: {err}")
+        else:
+            failures.append(str(err))
+
+    if note:
+        failures.insert(0, note)
+
+    theorem_statement, original_statement = _extract_theorem_statement(args.file, theorem)
+    statement = original_statement or theorem_statement
+    if not statement:
+        statement = "(unknown statement)"
+
+    config = _formalization_config_from_args(args)
+    llm = FormalizationLLM(args.llm, config)
+    summary = llm.summarize_attempt(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        last_goal=last_goal,
+        failures=_dedupe_items(failures),
+        successes=_dedupe_items(successes),
+        context="",
+    )
+    if not summary.strip():
+        return
+    _append_run_summary(args.file, summary.strip())
+    print(f"Wrote run summary to: {args.file}")
+
+
+def _read_trace_steps(path: Path, max_lines: int = 200) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if max_lines and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    steps: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            steps.append(json.loads(line))
+        except Exception:
+            continue
+    return steps
+
+
+def _extract_theorem_statement(file_path: Path, theorem: str) -> tuple[str, str]:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return "", ""
+    original = _extract_original_statement(text)
+    match = re.search(
+        rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\s*:\s*(.*?)\s*:=\s*by",
+        text,
+        re.S,
+    )
+    if not match:
+        return "", original
+    stmt = " ".join(match.group(2).split())
+    return stmt, original
+
+
+def _dedupe_items(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _append_run_summary(file_path: Path, summary: str) -> None:
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    block = (
+        "\n\n/- ULAMAI_RUN_SUMMARY\n"
+        + summary
+        + "\n-/"
+    )
+    try:
+        file_path.write_text(text + block, encoding="utf-8")
+    except Exception:
+        return
 
 
 def _preflight_lean_alignment(args: argparse.Namespace) -> None:
