@@ -11,9 +11,43 @@ Ulam AI is designed to plug into **Codex / Claude Code / Ollama** (or any OpenAI
 
 ---
 
-## Status (v0.1 scaffold)
+## Quickstart
+
+From a fresh clone:
+
+```bash
+./install.sh
+```
+
+In the folder where you want to prove or formalize things:
+
+```bash
+ulam -lean
+```
+
+Then launch the interactive menu:
+
+```bash
+ulam
+```
+
+Suggested Codex model: `gpt-5.2-codex` (or `gpt-5.3-codex` if available).
+
+Example for option **2** (Natural language guidance):
+
+```text
+prove that every PID is a UFD; use mathlib's IsPrincipalIdealRing → UniqueFactorizationMonoid
+```
+
+---
+
+## Status (v0.1.2)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
+- **Scripted solver** (sequential tactics) enabled by default
+- **Lemma-first planning** with automatic expansion on failure
+- **Run summaries** appended to `.lean` on failed attempts
+- **Settings** for solver choice and lemma limits
 - `ulam prove` and `ulam replay` commands
 - Best-first search with beam cap + repair loop
 - LLM adapters: OpenAI-compatible + Ollama + mock
