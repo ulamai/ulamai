@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+.ulam/
+*.egg-info/
+run.jsonl
+runs/
