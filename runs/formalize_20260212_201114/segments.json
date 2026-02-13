@@ -1,0 +1,17 @@
+[
+  {
+    "kind": "text",
+    "title": "",
+    "body": "\\section{Toy Example}"
+  },
+  {
+    "kind": "theorem",
+    "title": "",
+    "body": "[identity]\nFor every natural number $n$, we have $n = n$."
+  },
+  {
+    "kind": "text",
+    "title": "",
+    "body": "\\begin{proof}\nTrivial by reflexivity.\n\\end{proof}"
+  }
+]

@@ -1,0 +1,19 @@
+{
+  "tex_path": "examples/Formalize.tex",
+  "output_path": "/tmp/Formalize.lean",
+  "context_files": [],
+  "max_rounds": 3,
+  "max_repairs": 2,
+  "max_equivalence_repairs": 2,
+  "max_proof_rounds": 1,
+  "proof_max_steps": 64,
+  "proof_beam": 4,
+  "proof_k": 8,
+  "proof_timeout_s": 5.0,
+  "proof_repair": 2,
+  "lean_project": null,
+  "lean_imports": [],
+  "verbose": true,
+  "artifact_dir": null,
+  "equivalence_checks": false
+}

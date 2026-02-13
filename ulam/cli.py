@@ -1,0 +1,1249 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from .lean.base import LeanRunner
+from .lean.dojo import LeanDojoRunner
+from .lean.mock import MockLeanRunner
+from .llm import (
+    AnthropicClient,
+    ClaudeCLIClient,
+    CodexCLIClient,
+    MockLLMClient,
+    OllamaClient,
+    OpenAICompatClient,
+)
+from .formalize.engine import FormalizationEngine
+from .formalize.llm import FormalizationLLM
+from .formalize.types import FormalizationConfig
+from .config import load_config, save_config
+from .auth import (
+    codex_auth_path,
+    load_codex_api_key,
+    load_codex_tokens,
+    run_codex_login,
+    run_claude_setup_token,
+)
+from .retrieve import (
+    EmbeddingRetriever,
+    NullRetriever,
+    OpenAIEmbeddingClient,
+    SimpleRetriever,
+)
+from .search import best_first_search
+from .trace import TraceLogger
+from .types import RunConfig
+
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        from .menu import run_menu
+
+        run_menu()
+        return
+    if _has_lean_setup_flag(argv):
+        run_lean_setup(_parse_lean_setup_args(_strip_lean_setup_flags(argv)))
+        return
+    parser = argparse.ArgumentParser(prog="ulam", description="Ulam Prover CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    prove = sub.add_parser("prove", help="attempt to prove a Lean theorem")
+    prove.add_argument("file", type=Path, help="path to a Lean file")
+    prove.add_argument("--theorem", required=True, help="theorem name to prove")
+    prove.add_argument(
+        "--llm",
+        choices=["mock", "openai", "ollama", "anthropic", "codex_cli", "claude_cli"],
+        default="mock",
+    )
+    prove.add_argument("--lean", choices=["mock", "dojo"], default="mock")
+    prove.add_argument(
+        "--lean-project",
+        type=Path,
+        default=Path(os.environ["ULAM_LEAN_PROJECT"]) if "ULAM_LEAN_PROJECT" in os.environ else None,
+        help="Lean project root (defaults to nearest lakefile.lean/lean-toolchain)",
+    )
+    prove.add_argument(
+        "--lean-import",
+        action="append",
+        default=[],
+        help="additional Lean modules to import (repeatable)",
+    )
+    prove.add_argument("--premises", type=Path, default=None, help="optional premises file")
+    prove.add_argument("--instruction", default="", help="natural language guidance for the prover")
+    prove.add_argument(
+        "--context",
+        action="append",
+        default=[],
+        help="additional context files (.lean/.tex), repeatable",
+    )
+    prove.add_argument(
+        "--retriever",
+        choices=["none", "simple", "embedding"],
+        default="simple",
+        help="retriever type (requires --premises for simple/embedding)",
+    )
+    prove.add_argument(
+        "--embed-api-key",
+        default=os.environ.get("ULAM_EMBED_API_KEY", os.environ.get("ULAM_OPENAI_API_KEY", "")),
+    )
+    prove.add_argument(
+        "--embed-base-url",
+        default=os.environ.get("ULAM_EMBED_BASE_URL", os.environ.get("ULAM_OPENAI_BASE_URL", "https://api.openai.com")),
+    )
+    prove.add_argument(
+        "--embed-model",
+        default=os.environ.get("ULAM_EMBED_MODEL", "text-embedding-3-small"),
+    )
+    prove.add_argument("--embed-cache", type=Path, default=None)
+    prove.add_argument("--embed-batch-size", type=int, default=16)
+    prove.add_argument("--max-steps", type=int, default=64)
+    prove.add_argument("--beam", type=int, default=4)
+    prove.add_argument("--k", type=int, default=8, help="suggestions per state")
+    prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
+    prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
+    prove.add_argument("--seed", type=int, default=0)
+    prove.add_argument("--trace", type=Path, default=Path("run.jsonl"))
+    prove.add_argument("--verbose", action="store_true", help="print search/LLM logs")
+
+    prove.add_argument("--openai-key", default=os.environ.get("ULAM_OPENAI_API_KEY", ""))
+    prove.add_argument(
+        "--openai-base-url",
+        default=os.environ.get("ULAM_OPENAI_BASE_URL", "https://api.openai.com"),
+    )
+    prove.add_argument("--openai-model", default=os.environ.get("ULAM_OPENAI_MODEL", "gpt-4.1"))
+
+    prove.add_argument(
+        "--ollama-base-url",
+        default=os.environ.get("ULAM_OLLAMA_BASE_URL", "http://localhost:11434"),
+    )
+    prove.add_argument("--ollama-model", default=os.environ.get("ULAM_OLLAMA_MODEL", "llama3.1"))
+    prove.add_argument("--anthropic-key", default=os.environ.get("ULAM_ANTHROPIC_API_KEY", ""))
+    prove.add_argument("--anthropic-setup-token", default=os.environ.get("ULAM_ANTHROPIC_SETUP_TOKEN", ""))
+    prove.add_argument(
+        "--anthropic-base-url",
+        default=os.environ.get("ULAM_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+    )
+    prove.add_argument("--anthropic-model", default=os.environ.get("ULAM_ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
+
+    replay = sub.add_parser("replay", help="replay or summarize a run trace")
+    replay.add_argument("trace", type=Path, help="trace jsonl path")
+
+    auth = sub.add_parser("auth", help="authenticate with Codex or Claude Code")
+    auth.add_argument("provider", choices=["codex", "claude"])
+
+    formalize = sub.add_parser("formalize", help="formalize a .tex document to Lean")
+    formalize.add_argument("tex", type=Path, help="path to .tex file")
+    formalize.add_argument("--out", type=Path, default=None, help="output .lean path")
+    formalize.add_argument("--context", action="append", default=[], help="context files (.lean/.tex)")
+    formalize.add_argument("--max-rounds", type=int, default=3)
+    formalize.add_argument("--max-repairs", type=int, default=2)
+    formalize.add_argument("--max-equivalence-repairs", type=int, default=2)
+    formalize.add_argument("--max-proof-rounds", type=int, default=1)
+    formalize.add_argument("--proof-max-steps", type=int, default=64)
+    formalize.add_argument("--proof-beam", type=int, default=4)
+    formalize.add_argument("--proof-k", type=int, default=8)
+    formalize.add_argument("--proof-timeout", type=float, default=5.0)
+    formalize.add_argument("--proof-repair", type=int, default=2)
+    formalize.add_argument("--lean-project", type=Path, default=None)
+    formalize.add_argument("--lean-import", action="append", default=[])
+    formalize.add_argument("--no-equivalence", action="store_true", help="skip equivalence checks")
+    formalize.add_argument("--artifacts-dir", type=Path, default=None)
+    formalize.add_argument("--verbose", action="store_true")
+
+    bench = sub.add_parser("bench", help="run a regression suite")
+    bench.add_argument("--suite", type=Path, required=True, help="jsonl suite path")
+    bench.add_argument(
+        "--llm",
+        choices=["mock", "openai", "ollama", "anthropic", "codex_cli", "claude_cli"],
+        default="mock",
+    )
+    bench.add_argument("--lean", choices=["mock", "dojo"], default="mock")
+    bench.add_argument(
+        "--lean-project",
+        type=Path,
+        default=Path(os.environ["ULAM_LEAN_PROJECT"]) if "ULAM_LEAN_PROJECT" in os.environ else None,
+    )
+    bench.add_argument("--lean-import", action="append", default=[])
+    bench.add_argument("--premises", type=Path, default=None)
+    bench.add_argument("--instruction", default="", help="natural language guidance for the prover")
+    bench.add_argument(
+        "--context",
+        action="append",
+        default=[],
+        help="additional context files (.lean/.tex), repeatable",
+    )
+    bench.add_argument(
+        "--retriever",
+        choices=["none", "simple", "embedding"],
+        default="simple",
+    )
+    bench.add_argument(
+        "--embed-api-key",
+        default=os.environ.get("ULAM_EMBED_API_KEY", os.environ.get("ULAM_OPENAI_API_KEY", "")),
+    )
+    bench.add_argument(
+        "--embed-base-url",
+        default=os.environ.get("ULAM_EMBED_BASE_URL", os.environ.get("ULAM_OPENAI_BASE_URL", "https://api.openai.com")),
+    )
+    bench.add_argument(
+        "--embed-model",
+        default=os.environ.get("ULAM_EMBED_MODEL", "text-embedding-3-small"),
+    )
+    bench.add_argument("--embed-cache", type=Path, default=None)
+    bench.add_argument("--embed-batch-size", type=int, default=16)
+    bench.add_argument("--max-steps", type=int, default=64)
+    bench.add_argument("--beam", type=int, default=4)
+    bench.add_argument("--k", type=int, default=8, help="suggestions per state")
+    bench.add_argument("--timeout", type=float, default=5.0)
+    bench.add_argument("--repair", type=int, default=2)
+    bench.add_argument("--seed", type=int, default=0)
+    bench.add_argument("--trace-dir", type=Path, default=Path("bench_traces"))
+    bench.add_argument("--verbose", action="store_true", help="print search/LLM logs")
+
+    bench.add_argument("--openai-key", default=os.environ.get("ULAM_OPENAI_API_KEY", ""))
+    bench.add_argument(
+        "--openai-base-url",
+        default=os.environ.get("ULAM_OPENAI_BASE_URL", "https://api.openai.com"),
+    )
+    bench.add_argument("--openai-model", default=os.environ.get("ULAM_OPENAI_MODEL", "gpt-4.1"))
+
+    bench.add_argument(
+        "--ollama-base-url",
+        default=os.environ.get("ULAM_OLLAMA_BASE_URL", "http://localhost:11434"),
+    )
+    bench.add_argument("--ollama-model", default=os.environ.get("ULAM_OLLAMA_MODEL", "llama3.1"))
+    bench.add_argument("--anthropic-key", default=os.environ.get("ULAM_ANTHROPIC_API_KEY", ""))
+    bench.add_argument("--anthropic-setup-token", default=os.environ.get("ULAM_ANTHROPIC_SETUP_TOKEN", ""))
+    bench.add_argument(
+        "--anthropic-base-url",
+        default=os.environ.get("ULAM_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+    )
+    bench.add_argument(
+        "--anthropic-model",
+        default=os.environ.get("ULAM_ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
+    )
+
+    lean_setup = sub.add_parser(
+        "lean-setup", help="install Lean + LeanDojo and create a Lean project"
+    )
+    _add_lean_setup_args(lean_setup)
+
+    args = parser.parse_args(argv)
+
+    if args.command == "prove":
+        run_prove(args)
+        return
+    if args.command == "replay":
+        run_replay(args)
+        return
+    if args.command == "auth":
+        run_auth(args)
+        return
+    if args.command == "formalize":
+        run_formalize(args)
+        return
+    if args.command == "bench":
+        run_bench(args)
+        return
+    if args.command == "lean-setup":
+        run_lean_setup(args)
+        return
+
+
+def run_prove(args: argparse.Namespace) -> None:
+    context = _read_context_files(args.context)
+    config = RunConfig(
+        file_path=args.file,
+        theorem=args.theorem,
+        max_steps=args.max_steps,
+        beam_width=args.beam,
+        suggestions_per_state=args.k,
+        timeout_s=args.timeout,
+        repair_attempts=args.repair,
+        seed=args.seed,
+        trace_path=args.trace,
+        instruction=args.instruction.strip() if args.instruction else None,
+        context=context,
+        verbose=bool(args.verbose),
+    )
+    _preflight_lean_alignment(args)
+
+    def _run_once() -> SearchResult:
+        if config.verbose:
+            model = ""
+            if args.llm in {"openai", "codex_cli"}:
+                model = args.openai_model
+            elif args.llm in {"anthropic", "claude_cli"}:
+                model = args.anthropic_model
+            elif args.llm == "ollama":
+                model = args.ollama_model
+            label = args.llm
+            if model:
+                label = f"{label} ({model})"
+            print(f"[run] llm={label}")
+            print(f"[run] lean={args.lean} file={args.file} theorem={args.theorem}")
+            if args.instruction:
+                lines = len(args.instruction.splitlines())
+                print(f"[run] instruction_lines={lines}")
+            if args.context:
+                print(f"[run] context_files={len(args.context)}")
+            print(f"[run] trace={config.trace_path}")
+
+        runner = _make_runner(args)
+        llm = _make_llm(args)
+        retriever = _make_retriever(args)
+        trace = TraceLogger(config.trace_path)
+        try:
+            return best_first_search(runner, llm, retriever, trace, config)
+        finally:
+            trace.close()
+            runner.close()
+
+    try:
+        result = _run_once()
+    except Exception as exc:
+        if args.lean == "dojo" and _is_lean_mismatch_error(exc):
+            print("Lean toolchain mismatch detected. Attempting to repair...")
+            if _repair_lean_toolchain(args):
+                print("Retrying prover after toolchain repair...")
+                result = _run_once()
+            else:
+                raise
+        else:
+            raise
+
+    if result.solved:
+        print("Solved.")
+        print("Proof:")
+        print("by")
+        for line in result.proof:
+            print(f"  {line}")
+        return
+
+    print("Failed to solve.")
+    print(result.error or "unknown error")
+
+
+def run_replay(args: argparse.Namespace) -> None:
+    if not args.trace.exists():
+        print(f"Trace not found: {args.trace}")
+        sys.exit(1)
+
+    steps = 0
+    solved = False
+    tactics: list[str] = []
+    with args.trace.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            steps += 1
+            tactics.append(payload.get("tactic", ""))
+            if payload.get("solved"):
+                solved = True
+                break
+
+    print(f"Steps: {steps}")
+    print(f"Solved: {solved}")
+    if tactics:
+        print("Tactics:")
+        for tactic in tactics:
+            print(f"- {tactic}")
+
+
+def run_auth(args: argparse.Namespace) -> None:
+    config = load_config()
+    if args.provider == "codex":
+        print("Launching Codex CLI login...")
+        try:
+            run_codex_login()
+        except Exception as exc:
+            print(f"Codex login failed: {exc}")
+            return
+        auth_path = codex_auth_path()
+        api_key = load_codex_api_key(auth_path)
+        if api_key:
+            config.setdefault("openai", {})["api_key"] = api_key
+            config["llm_provider"] = "openai"
+            save_config(config)
+            print("Codex login imported API key successfully.")
+            return
+        tokens = load_codex_tokens(auth_path)
+        if tokens:
+            config["llm_provider"] = "codex_cli"
+            save_config(config)
+            print("Codex login successful (subscription token detected).")
+            return
+        print(f"Could not read credentials from {auth_path}.")
+        print("If your Codex CLI uses a different auth file, set CODEX_HOME.")
+        return
+    if args.provider == "claude":
+        print("Launching Claude Code setup-token...")
+        try:
+            token = run_claude_setup_token()
+        except Exception as exc:
+            print(f"Claude setup-token failed: {exc}")
+            return
+        if not token:
+            print("Could not capture setup-token output. Run `claude setup-token` and paste it into config.")
+            return
+        config.setdefault("anthropic", {})["setup_token"] = token
+        config["llm_provider"] = "claude_cli"
+        save_config(config)
+        print("Claude setup-token saved.")
+        return
+
+
+def _has_lean_setup_flag(argv: list[str]) -> bool:
+    return any(flag in argv for flag in ("-lean", "--lean", "--lean-setup"))
+
+
+def _strip_lean_setup_flags(argv: list[str]) -> list[str]:
+    return [arg for arg in argv if arg not in ("-lean", "--lean", "--lean-setup")]
+
+
+def _parse_lean_setup_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ulam -lean",
+        description="Install Lean + LeanDojo and create a Mathlib project",
+    )
+    _add_lean_setup_args(parser)
+    return parser.parse_args(argv)
+
+
+def _add_lean_setup_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dir",
+        default="",
+        help="Lean project directory (default: ./ulam-lean or current Lean project)",
+    )
+    parser.add_argument(
+        "--toolchain",
+        default="",
+        help="Lean toolchain to pin (default: Pantograph toolchain if available, else leanprover/lean4:stable)",
+    )
+    parser.add_argument(
+        "--use-mathlib-toolchain",
+        action="store_true",
+        help="use the toolchain from mathlib4 template instead of --toolchain",
+    )
+    parser.add_argument("--yes", action="store_true", help="run non-interactively with defaults")
+    parser.add_argument("--skip-elan", action="store_true", help="skip installing elan (Lean)")
+    parser.add_argument("--no-build", action="store_true", help="skip `lake build`")
+    parser.add_argument("--no-dojo", action="store_true", help="skip LeanDojo + Pantograph install")
+    parser.add_argument("--no-config", action="store_true", help="do not write .ulam/config.json")
+    parser.add_argument("--pip-timeout", type=int, default=120, help="pip download timeout (seconds)")
+    parser.add_argument("--pip-retries", type=int, default=5, help="pip retry count")
+
+
+def run_lean_setup(args: argparse.Namespace) -> None:
+    print("UlamAI Lean setup")
+    if not args.yes:
+        print("This will install Lean (elan), create a Mathlib project, and install LeanDojo.")
+        choice = input("Continue? (Y/n): ").strip().lower()
+        if choice in {"n", "no"}:
+            print("Aborted.")
+            return
+
+    project_dir = _resolve_lean_project_dir(args)
+    if project_dir is None:
+        return
+
+    env = os.environ.copy()
+    env = _ensure_elan(env, args)
+    if env is None:
+        return
+
+    if not _looks_like_lean_project(project_dir):
+        created = _create_mathlib_project(project_dir, env, args)
+        if not created:
+            return
+        _pin_toolchain(project_dir, args)
+
+    if not args.no_dojo:
+        if not _ensure_lean_dojo(env, args):
+            return
+        pantograph_toolchain = _pantograph_toolchain()
+        if pantograph_toolchain and not args.use_mathlib_toolchain:
+            if not _align_mathlib_to_toolchain(project_dir, env, pantograph_toolchain):
+                print(
+                    "Unable to align Mathlib to Pantograph toolchain automatically; "
+                    "continuing with Mathlib's default toolchain."
+                )
+
+    if not args.no_build:
+        if not _run_cmd(["lake", "build"], cwd=project_dir, env=env):
+            if _maybe_fallback_toolchain(project_dir, env, args):
+                if not _run_cmd(["lake", "build"], cwd=project_dir, env=env):
+                    return
+            else:
+                return
+
+    # If dojo install was skipped earlier, still allow it after build.
+    if args.no_dojo:
+        pass
+    else:
+        # Already handled above.
+        pass
+
+    if not args.no_config:
+        config = load_config()
+        config.setdefault("lean", {})["project"] = str(project_dir)
+        save_config(config)
+        print(f"Saved Lean project path to config: {project_dir}")
+
+    print("Lean setup complete.")
+
+
+def _resolve_lean_project_dir(args: argparse.Namespace) -> Path | None:
+    if args.dir:
+        project_dir = Path(args.dir).expanduser()
+    else:
+        cwd = Path.cwd()
+        if _looks_like_lean_project(cwd):
+            project_dir = cwd
+        elif args.yes:
+            project_dir = cwd / "ulam-lean"
+        else:
+            value = input("Lean project directory [./ulam-lean]: ").strip()
+            project_dir = Path(value).expanduser() if value else (cwd / "ulam-lean")
+
+    while project_dir.exists() and not _looks_like_lean_project(project_dir):
+        if args.yes:
+            print(f"Directory exists and is not a Lean project: {project_dir}")
+            return None
+        print(f"Directory exists and is not a Lean project: {project_dir}")
+        value = input("Choose a different path (blank to abort): ").strip()
+        if not value:
+            print("Aborted.")
+            return None
+        project_dir = Path(value).expanduser()
+
+    return project_dir
+
+
+def _ensure_elan(env: dict, args: argparse.Namespace) -> dict | None:
+    env = _extend_path(env, Path("~/.elan/bin").expanduser())
+    if _which("elan", env):
+        return env
+    if args.skip_elan:
+        print("Elan not found and --skip-elan set. Aborting.")
+        return None
+    if not args.yes:
+        choice = input("Elan not found. Install now? (Y/n): ").strip().lower()
+        if choice in {"n", "no"}:
+            print("Aborted.")
+            return None
+    if not _run_shell("curl https://elan.lean-lang.org/elan-init.sh -sSf | sh", env=env):
+        return None
+    env = _extend_path(env, Path("~/.elan/bin").expanduser())
+    if not _which("elan", env):
+        print("Elan was installed but not found on PATH. Open a new shell or source ~/.elan/env.")
+        return None
+    return env
+
+
+def _create_mathlib_project(project_dir: Path, env: dict, args: argparse.Namespace) -> bool:
+    if not _which("lake", env):
+        print("Lake not found. Ensure elan is installed and ~/.elan/bin is on PATH.")
+        return False
+    parent = project_dir.parent
+    name = project_dir.name
+    if project_dir.exists() and not _looks_like_lean_project(project_dir):
+        print(f"Directory exists and is not a Lean project: {project_dir}")
+        return False
+    parent.mkdir(parents=True, exist_ok=True)
+    if not _run_cmd(
+        ["lake", "+leanprover-community/mathlib4:lean-toolchain", "new", name, "math"],
+        cwd=parent,
+        env=env,
+    ):
+        return False
+    return True
+
+
+def _align_mathlib_to_toolchain(project_dir: Path, env: dict, toolchain: str) -> bool:
+    toolchain = _normalize_toolchain(toolchain)
+    if not toolchain:
+        return False
+    toolchain_file = project_dir / "lean-toolchain"
+    lean_path = project_dir / "lakefile.lean"
+    toml_path = project_dir / "lakefile.toml"
+
+    old_toolchain = toolchain_file.read_text(encoding="utf-8") if toolchain_file.exists() else ""
+    old_lean = lean_path.read_text(encoding="utf-8") if lean_path.exists() else None
+    old_toml = toml_path.read_text(encoding="utf-8") if toml_path.exists() else None
+
+    success = False
+    try:
+        toolchain_file.write_text(toolchain + "\n", encoding="utf-8")
+        mathlib_rev = _mathlib_rev_for_toolchain(toolchain)
+        if mathlib_rev:
+            if toml_path.exists():
+                if not _update_mathlib_rev_toml(toml_path, mathlib_rev):
+                    return False
+            elif lean_path.exists():
+                if not _pin_mathlib_rev_in_lakefile(project_dir, mathlib_rev):
+                    return False
+            else:
+                return False
+
+        if not _ensure_toolchain_installed(toolchain, env):
+            return False
+
+        shutil.rmtree(project_dir / ".lake" / "build", ignore_errors=True)
+        if not _run_cmd(["lake", "update"], cwd=project_dir, env=env):
+            return False
+        success = True
+        return True
+    finally:
+        if not success:
+            if old_toolchain:
+                try:
+                    toolchain_file.write_text(old_toolchain, encoding="utf-8")
+                except Exception:
+                    pass
+            if old_lean is not None:
+                try:
+                    lean_path.write_text(old_lean, encoding="utf-8")
+                except Exception:
+                    pass
+            if old_toml is not None:
+                try:
+                    toml_path.write_text(old_toml, encoding="utf-8")
+                except Exception:
+                    pass
+
+
+def _mathlib_rev_for_toolchain(toolchain: str) -> str | None:
+    if not toolchain:
+        return None
+    version = toolchain.split(":", 1)[-1].strip()
+    if not version:
+        return None
+    if version in {"stable", "nightly"}:
+        return None
+    if not version.startswith("v"):
+        version = f"v{version}"
+    return version
+
+
+def _pin_mathlib_rev_in_lakefile(project_dir: Path, rev: str) -> bool:
+    lakefile = project_dir / "lakefile.lean"
+    if not lakefile.exists():
+        return False
+    text = lakefile.read_text(encoding="utf-8")
+    if "require mathlib" not in text or "mathlib4" not in text:
+        return False
+    url_pat = r"https?://github\.com/leanprover-community/mathlib4(?:\.git)?"
+    replace_pat = rf'({url_pat}"\s*@\s*")[^"]+(")'
+    if re.search(replace_pat, text):
+        new_text = re.sub(replace_pat, rf"\1{rev}\2", text)
+        if new_text != text:
+            lakefile.write_text(new_text, encoding="utf-8")
+        return True
+    insert_pat = rf'({url_pat}(?:\.git)?")'
+    if re.search(insert_pat, text):
+        new_text = re.sub(insert_pat, rf'\1 @ "{rev}"', text, count=1)
+        if new_text != text:
+            lakefile.write_text(new_text, encoding="utf-8")
+            return True
+    return False
+
+
+def _update_mathlib_rev_toml(path: Path, rev: str) -> bool:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    in_require = False
+    is_mathlib = False
+    rev_written = False
+    seen_mathlib = False
+
+    def flush_rev() -> None:
+        nonlocal rev_written
+        if in_require and is_mathlib and not rev_written:
+            out.append(f'rev = "{rev}"')
+            rev_written = True
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped != "[[require]]":
+            flush_rev()
+            in_require = False
+            is_mathlib = False
+            rev_written = False
+            out.append(line)
+            continue
+        if stripped.startswith("[[require]]"):
+            flush_rev()
+            in_require = True
+            is_mathlib = False
+            rev_written = False
+            out.append(line)
+            continue
+        if in_require:
+            if stripped.startswith("name"):
+                is_mathlib = "mathlib" in stripped
+                if is_mathlib:
+                    seen_mathlib = True
+            if stripped.startswith("rev") and is_mathlib:
+                out.append(f'rev = "{rev}"')
+                rev_written = True
+                continue
+        out.append(line)
+
+    flush_rev()
+    if not seen_mathlib:
+        return False
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return True
+
+
+def _ensure_lean_dojo(env: dict, args: argparse.Namespace) -> bool:
+    if _pantograph_available():
+        print("LeanDojo already installed.")
+        return True
+    print("Installing LeanDojo + Pantograph...")
+    if not _pip_install(env, args, ["lean-dojo-v2"]):
+        return False
+    return _pip_install(env, args, ["git+https://github.com/stanford-centaur/PyPantograph"])
+
+
+def _pantograph_available() -> bool:
+    try:
+        import pantograph  # type: ignore
+    except Exception:
+        return False
+    return True
+
+
+def _looks_like_lean_project(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if (path / "lakefile.lean").exists():
+        return True
+    if (path / "lakefile.toml").exists():
+        return True
+    if (path / "lean-toolchain").exists():
+        return True
+    return False
+
+
+def _extend_path(env: dict, extra: Path) -> dict:
+    if not extra.exists():
+        return env
+    path = env.get("PATH", "")
+    extra_str = str(extra)
+    parts = path.split(os.pathsep) if path else []
+    if extra_str not in parts:
+        env = env.copy()
+        env["PATH"] = extra_str + os.pathsep + path if path else extra_str
+    return env
+
+
+def _which(cmd: str, env: dict | None = None) -> str | None:
+    path = env.get("PATH") if env else None
+    return shutil.which(cmd, path=path)
+
+
+def _run_shell(command: str, env: dict | None = None) -> bool:
+    try:
+        subprocess.run(command, shell=True, check=True, env=env)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"Command failed ({exc.returncode}): {command}")
+        return False
+
+
+def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> bool:
+    try:
+        subprocess.run(cmd, check=True, cwd=cwd, env=env)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"Command failed ({exc.returncode}): {' '.join(cmd)}")
+        return False
+
+
+def _ensure_toolchain_installed(toolchain: str, env: dict) -> bool:
+    proc = subprocess.run(
+        ["elan", "toolchain", "install", toolchain],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return True
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if "already installed" in output or "is already installed" in output:
+        return True
+    print(f"Command failed ({proc.returncode}): elan toolchain install {toolchain}")
+    if output.strip():
+        print(output.strip())
+    return False
+
+
+def _pip_install(env: dict, args: argparse.Namespace, packages: list[str]) -> bool:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--timeout",
+        str(args.pip_timeout),
+        "--retries",
+        str(args.pip_retries),
+        *packages,
+    ]
+    return _run_cmd(cmd, env=env)
+
+
+def _is_lean_mismatch_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "incompatible header" in text
+        or "lean version mismatch" in text
+        or "server failed to emit ready signal" in text
+    )
+
+
+def _preflight_lean_alignment(args: argparse.Namespace) -> None:
+    if args.lean != "dojo":
+        return
+    project = args.lean_project or _find_lean_project_for_file(args.file)
+    if project is None:
+        return
+    args.lean_project = project
+    toolchain_file = project / "lean-toolchain"
+    current = toolchain_file.read_text(encoding="utf-8").strip() if toolchain_file.exists() else ""
+    pantograph = _pantograph_toolchain()
+    if not pantograph or current == pantograph:
+        return
+    env = _extend_path(os.environ.copy(), Path("~/.elan/bin").expanduser())
+    if not _which("elan", env):
+        return
+    print(f"Aligning project toolchain to Pantograph ({pantograph}) before starting prover...")
+    if not _align_mathlib_to_toolchain(project, env, pantograph):
+        print("Warning: failed to align project toolchain automatically.")
+
+
+def _repair_lean_toolchain(args: argparse.Namespace) -> bool:
+    project = args.lean_project or _find_lean_project_for_file(args.file)
+    if project is None:
+        print("Unable to locate Lean project to repair.")
+        return False
+    toolchain_file = project / "lean-toolchain"
+    if not toolchain_file.exists():
+        print("Lean toolchain file not found; cannot repair automatically.")
+        return False
+    original_toolchain_text = toolchain_file.read_text(encoding="utf-8")
+    original_toolchain = original_toolchain_text.strip()
+    if not original_toolchain:
+        print("Lean toolchain file is empty; cannot repair automatically.")
+        return False
+    lakefile_lean = project / "lakefile.lean"
+    lakefile_toml = project / "lakefile.toml"
+    original_lakefile_lean = lakefile_lean.read_text(encoding="utf-8") if lakefile_lean.exists() else None
+    original_lakefile_toml = lakefile_toml.read_text(encoding="utf-8") if lakefile_toml.exists() else None
+    env = _extend_path(os.environ.copy(), Path("~/.elan/bin").expanduser())
+    if not _which("elan", env):
+        print("Elan not found on PATH; cannot repair automatically.")
+        return False
+    candidates = _repair_toolchain_candidates(original_toolchain)
+    for candidate in candidates:
+        if candidate != original_toolchain:
+            print(f"Trying toolchain: {candidate}")
+        try:
+            toolchain_file.write_text(original_toolchain_text, encoding="utf-8")
+        except Exception:
+            pass
+        if original_lakefile_lean is not None:
+            try:
+                lakefile_lean.write_text(original_lakefile_lean, encoding="utf-8")
+            except Exception:
+                pass
+        if original_lakefile_toml is not None:
+            try:
+                lakefile_toml.write_text(original_lakefile_toml, encoding="utf-8")
+            except Exception:
+                pass
+
+        if not _align_mathlib_to_toolchain(project, env, candidate):
+            continue
+        if _run_cmd(["lake", "build"], cwd=project, env=env):
+            if args.lean_project is None:
+                args.lean_project = project
+            return True
+    try:
+        toolchain_file.write_text(original_toolchain_text, encoding="utf-8")
+    except Exception:
+        pass
+    if original_lakefile_lean is not None:
+        try:
+            lakefile_lean.write_text(original_lakefile_lean, encoding="utf-8")
+        except Exception:
+            pass
+    if original_lakefile_toml is not None:
+        try:
+            lakefile_toml.write_text(original_lakefile_toml, encoding="utf-8")
+        except Exception:
+            pass
+    print("Toolchain repair failed after trying alternatives.")
+    return False
+
+
+def _find_lean_project_for_file(file_path: Path) -> Path | None:
+    root = file_path.parent
+    for parent in [root, *root.parents]:
+        if (
+            (parent / "lakefile.lean").exists()
+            or (parent / "lakefile.toml").exists()
+            or (parent / "lean-toolchain").exists()
+        ):
+            return parent
+    return None
+
+
+def _pin_toolchain(project_dir: Path, args: argparse.Namespace) -> None:
+    if args.use_mathlib_toolchain or not args.toolchain:
+        return
+    toolchain = _normalize_toolchain(args.toolchain)
+    if not toolchain:
+        return
+    toolchain_file = project_dir / "lean-toolchain"
+    if toolchain_file.exists():
+        current = toolchain_file.read_text(encoding="utf-8").strip()
+        if current == toolchain:
+            return
+    toolchain_file.write_text(toolchain + "\n", encoding="utf-8")
+
+
+def _maybe_fallback_toolchain(project_dir: Path, env: dict, args: argparse.Namespace) -> bool:
+    if args.use_mathlib_toolchain or args.no_build:
+        return False
+    toolchain_file = project_dir / "lean-toolchain"
+    if not toolchain_file.exists():
+        return False
+    current = toolchain_file.read_text(encoding="utf-8").strip()
+    if not current:
+        return False
+    pantograph = _pantograph_toolchain()
+    fallback = pantograph or "leanprover/lean4:stable"
+    if current == fallback:
+        return False
+    print(f"Build failed with current toolchain; retrying with {fallback}.")
+    toolchain_file.write_text(fallback + "\n", encoding="utf-8")
+    _ensure_toolchain_installed(fallback, env)
+    return True
+
+
+def _normalize_toolchain(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if text in {"stable", "nightly"}:
+        return f"leanprover/lean4:{text}"
+    return text
+
+
+def _is_rc_toolchain(value: str) -> bool:
+    return "-rc" in value or "rc" in value
+
+
+def _select_toolchain(args: argparse.Namespace) -> str:
+    if args.toolchain:
+        return _normalize_toolchain(args.toolchain)
+    return ""
+
+
+def _repair_toolchain_candidates(original: str) -> list[str]:
+    candidates: list[str] = []
+    pantograph = _pantograph_toolchain()
+    if pantograph:
+        candidates.append(pantograph)
+    if _is_rc_toolchain(original):
+        candidates.append("leanprover/lean4:stable")
+    candidates.append(original)
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _try_align_with_pantograph(project_dir: Path, env: dict, args: argparse.Namespace) -> bool:
+    pantograph = _pantograph_toolchain()
+    if not pantograph:
+        return True
+    if args.use_mathlib_toolchain:
+        print("Pantograph toolchain differs from Mathlib toolchain; keeping Mathlib toolchain.")
+        return True
+    toolchain_file = project_dir / "lean-toolchain"
+    current = toolchain_file.read_text(encoding="utf-8").strip() if toolchain_file.exists() else ""
+    if current == pantograph:
+        return True
+    print(f"Pantograph toolchain detected ({pantograph}); attempting to align project toolchain.")
+    original = current
+    toolchain_file.write_text(pantograph + "\n", encoding="utf-8")
+    _run_cmd(["elan", "toolchain", "install", pantograph], env=env)
+    if not _run_cmd(["lake", "update"], cwd=project_dir, env=env):
+        print("Failed to update dependencies for Pantograph toolchain; restoring original toolchain.")
+        if original:
+            toolchain_file.write_text(original + "\n", encoding="utf-8")
+        return True
+    if not args.no_build:
+        if not _run_cmd(["lake", "build"], cwd=project_dir, env=env):
+            print("Build failed after aligning to Pantograph toolchain; restoring original toolchain.")
+            if original:
+                toolchain_file.write_text(original + "\n", encoding="utf-8")
+                _run_cmd(["lake", "build"], cwd=project_dir, env=env)
+            return True
+    return True
+
+
+def _pantograph_toolchain() -> str | None:
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("pantograph")
+        if spec is None or spec.origin is None:
+            return None
+        base = Path(spec.origin).resolve().parent
+    except Exception:
+        return None
+    candidates = [
+        base / "lean-toolchain",
+        base / "src" / "lean-toolchain",
+        base.parent / "src" / "lean-toolchain",
+        base.parent / "pantograph" / "lean-toolchain",
+    ]
+    for path in candidates:
+        toolchain = _read_toolchain_file(path)
+        if toolchain:
+            return toolchain
+    # As a last resort, look a couple levels up for a toolchain file.
+    toolchain = _scan_for_toolchain(base.parent, max_depth=3)
+    return toolchain
+
+
+def _scan_for_toolchain(root: Path, max_depth: int = 3) -> str | None:
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    while queue:
+        path, depth = queue.pop(0)
+        toolchain = _read_toolchain_file(path / "lean-toolchain")
+        if toolchain:
+            return toolchain
+        if depth >= max_depth:
+            continue
+        try:
+            for child in path.iterdir():
+                if child.is_dir():
+                    name = child.name
+                    if name.startswith(".") or name.endswith(".dist-info") or name == "__pycache__":
+                        continue
+                    queue.append((child, depth + 1))
+        except Exception:
+            continue
+    return None
+
+
+def _read_toolchain_file(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    return value or None
+
+
+def run_formalize(args: argparse.Namespace) -> None:
+    config = load_config()
+    tex_path = args.tex
+    if not tex_path.exists():
+        print(f"Tex file not found: {tex_path}")
+        sys.exit(1)
+    output_path = args.out if args.out else tex_path.with_suffix(".lean")
+    context_files = [Path(p) for p in args.context]
+
+    cfg = FormalizationConfig(
+        tex_path=tex_path,
+        output_path=output_path,
+        context_files=context_files,
+        max_rounds=args.max_rounds,
+        max_repairs=args.max_repairs,
+        max_equivalence_repairs=args.max_equivalence_repairs,
+        max_proof_rounds=args.max_proof_rounds,
+        proof_max_steps=args.proof_max_steps,
+        proof_beam=args.proof_beam,
+        proof_k=args.proof_k,
+        proof_timeout_s=args.proof_timeout,
+        proof_repair=args.proof_repair,
+        lean_project=args.lean_project,
+        lean_imports=args.lean_import,
+        verbose=bool(args.verbose),
+        artifact_dir=args.artifacts_dir,
+        equivalence_checks=not args.no_equivalence,
+    )
+    llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
+    engine = FormalizationEngine(cfg, llm)
+    result = engine.run()
+    print(f"Wrote: {result.output_path}")
+    print(f"Typecheck: {'ok' if result.typecheck_ok else 'failed'}")
+    print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    if result.artifact_dir:
+        print(f"Artifacts: {result.artifact_dir}")
+
+
+def run_bench(args: argparse.Namespace) -> None:
+    if not args.suite.exists():
+        print(f"Suite not found: {args.suite}")
+        sys.exit(1)
+
+    cases = []
+    with args.suite.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            file_path = Path(payload["file"])
+            theorem = payload["theorem"]
+            premises = Path(payload["premises"]) if payload.get("premises") else None
+            cases.append((file_path, theorem, premises))
+
+    llm = _make_llm(args)
+    solved = 0
+    results: list[tuple[str, bool]] = []
+    for idx, (file_path, theorem, premises) in enumerate(cases, start=1):
+        case_args = argparse.Namespace(**vars(args))
+        case_args.premises = premises if premises is not None else args.premises
+        context = _read_context_files(case_args.context)
+        trace_path = None
+        if args.trace_dir:
+            args.trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_name = _sanitize_case_name(idx, theorem)
+            trace_path = args.trace_dir / f"{trace_name}.jsonl"
+        config = RunConfig(
+            file_path=file_path,
+            theorem=theorem,
+            max_steps=args.max_steps,
+            beam_width=args.beam,
+            suggestions_per_state=args.k,
+            timeout_s=args.timeout,
+            repair_attempts=args.repair,
+            seed=args.seed,
+            trace_path=trace_path,
+            instruction=args.instruction.strip() if args.instruction else None,
+            context=context,
+            verbose=bool(args.verbose),
+        )
+        runner = _make_runner(case_args)
+        retriever = _make_retriever(case_args)
+        trace = TraceLogger(trace_path)
+        try:
+            result = best_first_search(runner, llm, retriever, trace, config)
+        finally:
+            trace.close()
+            runner.close()
+        results.append((theorem, result.solved))
+        if result.solved:
+            solved += 1
+        status = "solved" if result.solved else "failed"
+        print(f"[{idx}/{len(cases)}] {theorem}: {status}")
+
+    print(f"Total: {len(cases)}")
+    print(f"Solved: {solved}")
+
+
+def _read_context_files(paths: list[Path], max_chars: int = 8000) -> list[str]:
+    context = []
+    for path in paths:
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n-- (truncated)"
+        context.append(f"[file: {path}]\n{content}")
+    return context
+
+
+def _sanitize_case_name(index: int, theorem: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in theorem)
+    return f"{index:03d}_{safe}"
+
+
+def _make_runner(args: argparse.Namespace) -> LeanRunner:
+    if args.lean == "mock":
+        return MockLeanRunner()
+    if args.lean == "dojo":
+        imports = args.lean_import if args.lean_import else None
+        return LeanDojoRunner(project_path=args.lean_project, imports=imports)
+    raise RuntimeError(f"unknown Lean backend: {args.lean}")
+
+
+def _make_llm(args: argparse.Namespace):
+    if args.llm == "mock":
+        return MockLLMClient()
+    if args.llm == "openai":
+        if not args.openai_key:
+            raise RuntimeError("OpenAI API key missing. Set ULAM_OPENAI_API_KEY or --openai-key.")
+        return OpenAICompatClient(
+            api_key=args.openai_key,
+            base_url=args.openai_base_url,
+            model=args.openai_model,
+        )
+    if args.llm == "ollama":
+        return OllamaClient(base_url=args.ollama_base_url, model=args.ollama_model)
+    if args.llm == "anthropic":
+        token = args.anthropic_key or args.anthropic_setup_token
+        return AnthropicClient(
+            api_key=token,
+            base_url=args.anthropic_base_url,
+            model=args.anthropic_model,
+        )
+    if args.llm == "codex_cli":
+        model = args.openai_model or None
+        return CodexCLIClient(model=model)
+    if args.llm == "claude_cli":
+        return ClaudeCLIClient(model=args.anthropic_model or None)
+    raise RuntimeError(f"unknown LLM backend: {args.llm}")
+
+
+def _make_retriever(args: argparse.Namespace):
+    if args.retriever == "none" or args.premises is None:
+        return NullRetriever()
+    if not args.premises.exists():
+        raise RuntimeError(f"Premises file not found: {args.premises}")
+    with args.premises.open("r", encoding="utf-8") as fh:
+        premises = [line.rstrip("\n") for line in fh]
+    if args.retriever == "simple":
+        return SimpleRetriever(premises)
+    if args.retriever == "embedding":
+        if not args.embed_api_key:
+            raise RuntimeError(
+                "Embedding API key missing. Set ULAM_EMBED_API_KEY or --embed-api-key."
+            )
+        embedder = OpenAIEmbeddingClient(
+            api_key=args.embed_api_key,
+            base_url=args.embed_base_url,
+            model=args.embed_model,
+        )
+        return EmbeddingRetriever(
+            premises=premises,
+            embedder=embedder,
+            cache_path=args.embed_cache,
+            batch_size=args.embed_batch_size,
+        )
+    raise RuntimeError(f"unknown retriever: {args.retriever}")

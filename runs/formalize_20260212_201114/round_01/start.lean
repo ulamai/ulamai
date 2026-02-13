@@ -1,0 +1,15 @@
+/-
+Original .tex:
+\section{Toy Example}
+
+\begin{theorem}[identity]
+For every natural number $n$, we have $n = n$.
+\end{theorem}
+
+\begin{proof}
+Trivial by reflexivity.
+\end{proof}
+
+-/
+
+-- TODO: formalize above.
