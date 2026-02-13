@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument(
         "--solver",
         choices=["auto", "search", "script"],
-        default="auto",
+        default="script",
         help="tactic solver (auto=script for lemma-first, search otherwise)",
     )
     prove.add_argument(
