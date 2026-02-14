@@ -145,6 +145,12 @@ def _configure_prover(config: dict) -> None:
     autop_default = "y" if prove.get("autop", True) else "n"
     autop_choice = _prompt("Enable autop tactics (aesop/simp/linarith/ring) (Y/n)", default=autop_default).strip().lower()
     prove["autop"] = autop_choice not in {"n", "no", "false", "0"}
+    suggestion_default = str(prove.get("k", 1))
+    suggestion_raw = _prompt("Number of LLM suggestions per state", default=suggestion_default).strip()
+    try:
+        prove["k"] = max(1, int(suggestion_raw))
+    except Exception:
+        prove["k"] = 1
     lemma_max = _prompt("Lemma max count", default=str(prove.get("lemma_max", 60))).strip()
     lemma_depth = _prompt("Lemma max depth", default=str(prove.get("lemma_depth", 60))).strip()
     try:
@@ -291,7 +297,7 @@ def _menu_formalize(config: dict) -> None:
         max_proof_rounds=1,
         proof_max_steps=64,
         proof_beam=4,
-        proof_k=8,
+        proof_k=int(config.get("prove", {}).get("k", 1)),
         proof_timeout_s=5.0,
         proof_repair=2,
         lean_project=lean_project,
@@ -436,7 +442,7 @@ def _build_args_from_config(
         retriever="none",
         max_steps=64,
         beam=4,
-        k=8,
+        k=int(prove.get("k", 1)),
         timeout=5.0,
         repair=2,
         seed=0,

@@ -62,17 +62,71 @@ def parse_tactics(text: str, k: int) -> list[str]:
         line = re.sub(r"^[-*]\s+", "", line)
         line = re.sub(r"^\d+\.\s+", "", line)
         cleaned = line.strip()
-        if re.search(r":=\s*by\s*$", cleaned):
-            continue
-        if cleaned.endswith("=>"):
-            continue
-        if cleaned in {"case", "cases", "calc"}:
-            continue
-        if cleaned.startswith("case ") and cleaned.endswith("=>"):
-            continue
-        if cleaned.startswith("| ") and cleaned.endswith("=>"):
-            continue
-        tactics.append(cleaned)
+        for candidate in _split_tactic_line(cleaned):
+            if re.search(r":=\s*by\s*$", candidate):
+                continue
+            if candidate.endswith("=>"):
+                continue
+            if candidate in {"case", "cases", "calc"}:
+                continue
+            if candidate.startswith("case ") and candidate.endswith("=>"):
+                continue
+            if candidate.startswith("| ") and candidate.endswith("=>"):
+                continue
+            tactics.append(candidate)
+            if len(tactics) >= k:
+                break
         if len(tactics) >= k:
             break
     return tactics
+
+
+def _split_tactic_line(text: str) -> list[str]:
+    if "," not in text:
+        return [text]
+    parts: list[str] = []
+    buf: list[str] = []
+    depth_paren = 0
+    depth_brack = 0
+    depth_brace = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            buf.append(ch)
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            buf.append(ch)
+            continue
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "[":
+            depth_brack += 1
+        elif ch == "]":
+            depth_brack = max(0, depth_brack - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+        if ch == "," and depth_paren == 0 and depth_brack == 0 and depth_brace == 0:
+            candidate = "".join(buf).strip()
+            if candidate:
+                parts.append(candidate)
+            buf = []
+            continue
+        buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
