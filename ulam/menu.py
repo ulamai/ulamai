@@ -31,10 +31,11 @@ def run_menu() -> None:
         print("1. Configure LLM (Codex/OpenAI, Claude, Ollama)")
         print("2. Prove with natural language guidance")
         print("3. Formalize .tex to Lean")
-        print("4. Settings")
-        print("5. Exit")
+        print("4. Resume last formalization")
+        print("5. Settings")
+        print("6. Exit")
         print()
-        choice = _prompt("Select option", default="5")
+        choice = _prompt("Select option", default="6")
         if choice == "1":
             _configure_llm(config)
             save_config(config)
@@ -46,10 +47,13 @@ def run_menu() -> None:
             _menu_formalize(config)
             continue
         if choice == "4":
+            _menu_formalize_resume(config)
+            continue
+        if choice == "5":
             _configure_prover(config)
             save_config(config)
             continue
-        if choice == "5":
+        if choice == "6":
             print("Goodbye.")
             return
         print("Invalid choice.\n")
@@ -138,6 +142,9 @@ def _configure_prover(config: dict) -> None:
     if solver not in {"auto", "search", "script"}:
         solver = "auto"
     prove["solver"] = solver
+    autop_default = "y" if prove.get("autop", True) else "n"
+    autop_choice = _prompt("Enable autop tactics (aesop/simp/linarith/ring) (Y/n)", default=autop_default).strip().lower()
+    prove["autop"] = autop_choice not in {"n", "no", "false", "0"}
     lemma_max = _prompt("Lemma max count", default=str(prove.get("lemma_max", 60))).strip()
     lemma_depth = _prompt("Lemma max depth", default=str(prove.get("lemma_depth", 60))).strip()
     try:
@@ -154,6 +161,7 @@ def _configure_prover(config: dict) -> None:
 def _menu_prove(config: dict) -> None:
     instruction = _prompt_multiline("Enter guidance for the prover")
     print("Optional: provide a Lean file path to run immediately, or leave blank to auto-generate from text.")
+    _print_lean_file_suggestions()
     file_path = _prompt("Lean file path (optional)", default="").strip()
     theorem = ""
     extra_paths = _prompt("Additional context files (.lean/.tex), comma-separated", default="")
@@ -277,7 +285,7 @@ def _menu_formalize(config: dict) -> None:
         tex_path=tex_file,
         output_path=Path(output_path),
         context_files=context_files,
-        max_rounds=3,
+        max_rounds=5,
         max_repairs=2,
         max_equivalence_repairs=2,
         max_proof_rounds=1,
@@ -289,6 +297,7 @@ def _menu_formalize(config: dict) -> None:
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
+        resume_path=None,
         artifact_dir=None,
         equivalence_checks=True,
     )
@@ -300,6 +309,99 @@ def _menu_formalize(config: dict) -> None:
     print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
     if result.artifact_dir:
         print(f"Artifacts: {result.artifact_dir}")
+
+
+def _menu_formalize_resume(config: dict) -> None:
+    artifact_dir = _find_latest_formalize_artifact()
+    if not artifact_dir:
+        print("No previous formalization runs found in runs/.")
+        return
+    snapshot = _load_formalize_snapshot(artifact_dir)
+    if not snapshot:
+        print(f"Could not read config.json from {artifact_dir}")
+        return
+    tex_path = Path(snapshot.get("tex_path", "")).expanduser()
+    output_path = Path(snapshot.get("output_path", "")).expanduser()
+    if not tex_path.exists():
+        tex_path = Path(_prompt("Missing .tex path, enter path", default="")).expanduser()
+    resume_path = _find_resume_lean_from_artifact(artifact_dir, output_path)
+    if not resume_path:
+        print("Could not locate a prior Lean file to resume from.")
+        return
+    print(f"Resuming from: {resume_path}")
+    lean_project_raw = config.get("lean", {}).get("project", "")
+    lean_project = Path(lean_project_raw) if lean_project_raw else None
+    snapshot_project = snapshot.get("lean_project")
+    if snapshot_project:
+        candidate = Path(snapshot_project)
+        if candidate.exists():
+            lean_project = candidate
+    context_files = [Path(p) for p in snapshot.get("context_files", []) if p]
+    cfg = FormalizationConfig(
+        tex_path=tex_path,
+        output_path=output_path,
+        context_files=context_files,
+        max_rounds=max(5, int(snapshot.get("max_rounds", 5))),
+        max_repairs=int(snapshot.get("max_repairs", 2)),
+        max_equivalence_repairs=int(snapshot.get("max_equivalence_repairs", 2)),
+        max_proof_rounds=int(snapshot.get("max_proof_rounds", 1)),
+        proof_max_steps=int(snapshot.get("proof_max_steps", 64)),
+        proof_beam=int(snapshot.get("proof_beam", 4)),
+        proof_k=int(snapshot.get("proof_k", 8)),
+        proof_timeout_s=float(snapshot.get("proof_timeout_s", 5.0)),
+        proof_repair=int(snapshot.get("proof_repair", 2)),
+        lean_project=lean_project,
+        lean_imports=config.get("lean", {}).get("imports", []),
+        verbose=True,
+        resume_path=resume_path,
+        artifact_dir=None,
+        equivalence_checks=bool(snapshot.get("equivalence_checks", True)),
+    )
+    llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
+    engine = FormalizationEngine(cfg, llm)
+    result = engine.run()
+    print(f"Wrote: {result.output_path}")
+    print(f"Typecheck: {'ok' if result.typecheck_ok else 'failed'}")
+    print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    if result.artifact_dir:
+        print(f"Artifacts: {result.artifact_dir}")
+
+
+def _find_latest_formalize_artifact() -> Path | None:
+    root = Path("runs")
+    if not root.exists():
+        return None
+    candidates = [path for path in root.glob("formalize_*") if path.is_dir()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _load_formalize_snapshot(artifact_dir: Path) -> dict | None:
+    path = artifact_dir / "config.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _find_resume_lean_from_artifact(artifact_dir: Path, output_path: Path) -> Path | None:
+    if output_path and output_path.exists():
+        return output_path
+    rounds = sorted(
+        [p for p in artifact_dir.glob("round_*") if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    for round_dir in rounds:
+        for name in ("improve.lean", "repair.lean", "start.lean"):
+            candidate = round_dir / name
+            if candidate.exists():
+                return candidate
+    return None
 
 
 def _build_args_from_config(
@@ -343,6 +445,7 @@ def _build_args_from_config(
         context=context_files,
         prove_mode=prove.get("mode", "tactic"),
         solver=prove.get("solver", "script"),
+        autop=bool(prove.get("autop", True)),
         lemma_max=int(prove.get("lemma_max", 60)),
         lemma_depth=int(prove.get("lemma_depth", 60)),
         openai_key=openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", ""),
@@ -397,6 +500,34 @@ def _parse_paths(raw: str) -> list[Path]:
 def _default_lean_output(tex_path: str) -> str:
     path = Path(tex_path)
     return str(path.with_suffix(".lean"))
+
+
+def _print_lean_file_suggestions(max_items: int = 5) -> None:
+    candidates: list[Path] = []
+    cwd = Path.cwd()
+    for root in (cwd, cwd / "ulam-lean" / "UlamAI"):
+        if root.exists() and root.is_dir():
+            candidates.extend(sorted(root.glob("*.lean")))
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for path in candidates:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    if not deduped:
+        example = cwd / "ulam-lean" / "UlamAI" / "proof.lean"
+        print(f"Example: {example}")
+        return
+    print("Recent .lean files:")
+    for path in deduped[:max_items]:
+        rel = path
+        try:
+            rel = path.relative_to(cwd)
+        except Exception:
+            pass
+        print(f"  - {rel}")
 
 
 def _save_task(kind: str, payload: dict) -> None:

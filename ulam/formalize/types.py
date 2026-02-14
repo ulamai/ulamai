@@ -29,6 +29,7 @@ class FormalizationConfig:
     lean_project: Optional[Path]
     lean_imports: list[str]
     verbose: bool
+    resume_path: Optional[Path] = None
     artifact_dir: Optional[Path] = None
     equivalence_checks: bool = True
 

@@ -13,6 +13,7 @@ _ENV_KIND = {
     "proposition": "proposition",
     "corollary": "corollary",
     "example": "example",
+    "proof": "proof",
 }
 
 
@@ -22,7 +23,7 @@ def segment_tex(tex: str) -> list[FormalizationSegment]:
         return segments
 
     env_pattern = re.compile(
-        r"\\begin\{(?P<env>definition|lemma|theorem|proposition|corollary|example)\}(?P<body>.*?)\\end\{\1\}",
+        r"\\begin\{(?P<env>definition|lemma|theorem|proposition|corollary|example|proof)\}(?P<body>.*?)\\end\{\1\}",
         re.DOTALL | re.IGNORECASE,
     )
 
@@ -42,6 +43,29 @@ def segment_tex(tex: str) -> list[FormalizationSegment]:
     if tail:
         segments.append(FormalizationSegment("text", "", tail))
     return segments
+
+
+def attach_proofs(segments: list[FormalizationSegment]) -> list[FormalizationSegment]:
+    if not segments:
+        return segments
+    merged: list[FormalizationSegment] = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg.kind in {"lemma", "theorem", "proposition", "corollary", "example"}:
+            body = seg.body
+            if i + 1 < len(segments) and segments[i + 1].kind == "proof":
+                proof_body = segments[i + 1].body.strip()
+                if proof_body:
+                    body = body.rstrip() + "\n\nProof.\n" + proof_body
+                i += 1
+            merged.append(
+                FormalizationSegment(seg.kind, seg.title, body)
+            )
+        else:
+            merged.append(seg)
+        i += 1
+    return merged
 
 
 def _extract_title(body: str) -> str:
