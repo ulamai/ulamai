@@ -41,9 +41,12 @@ prove that every PID is a UFD; use mathlib's IsPrincipalIdealRing → UniqueFact
 
 ---
 
-## Status (v0.1.2)
+## Status (v0.1.3)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
+- **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
+- **Resume last formalization** in the menu + reuse prior artifacts
+- **Per-lemma LaTeX proof snippets** injected into Lean comments and LLM prompts
 - **Scripted solver** (sequential tactics) enabled by default
 - **Lemma-first planning** with automatic expansion on failure
 - **Run summaries** appended to `.lean` on failed attempts
