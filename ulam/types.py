@@ -42,6 +42,7 @@ class RunConfig:
     repair_attempts: int
     seed: int
     trace_path: Optional[Path]
+    autop: bool = True
     instruction: Optional[str] = None
     context: Optional[list[str]] = None
     verbose: bool = False

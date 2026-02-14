@@ -111,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--k", type=int, default=8, help="suggestions per state")
     prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
     prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
+    prove.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     prove.add_argument("--seed", type=int, default=0)
     prove.add_argument("--trace", type=Path, default=Path("run.jsonl"))
     prove.add_argument("--verbose", action="store_true", help="print search/LLM logs")
@@ -169,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("tex", type=Path, help="path to .tex file")
     formalize.add_argument("--out", type=Path, default=None, help="output .lean path")
     formalize.add_argument("--context", action="append", default=[], help="context files (.lean/.tex)")
-    formalize.add_argument("--max-rounds", type=int, default=3)
+    formalize.add_argument("--max-rounds", type=int, default=5)
     formalize.add_argument("--max-repairs", type=int, default=2)
     formalize.add_argument("--max-equivalence-repairs", type=int, default=2)
     formalize.add_argument("--max-proof-rounds", type=int, default=1)
@@ -230,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     bench.add_argument("--k", type=int, default=8, help="suggestions per state")
     bench.add_argument("--timeout", type=float, default=5.0)
     bench.add_argument("--repair", type=int, default=2)
+    bench.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     bench.add_argument("--seed", type=int, default=0)
     bench.add_argument("--trace-dir", type=Path, default=Path("bench_traces"))
     bench.add_argument("--verbose", action="store_true", help="print search/LLM logs")
@@ -296,6 +298,7 @@ def run_prove(args: argparse.Namespace) -> None:
         repair_attempts=args.repair,
         seed=args.seed,
         trace_path=args.trace,
+        autop=_autop_enabled(args),
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
         verbose=bool(args.verbose),
@@ -303,7 +306,6 @@ def run_prove(args: argparse.Namespace) -> None:
     _preflight_lean_alignment(args)
 
     def _run_once() -> SearchResult:
-        solver = _resolve_solver(args)
         solver = _resolve_solver(args)
         if config.verbose:
             model = ""
@@ -325,6 +327,8 @@ def run_prove(args: argparse.Namespace) -> None:
                 print(f"[run] context_files={len(args.context)}")
             print(f"[run] trace={config.trace_path}")
             print(f"[run] solver={solver}")
+            print(f"[run] autop={'on' if config.autop else 'off'}")
+            print(f"[run] autop={'on' if config.autop else 'off'}")
 
         runner = _make_runner(args)
         llm = _make_llm(args)
@@ -378,24 +382,38 @@ def run_prove(args: argparse.Namespace) -> None:
 def run_prove_lemma_first(args: argparse.Namespace) -> None:
     print("Lemma-first mode: generating lemma plan...")
     _preflight_lean_alignment(args)
-    if not _has_lemma_plan(args.file):
-        try:
-            plan = _generate_lemma_plan(args)
-        except Exception as exc:
-            print(f"Failed to generate lemma plan: {exc}")
-            return
-        if not plan.declarations:
-            print("Lemma plan produced no declarations. Aborting.")
-            return
-        if not _write_lemma_plan(args, plan):
-            print("Failed to write lemma plan to file.")
-            return
-
+    file_text = ""
     try:
         file_text = args.file.read_text(encoding="utf-8")
     except Exception:
-        print("Failed to read lemma plan file.")
-        return
+        pass
+    has_decl = _file_has_decl(file_text, args.theorem) if file_text else False
+    if not _has_lemma_plan(args.file):
+        if has_decl:
+            print("Using existing declarations; skipping lemma plan generation.")
+            _update_lemma_list_block(args.file)
+        else:
+            stmt, _ = _extract_theorem_statement(args.file, args.theorem)
+            if not stmt:
+                _suggest_proof_targets(args.file, args.theorem)
+                return
+            try:
+                plan = _generate_lemma_plan(args)
+            except Exception as exc:
+                print(f"Failed to generate lemma plan: {exc}")
+                return
+            if not plan.declarations:
+                print("Lemma plan produced no declarations. Aborting.")
+                return
+            if not _write_lemma_plan(args, plan):
+                print("Failed to write lemma plan to file.")
+                return
+    if not file_text:
+        try:
+            file_text = args.file.read_text(encoding="utf-8")
+        except Exception:
+            print("Failed to read lemma plan file.")
+            return
 
     decls = _extract_decl_names(file_text)
     if not decls:
@@ -741,9 +759,53 @@ def _cleanup_failed_lemmas(file_path: Path) -> None:
     _update_lemma_list_block(file_path)
 
 
+def _file_has_decl(text: str, name: str) -> bool:
+    if not text or not name:
+        return False
+    return re.search(rf"\b(theorem|lemma|example)\s+{re.escape(name)}\b", text) is not None
+
+
+def _suggest_proof_targets(file_path: Path, theorem: str, max_items: int = 20) -> None:
+    cwd = Path.cwd()
+    print("Could not read theorem statement.")
+    if not file_path.exists():
+        print(f"File not found: {file_path}")
+        _print_available_lean_files(cwd, max_items=max_items)
+        return
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"Could not read file: {exc}")
+        _print_available_lean_files(file_path.parent, max_items=max_items)
+        return
+    decls = _extract_decl_names(text)
+    if not decls:
+        print("No theorem/lemma/example declarations found in the file.")
+    else:
+        print("Declarations found in file:")
+        for name in decls[:max_items]:
+            print(f"  - {name}")
+        if theorem and theorem not in decls:
+            print(f"Note: '{theorem}' is not present in this file.")
+    print("Tip: choose a name from the list above or edit the file to add a theorem.")
+
+
+def _print_available_lean_files(root: Path, max_items: int = 20) -> None:
+    try:
+        candidates = sorted(root.glob("*.lean"))
+    except Exception:
+        candidates = []
+    if not candidates:
+        return
+    print(f"Lean files in {root}:")
+    for path in candidates[:max_items]:
+        print(f"  - {path}")
+
+
 def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchResult | None:
     context = _read_context_files(args.context)
     trace_path = _trace_path_for_theorem(args, theorem)
+    solver = _resolve_solver(args)
     config = RunConfig(
         file_path=args.file,
         theorem=theorem,
@@ -754,6 +816,7 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         repair_attempts=args.repair,
         seed=args.seed,
         trace_path=trace_path,
+        autop=_autop_enabled(args),
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
         verbose=bool(args.verbose),
@@ -805,6 +868,7 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
             if _repair_lean_toolchain(args):
                 print("Retrying prover after toolchain repair...")
                 return _run_once()
+        print(f"Prover error: {exc}")
         return None
 
 
@@ -822,6 +886,14 @@ def _resolve_solver(args: argparse.Namespace) -> str:
     if solver == "auto":
         return "script" if getattr(args, "prove_mode", "tactic") == "lemma" else "search"
     return solver
+
+
+def _autop_enabled(args: argparse.Namespace) -> bool:
+    if hasattr(args, "autop"):
+        return bool(getattr(args, "autop"))
+    if hasattr(args, "no_autop"):
+        return not bool(getattr(args, "no_autop"))
+    return True
 
 
 def run_replay(args: argparse.Namespace) -> None:
@@ -1480,14 +1552,47 @@ def _extract_theorem_statement(file_path: Path, theorem: str) -> tuple[str, str]
     except Exception:
         return "", ""
     original = _extract_original_statement(text)
-    match = re.search(
-        rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\s*:\s*(.*?)\s*:=\s*by",
+    decl_match = re.search(
+        rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b",
         text,
-        re.S,
     )
-    if not match:
+    if not decl_match:
         return "", original
-    stmt = " ".join(match.group(2).split())
+    proof_match = re.search(r":=\s*by\b", text[decl_match.end():], re.S)
+    if not proof_match:
+        return "", original
+    start = decl_match.end()
+    end = decl_match.end() + proof_match.start()
+    header = text[start:end]
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    colon_idx = None
+    i = 0
+    while i < len(header):
+        ch = header[i]
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+        elif ch == ":" and i + 1 < len(header) and header[i + 1] == "=":
+            i += 1
+        elif ch == ":" and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            colon_idx = i
+            break
+        i += 1
+    if colon_idx is None:
+        return "", original
+    stmt_raw = header[colon_idx + 1 :]
+    stmt = " ".join(stmt_raw.split())
     return stmt, original
 
 
@@ -1795,6 +1900,7 @@ def run_formalize(args: argparse.Namespace) -> None:
         lean_project=args.lean_project,
         lean_imports=args.lean_import,
         verbose=bool(args.verbose),
+        resume_path=None,
         artifact_dir=args.artifacts_dir,
         equivalence_checks=not args.no_equivalence,
     )
@@ -1847,6 +1953,7 @@ def run_bench(args: argparse.Namespace) -> None:
             repair_attempts=args.repair,
             seed=args.seed,
             trace_path=trace_path,
+            autop=_autop_enabled(case_args),
             instruction=args.instruction.strip() if args.instruction else None,
             context=context,
             verbose=bool(args.verbose),

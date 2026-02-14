@@ -58,6 +58,8 @@ def best_first_search(
             context=config.context,
             mode=mode,
         )
+        if config.autop:
+            suggestions = _merge_suggestions(suggestions, _autop_tactics())
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
         for tactic in suggestions:
@@ -236,6 +238,28 @@ def scripted_search(
             last_tactic = tactic
             break
 
+        if not progressed and config.autop:
+            _log(config, "[autop] trying fallback tactics")
+            for tactic in _autop_tactics():
+                if steps >= config.max_steps:
+                    break
+                result = runner.apply(state, tactic, config.timeout_s)
+                steps += 1
+                trace.log_step(_step_from_result(state, tactic, result, cached=False))
+                _log(config, _format_result(tactic, result, cached=False))
+                if result.ok and result.is_solved:
+                    proof.append(tactic)
+                    return SearchResult(True, proof, steps, None)
+                if result.ok and result.new_state is not None:
+                    proof.append(tactic)
+                    state = result.new_state
+                    last_error = None
+                    last_tactic = None
+                    progressed = True
+                    break
+                last_error = result.error or "unknown error"
+                last_tactic = tactic
+
         if not progressed and last_error and repair_budget <= 0:
             return SearchResult(False, proof, steps, last_error)
 
@@ -290,3 +314,26 @@ def _format_result(tactic: str, result: TacticResult, cached: bool) -> str:
     if len(err) > 160:
         err = err[:160] + "..."
     return f"{prefix} {tactic} -> error: {err}"
+
+
+def _autop_tactics() -> list[str]:
+    return [
+        "aesop",
+        "simp",
+        "ring_nf",
+        "linarith",
+        "nlinarith",
+    ]
+
+
+def _merge_suggestions(suggestions: list[str], extras: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in suggestions + extras:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+    return merged

@@ -38,13 +38,16 @@ def build_prompt(
             "You are writing a short Lean tactic script to execute IN ORDER.\n"
             "- Each line must be a complete Lean tactic command.\n"
             "- Later lines may depend on names introduced earlier.\n"
-            "- Avoid multi-line blocks; if you use `by`, complete it on the same line.\n"
+            "- Avoid multi-line blocks, `case` blocks, or bullet syntax.\n"
+            "- If you use `by`, complete it on the same line (e.g., `by simp`).\n"
             "- Do not include commentary, numbering, or code fences.\n"
             f"Return up to {k} line(s), one tactic per line."
         )
     else:
         user += (
-            "Suggest the next tactic or small lemma.\n"
+            "Suggest the next single-line tactic.\n"
+            "- Avoid multi-line blocks, `case` blocks, or bullet syntax.\n"
+            "- If you use `by`, complete it on the same line (e.g., `by simp`).\n"
             f"Return exactly {k} line(s), one tactic per line."
         )
     return system, user
@@ -58,7 +61,18 @@ def parse_tactics(text: str, k: int) -> list[str]:
             continue
         line = re.sub(r"^[-*]\s+", "", line)
         line = re.sub(r"^\d+\.\s+", "", line)
-        tactics.append(line.strip())
+        cleaned = line.strip()
+        if re.search(r":=\s*by\s*$", cleaned):
+            continue
+        if cleaned.endswith("=>"):
+            continue
+        if cleaned in {"case", "cases", "calc"}:
+            continue
+        if cleaned.startswith("case ") and cleaned.endswith("=>"):
+            continue
+        if cleaned.startswith("| ") and cleaned.endswith("=>"):
+            continue
+        tactics.append(cleaned)
         if len(tactics) >= k:
             break
     return tactics
