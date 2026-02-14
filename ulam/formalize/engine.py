@@ -10,7 +10,7 @@ from typing import Optional
 from .llm import FormalizationLLM
 from .segment import segment_tex, collect_segment_hints, attach_proofs
 from .types import FormalizationConfig, FormalizationResult
-from ..search import best_first_search
+from ..search import best_first_search, scripted_search
 from ..trace import TraceLogger
 from ..types import RunConfig
 
@@ -220,7 +220,7 @@ def _run_prover(
             context=None,
             verbose=config.verbose,
         )
-        result = best_first_search(runner, llm_client, _null_retriever(), trace, run_config)
+        result = scripted_search(runner, llm_client, _null_retriever(), trace, run_config)
     finally:
         trace.close()
         runner.close()
