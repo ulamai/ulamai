@@ -84,6 +84,22 @@ def claude_print(
     ]
     if model:
         cmd.extend(["--model", model])
+    return _claude_print_impl(
+        cmd,
+        user_prompt,
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+        retry_login=True,
+    )
+
+
+def _claude_print_impl(
+    cmd: list[str],
+    user_prompt: str,
+    timeout_s: float | None,
+    heartbeat_s: float | None,
+    retry_login: bool,
+) -> str:
     proc = subprocess.Popen(
         cmd,
         text=True,
@@ -113,5 +129,24 @@ def claude_print(
                 proc.kill()
                 raise RuntimeError(f"claude print timed out after {timeout_s:.0f}s")
     if proc.returncode != 0:
-        raise RuntimeError((stderr or "").strip() or "claude print failed")
+        err = (stderr or "").strip()
+        out = (stdout or "").strip()
+        msg = err or out or f"claude print failed (exit {proc.returncode})"
+        if retry_login and "Not logged in" in msg:
+            _claude_auth_login()
+            return _claude_print_impl(
+                cmd,
+                user_prompt,
+                timeout_s=timeout_s,
+                heartbeat_s=heartbeat_s,
+                retry_login=False,
+            )
+        raise RuntimeError(msg)
     return stdout
+
+
+def _claude_auth_login() -> None:
+    try:
+        subprocess.run(["claude", "auth", "login"], check=False)
+    except Exception:
+        return

@@ -14,6 +14,7 @@ from .auth import (
     load_codex_tokens,
     run_codex_login,
     run_claude_setup_token,
+    run_claude_login,
 )
 from .formalize.engine import FormalizationEngine
 from .formalize.llm import FormalizationLLM
@@ -101,15 +102,26 @@ def _configure_openai(config: dict) -> None:
 def _configure_anthropic(config: dict) -> None:
     section = config.setdefault("anthropic", {})
     print("\nClaude auth:")
-    print("1. Sign in with Claude Code (setup-token)")
-    print("2. Use API key")
+    print("1. Claude Code CLI login (claude auth login)")
+    print("2. Claude subscription (setup-token)")
+    print("3. Use API key")
     choice = _prompt("Auth method", default="1")
     if choice == "1":
-        _login_claude(section)
+        _login_claude_cli()
         config["llm_provider"] = "claude_cli"
         default_model = _default_claude_model(section)
         suggestions = _claude_model_suggestions(section, default_model)
         section["claude_model"] = _prompt_model_choice("Claude model", default_model, suggestions)
+        return
+    if choice == "2":
+        _login_claude_setup_token(section)
+        config["llm_provider"] = "anthropic"
+        section["model"] = _prompt(
+            "Model", default=section.get("model", "claude-3-5-sonnet-20240620")
+        )
+        section["base_url"] = _prompt(
+            "Base URL", default=section.get("base_url", "https://api.anthropic.com")
+        )
         return
     section["api_key"] = _prompt("API key", default=section.get("api_key", ""))
     config["llm_provider"] = "anthropic"
@@ -180,17 +192,33 @@ def _configure_prover(config: dict) -> None:
         prove["lemma_depth"] = max(1, int(lemma_depth))
     except Exception:
         prove["lemma_depth"] = 60
+    allow_axioms_default = "y" if prove.get("allow_axioms", False) else "n"
+    allow_axioms_raw = _prompt("Allow axioms (Y/n)", default=allow_axioms_default).strip().lower()
+    allow_axioms = allow_axioms_raw in {"y", "yes", "true", "1"}
+    prove["allow_axioms"] = allow_axioms
+    lean_section = config.setdefault("lean", {})
+    dojo_timeout_default = str(lean_section.get("dojo_timeout_s", 180))
+    dojo_timeout_raw = _prompt(
+        "LeanDojo server startup timeout (seconds)",
+        default=dojo_timeout_default,
+    ).strip()
+    try:
+        lean_section["dojo_timeout_s"] = max(30, int(float(dojo_timeout_raw)))
+    except Exception:
+        lean_section["dojo_timeout_s"] = 180
 
     formalize = config.setdefault("formalize", {})
-    proof_backend = _prompt(
-        "Formalize proof backend (dojo|llm)",
-        default=formalize.get("proof_backend", "dojo"),
+    formalize_mode_default = formalize.get("proof_backend", "inherit")
+    formalize_mode = _prompt(
+        "Formalize proof mode (inherit|tactic|lemma|llm)",
+        default=formalize_mode_default,
     ).strip().lower()
-    if proof_backend not in {"dojo", "llm"}:
-        proof_backend = "dojo"
-    formalize["proof_backend"] = proof_backend
+    if formalize_mode not in {"inherit", "tactic", "lemma", "llm"}:
+        formalize_mode = "inherit"
+    formalize["proof_backend"] = formalize_mode
+    effective_mode = prove.get("mode", "tactic") if formalize_mode == "inherit" else formalize_mode
     lean_backend_default = formalize.get(
-        "lean_backend", "cli" if proof_backend == "llm" else "dojo"
+        "lean_backend", "cli" if effective_mode == "llm" else "dojo"
     )
     lean_backend = _prompt(
         "Formalize typecheck backend (dojo|cli)",
@@ -331,8 +359,15 @@ def _menu_formalize(config: dict) -> None:
     lean_project_raw = config.get("lean", {}).get("project", "")
     lean_project = Path(lean_project_raw) if lean_project_raw else None
     formalize_cfg = config.get("formalize", {})
-    proof_backend = formalize_cfg.get("proof_backend", "dojo")
+    proof_backend = formalize_cfg.get("proof_backend", "inherit")
+    if proof_backend == "inherit":
+        proof_backend = config.get("prove", {}).get("mode", "tactic")
+    if proof_backend == "dojo":
+        proof_backend = "tactic"
+    if proof_backend not in {"tactic", "lemma", "llm"}:
+        proof_backend = "tactic"
     lean_backend = formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo")
+    dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_file,
         output_path=Path(output_path),
@@ -346,6 +381,10 @@ def _menu_formalize(config: dict) -> None:
         proof_k=int(config.get("prove", {}).get("k", 1)),
         proof_timeout_s=5.0,
         proof_repair=2,
+        dojo_timeout_s=dojo_timeout_s,
+        lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
+        lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
+        allow_axioms=bool(config.get("prove", {}).get("allow_axioms", False)),
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
@@ -392,11 +431,18 @@ def _menu_formalize_resume(config: dict) -> None:
             lean_project = candidate
     context_files = [Path(p) for p in snapshot.get("context_files", []) if p]
     formalize_cfg = config.get("formalize", {})
-    proof_backend = snapshot.get("proof_backend", formalize_cfg.get("proof_backend", "dojo"))
+    proof_backend = snapshot.get("proof_backend", formalize_cfg.get("proof_backend", "inherit"))
+    if proof_backend == "inherit":
+        proof_backend = config.get("prove", {}).get("mode", "tactic")
+    if proof_backend == "dojo":
+        proof_backend = "tactic"
+    if proof_backend not in {"tactic", "lemma", "llm"}:
+        proof_backend = "tactic"
     lean_backend = snapshot.get(
         "lean_backend",
         formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo"),
     )
+    dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -410,6 +456,12 @@ def _menu_formalize_resume(config: dict) -> None:
         proof_k=int(snapshot.get("proof_k", 8)),
         proof_timeout_s=float(snapshot.get("proof_timeout_s", 5.0)),
         proof_repair=int(snapshot.get("proof_repair", 2)),
+        dojo_timeout_s=float(snapshot.get("dojo_timeout_s", dojo_timeout_s)),
+        lemma_max=int(snapshot.get("lemma_max", config.get("prove", {}).get("lemma_max", 60))),
+        lemma_depth=int(snapshot.get("lemma_depth", config.get("prove", {}).get("lemma_depth", 60))),
+        allow_axioms=bool(
+            snapshot.get("allow_axioms", config.get("prove", {}).get("allow_axioms", False))
+        ),
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
@@ -511,6 +563,7 @@ def _build_args_from_config(
         autop=bool(prove.get("autop", True)),
         lemma_max=int(prove.get("lemma_max", 60)),
         lemma_depth=int(prove.get("lemma_depth", 60)),
+        allow_axioms=bool(prove.get("allow_axioms", False)),
         openai_key=openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", ""),
         openai_base_url=openai.get("base_url", "https://api.openai.com"),
         openai_model=openai_model,
@@ -991,7 +1044,7 @@ def _login_codex(section: dict) -> None:
     print("If your Codex CLI uses a different auth file, set CODEX_HOME.")
 
 
-def _login_claude(section: dict) -> None:
+def _login_claude_setup_token(section: dict) -> None:
     print("Launching Claude Code setup-token...")
     try:
         token = run_claude_setup_token()
@@ -1006,6 +1059,14 @@ def _login_claude(section: dict) -> None:
         return
     section["setup_token"] = token
     print("Claude setup-token saved.")
+
+
+def _login_claude_cli() -> None:
+    print("Launching Claude Code login...")
+    try:
+        run_claude_login()
+    except Exception as exc:
+        print(f"Claude login failed: {exc}")
 
 
 def _print_banner() -> None:

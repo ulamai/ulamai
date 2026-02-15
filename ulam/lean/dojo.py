@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -15,10 +17,16 @@ from ..types import ProofState, TacticResult
 class _LeanDojoConfig:
     project_path: Optional[Path]
     imports: Optional[list[str]]
+    timeout_s: Optional[float]
 
 
 class LeanDojoRunner(LeanRunner):
-    def __init__(self, project_path: Optional[Path] = None, imports: Optional[list[str]] = None) -> None:
+    def __init__(
+        self,
+        project_path: Optional[Path] = None,
+        imports: Optional[list[str]] = None,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         try:
             from pantograph import Server  # type: ignore
         except ImportError as exc:
@@ -28,7 +36,9 @@ class LeanDojoRunner(LeanRunner):
             ) from exc
 
         self._Server = Server
-        self._config = _LeanDojoConfig(project_path=project_path, imports=imports)
+        if timeout_s is None:
+            timeout_s = _default_dojo_timeout()
+        self._config = _LeanDojoConfig(project_path=project_path, imports=imports, timeout_s=timeout_s)
         self._server = None
         self._states: dict[str, Any] = {}
 
@@ -41,7 +51,9 @@ class LeanDojoRunner(LeanRunner):
 
         if self._server is None:
             project_path = self._config.project_path or _find_project_root(file_path)
-            self._server = _create_server(self._Server, project_path, imports)
+            self._server = _create_server(
+                self._Server, project_path, imports, timeout_s=self._config.timeout_s
+            )
 
         text_for_dojo = cleaned_body if merged_imports else text
         try:
@@ -132,14 +144,50 @@ def _is_solved(goal_state: Any) -> bool:
     return len(goals) == 0
 
 
-def _create_server(Server: Any, project_path: Path, imports: Optional[list[str]]) -> Any:
+def _create_server(
+    Server: Any,
+    project_path: Path,
+    imports: Optional[list[str]],
+    timeout_s: Optional[float] = None,
+) -> Any:
+    imports = _sanitize_imports(imports)
     kwargs: dict[str, Any] = {}
     sig = inspect.signature(Server)
     if "project_path" in sig.parameters:
         kwargs["project_path"] = str(project_path)
     if imports and "imports" in sig.parameters:
         kwargs["imports"] = imports
+    if timeout_s is not None and "timeout" in sig.parameters:
+        kwargs["timeout"] = float(timeout_s)
+    env_updates: dict[str, str | None] = {}
+    if _lean_options_invalid(os.environ.get("LEAN_OPTIONS")):
+        print("[lean] LEAN_OPTIONS contains invalid entries; ignoring for this run.")
+        env_updates["LEAN_OPTIONS"] = ""
+    if _lean_options_invalid(os.environ.get("LEAN_CORE_OPTIONS")):
+        print("[lean] LEAN_CORE_OPTIONS contains invalid entries; ignoring for this run.")
+        env_updates["LEAN_CORE_OPTIONS"] = ""
+    if env_updates:
+        with _temporary_env(env_updates):
+            return Server(**kwargs)
     return Server(**kwargs)
+
+
+def _default_dojo_timeout() -> Optional[float]:
+    import os
+
+    env = os.environ.get("ULAM_DOJO_TIMEOUT_S")
+    if env:
+        try:
+            return float(env)
+        except Exception:
+            pass
+    try:
+        from ..config import load_config
+
+        cfg = load_config()
+        return float(cfg.get("lean", {}).get("dojo_timeout_s", 180))
+    except Exception:
+        return 180.0
 
 
 def _goal_tactic_uses_index(server: Any) -> bool:
@@ -218,14 +266,15 @@ def _split_imports(text: str) -> tuple[list[str], str]:
                     in_block_comment = True
                 continue
             if stripped.startswith("import "):
-                remainder = stripped[len("import ") :].strip()
+                cleaned = _strip_inline_comment(stripped)
+                remainder = cleaned[len("import ") :].strip()
                 if remainder:
-                    imports.extend(remainder.split())
+                    imports.extend(part for part in remainder.split() if part)
                 continue
             in_header = False
         body.append(line)
 
-    return imports, "\n".join(body).lstrip("\n")
+    return _sanitize_imports(imports) or [], "\n".join(body).lstrip("\n")
 
 
 def _strip_import_lines(text: str) -> tuple[list[str], str]:
@@ -234,12 +283,71 @@ def _strip_import_lines(text: str) -> tuple[list[str], str]:
     for line in text.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("import "):
-            remainder = stripped[len("import ") :].strip()
+            cleaned = _strip_inline_comment(stripped)
+            remainder = cleaned[len("import ") :].strip()
             if remainder:
-                imports.extend(remainder.split())
+                imports.extend(part for part in remainder.split() if part)
             continue
         body.append(line)
-    return imports, "\n".join(body).lstrip("\n")
+    return _sanitize_imports(imports) or [], "\n".join(body).lstrip("\n")
+
+
+def _strip_inline_comment(line: str) -> str:
+    if "--" in line:
+        line = line.split("--", 1)[0]
+    if "/-" in line:
+        line = line.split("/-", 1)[0]
+    return line.rstrip()
+
+
+def _sanitize_imports(imports: Optional[list[str]]) -> Optional[list[str]]:
+    if not imports:
+        return imports
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    invalid: list[str] = []
+    for mod in imports:
+        mod = mod.strip()
+        if not mod:
+            continue
+        if not re.match(r"^[A-Za-z0-9_.']+$", mod):
+            invalid.append(mod)
+            continue
+        if mod in seen:
+            continue
+        seen.add(mod)
+        cleaned.append(mod)
+    if invalid:
+        print(f"[lean] ignoring invalid import tokens: {', '.join(invalid)}")
+    return cleaned or None
+
+
+def _lean_options_invalid(value: str | None) -> bool:
+    if not value:
+        return False
+    tokens = re.split(r"\s+", value.strip())
+    if not tokens:
+        return False
+    return any(tok and "=" not in tok for tok in tokens)
+
+
+@contextmanager
+def _temporary_env(updates: dict[str, str | None]):
+    original: dict[str, str | None] = {}
+    for key, val in updates.items():
+        original[key] = os.environ.get(key)
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+    try:
+        yield
+    finally:
+        for key, old in original.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 
 def _load_sorries(server: Any, text: str) -> list[Any]:

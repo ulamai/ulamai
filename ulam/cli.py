@@ -31,6 +31,7 @@ from .auth import (
     load_codex_tokens,
     run_codex_login,
     run_claude_setup_token,
+    run_claude_login,
 )
 from .retrieve import (
     EmbeddingRetriever,
@@ -112,6 +113,11 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
     prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
     prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
+    prove.add_argument(
+        "--allow-axioms",
+        action="store_true",
+        help="allow axioms/constants only inside ULAMAI assumptions block",
+    )
     prove.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     prove.add_argument("--seed", type=int, default=0)
     prove.add_argument("--trace", type=Path, default=Path("run.jsonl"))
@@ -180,13 +186,18 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--proof-k", type=int, default=1)
     formalize.add_argument("--proof-timeout", type=float, default=5.0)
     formalize.add_argument("--proof-repair", type=int, default=2)
+    formalize.add_argument(
+        "--allow-axioms",
+        action="store_true",
+        help="allow axioms/constants only inside ULAMAI assumptions block",
+    )
     formalize.add_argument("--lean-project", type=Path, default=None)
     formalize.add_argument("--lean-import", action="append", default=[])
     formalize.add_argument(
         "--proof-backend",
-        choices=["dojo", "llm"],
-        default="dojo",
-        help="proof backend (dojo uses LeanDojo, llm uses Lean CLI)",
+        choices=["tactic", "lemma", "llm", "dojo"],
+        default="tactic",
+        help="proof backend (tactic/lemma use LeanDojo, llm uses Lean CLI)",
     )
     formalize.add_argument(
         "--lean-backend",
@@ -388,6 +399,14 @@ def run_prove(args: argparse.Namespace) -> None:
             print(f"  {line}")
         if _write_proof_to_file(args.file, args.theorem, result.proof):
             print(f"Wrote proof to: {args.file}")
+        try:
+            updated = args.file.read_text(encoding="utf-8")
+        except Exception:
+            updated = ""
+        if updated:
+            axiom_error = _axiom_guardrail_error(updated, bool(getattr(args, "allow_axioms", False)))
+            if axiom_error:
+                print(f"[axiom] {axiom_error}")
         return
 
     print("Failed to solve.")
@@ -454,6 +473,11 @@ def run_prove_llm(args: argparse.Namespace) -> None:
         if check_error:
             error = check_error
             print(f"[typecheck] error: {check_error[:200]}")
+            continue
+        axiom_error = _axiom_guardrail_error(updated, bool(getattr(args, "allow_axioms", False)))
+        if axiom_error:
+            error = axiom_error
+            print(f"[axiom] {axiom_error}")
             continue
         print("Solved.")
         print(f"Wrote proof to: {args.file}")
@@ -1041,6 +1065,21 @@ def run_auth(args: argparse.Namespace) -> None:
         print("If your Codex CLI uses a different auth file, set CODEX_HOME.")
         return
     if args.provider == "claude":
+        print("Claude auth options:")
+        print("1. Claude Code CLI login (claude auth login)")
+        print("2. Claude subscription (setup-token)")
+        choice = input("Auth method [1]: ").strip() or "1"
+        if choice == "1":
+            print("Launching Claude Code login...")
+            try:
+                run_claude_login()
+            except Exception as exc:
+                print(f"Claude login failed: {exc}")
+                return
+            config["llm_provider"] = "claude_cli"
+            save_config(config)
+            print("Claude CLI login completed.")
+            return
         print("Launching Claude Code setup-token...")
         try:
             token = run_claude_setup_token()
@@ -1051,7 +1090,7 @@ def run_auth(args: argparse.Namespace) -> None:
             print("Could not capture setup-token output. Run `claude setup-token` and paste it into config.")
             return
         config.setdefault("anthropic", {})["setup_token"] = token
-        config["llm_provider"] = "claude_cli"
+        config["llm_provider"] = "anthropic"
         save_config(config)
         print("Claude setup-token saved.")
         return
@@ -1975,9 +2014,15 @@ def run_formalize(args: argparse.Namespace) -> None:
     context_files = [Path(p) for p in args.context]
 
     proof_backend = args.proof_backend
+    if proof_backend == "dojo":
+        proof_backend = "tactic"
     lean_backend = args.lean_backend
     if proof_backend == "llm":
         lean_backend = "cli"
+    dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
+    allow_axioms = bool(getattr(args, "allow_axioms", False)) or bool(
+        config.get("prove", {}).get("allow_axioms", False)
+    )
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -1991,6 +2036,10 @@ def run_formalize(args: argparse.Namespace) -> None:
         proof_k=args.proof_k,
         proof_timeout_s=args.proof_timeout,
         proof_repair=args.proof_repair,
+        dojo_timeout_s=dojo_timeout_s,
+        lemma_max=60,
+        lemma_depth=60,
+        allow_axioms=allow_axioms,
         lean_project=args.lean_project,
         lean_imports=args.lean_import,
         verbose=bool(args.verbose),
@@ -2171,6 +2220,45 @@ def _normalize_llm_output(text: str) -> str:
             lines.append(line)
     cleaned = "\n".join(lines).strip()
     return cleaned + "\n" if cleaned else ""
+
+
+def _axiom_guardrail_error(text: str, allow_axioms: bool) -> str | None:
+    if allow_axioms:
+        remaining, err = _strip_assumptions_block(text)
+        if err:
+            return err
+        cleaned = _strip_comments(remaining)
+        if re.search(r"\b(axiom|constant)\b", cleaned):
+            return (
+                "Axioms/constants are only allowed inside the ULAMAI assumptions block "
+                "(/- ULAMAI_ASSUMPTIONS_BEGIN -/ ... /- ULAMAI_ASSUMPTIONS_END -/)."
+            )
+        return None
+
+    cleaned = _strip_comments(text)
+    if re.search(r"\b(axiom|constant)\b", cleaned):
+        return "Axioms/constants are not allowed. Replace with lemma/theorem + sorry."
+    return None
+
+
+def _strip_comments(text: str) -> str:
+    no_block = re.sub(r"/-.*?-/", "", text, flags=re.S)
+    no_line = re.sub(r"--.*", "", no_block)
+    return no_line
+
+
+def _strip_assumptions_block(text: str) -> tuple[str, str | None]:
+    begin = "/- ULAMAI_ASSUMPTIONS_BEGIN -/"
+    end = "/- ULAMAI_ASSUMPTIONS_END -/"
+    remaining = text
+    while True:
+        start = remaining.find(begin)
+        if start == -1:
+            return remaining, None
+        finish = remaining.find(end, start + len(begin))
+        if finish == -1:
+            return remaining, "Assumptions block is missing ULAMAI_ASSUMPTIONS_END."
+        remaining = remaining[:start] + remaining[finish + len(end) :]
 
 
 def _extract_tex_snippet(text: str, name: str) -> str:
