@@ -117,7 +117,9 @@ class FormalizationEngine:
                     if did_repair:
                         continue
 
-            solved, failures, lean_code = _attempt_proofs(lean_code, self._config, context, segments)
+            solved, failures, lean_code = _attempt_proofs(
+                lean_code, self._config, context, segments, self._llm
+            )
             if failures:
                 _write_artifact(round_dir / "proof_failures.json", json.dumps(failures, indent=2))
             if not failures:
@@ -159,9 +161,18 @@ def _attempt_proofs(
     config: FormalizationConfig,
     context: str,
     segments,
+    llm: FormalizationLLM | None = None,
 ) -> tuple[int, list[str], str]:
-    if not config.lean_project or config.max_proof_rounds <= 0:
-        _log(config, "[prove] skipping proof search (no Lean project or disabled)")
+    if config.max_proof_rounds <= 0:
+        _log(config, "[prove] skipping proof search (disabled)")
+        return 0, [], lean_code
+    if config.proof_backend == "llm":
+        if llm is None:
+            _log(config, "[prove] skipping proof search (no LLM configured)")
+            return 0, [], lean_code
+        return _attempt_proofs_llm(lean_code, config, context, segments, llm)
+    if not config.lean_project:
+        _log(config, "[prove] skipping proof search (no Lean project configured)")
         return 0, [], lean_code
 
     names = _extract_decl_names(lean_code)
@@ -182,6 +193,74 @@ def _attempt_proofs(
             if result:
                 lean_code = _replace_sorry(lean_code, name, proof_lines)
                 solved += 1
+                _log(config, f"[prove] solved {name}")
+            else:
+                next_pending.append(name)
+                _log(config, f"[prove] failed {name}")
+        pending = next_pending
+
+    failures.extend(pending)
+    return solved, failures, lean_code
+
+
+def _attempt_proofs_llm(
+    lean_code: str,
+    config: FormalizationConfig,
+    context: str,
+    segments,
+    llm: FormalizationLLM,
+) -> tuple[int, list[str], str]:
+    names = _extract_decl_names(lean_code)
+    failures: list[str] = []
+    solved = 0
+    rounds = 0
+    pending = [name for name in names if _decl_has_placeholder(lean_code, name)]
+    tex_snippets = _build_tex_snippet_map(segments, lean_code)
+
+    if not pending:
+        return 0, [], lean_code
+
+    while pending and rounds < config.max_proof_rounds:
+        rounds += 1
+        _log(config, f"[prove] round {rounds}/{config.max_proof_rounds}")
+        next_pending: list[str] = []
+        for name in pending:
+            _log(config, f"[prove] attempting {name}")
+            snippet = tex_snippets.get(name, "")
+            error: str | None = None
+            success = False
+            attempts = max(1, int(config.proof_repair) + 1)
+            for attempt in range(1, attempts + 1):
+                _log(config, "[llm] requesting proof update")
+                try:
+                    updated = llm.prove(
+                        lean_code=lean_code,
+                        name=name,
+                        instruction="",
+                        tex_snippet=snippet,
+                        context=context,
+                        error=error,
+                    )
+                except Exception as exc:
+                    _log(config, f"[llm] error: {exc}")
+                    break
+                if not updated.strip():
+                    break
+                updated = _normalize_lean_output(updated)
+                updated = _inject_tex_snippets(updated, segments)
+                config.output_path.write_text(updated, encoding="utf-8")
+                lean_code = updated
+                if _decl_has_placeholder(updated, name):
+                    error = f"Declaration `{name}` still contains sorry/admit."
+                    continue
+                check_error = _typecheck(updated, config)
+                if check_error:
+                    error = check_error
+                    continue
+                solved += 1
+                success = True
+                break
+            if success:
                 _log(config, f"[prove] solved {name}")
             else:
                 next_pending.append(name)
@@ -271,6 +350,12 @@ def _make_llm_client(config: FormalizationConfig):
 
 
 def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
+    if config.lean_backend == "cli":
+        from ..lean.cli_check import lean_cli_check
+
+        project_path = config.lean_project or _find_lean_project(config.output_path)
+        return lean_cli_check(config.output_path, project_path=project_path, timeout_s=60.0)
+
     if not config.lean_project:
         return None
     try:
@@ -309,6 +394,16 @@ def _decl_has_sorry(text: str, name: str) -> bool:
     next_decl = re.search(r"\b(theorem|lemma|example|proposition|corollary)\b", rest)
     scope = rest if not next_decl else rest[: next_decl.start()]
     return "sorry" in scope
+
+
+def _decl_has_placeholder(text: str, name: str) -> bool:
+    match = re.search(rf"\b(theorem|lemma|example|proposition|corollary)\s+{re.escape(name)}\b", text)
+    if not match:
+        return False
+    rest = text[match.end():]
+    next_decl = re.search(r"\b(theorem|lemma|example|proposition|corollary)\b", rest)
+    scope = rest if not next_decl else rest[: next_decl.start()]
+    return bool(re.search(r"\b(sorry|admit)\b", scope))
 
 
 def _replace_sorry(text: str, name: str, proof_lines: list[str]) -> str:
@@ -465,6 +560,18 @@ def _split_imports_for_typecheck(text: str) -> tuple[list[str], str]:
     return imports, "\n".join(body).lstrip("\n")
 
 
+def _find_lean_project(path: Path) -> Path | None:
+    root = path if path.is_dir() else path.parent
+    for parent in [root, *root.parents]:
+        if (
+            (parent / "lakefile.lean").exists()
+            or (parent / "lakefile.toml").exists()
+            or (parent / "lean-toolchain").exists()
+        ):
+            return parent
+    return None
+
+
 def _fallback_lean(tex: str) -> str:
     lines = ["/-", "Original .tex:", tex, "-/", "", "-- TODO: formalize above."]
     return "\n".join(lines)
@@ -581,6 +688,8 @@ def _config_snapshot(config: FormalizationConfig) -> dict:
         "proof_k": config.proof_k,
         "proof_timeout_s": config.proof_timeout_s,
         "proof_repair": config.proof_repair,
+        "proof_backend": config.proof_backend,
+        "lean_backend": config.lean_backend,
         "lean_project": str(config.lean_project) if config.lean_project else None,
         "lean_imports": list(config.lean_imports),
         "resume_path": str(config.resume_path) if config.resume_path else None,

@@ -41,7 +41,21 @@ prove that every PID is a UFD; use mathlib's IsPrincipalIdealRing → UniqueFact
 
 ---
 
-## Status (v0.1.3)
+## Modes
+These modes apply to both `prove` and `formalize` workflows (you can set them via Settings or CLI flags).
+
+Proof modes:
+- `tactic`: LLM proposes the next tactic; LeanDojo checks each step. **Pros:** fast feedback, goal-state aware. **Cons:** brittle for long chains.
+- `lemma`: LLM drafts a lemma plan; each lemma is proved sequentially. **Pros:** decomposes big proofs. **Cons:** depends on plan quality, more scaffolding.
+- `llm`: LLM rewrites the Lean file; Lean CLI typechecks. **Pros:** handles multi-step edits, no Dojo required. **Cons:** slower, less guidance than goals, relies on LLM (requires Lean CLI).
+
+Lean backends:
+- `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
+- `cli`: `lake env lean` typecheck. **Pros:** simple, works with any toolchain. **Cons:** no goal-state feedback.
+
+---
+
+## Status (v0.1.4)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
@@ -52,6 +66,7 @@ This repo contains a **first working scaffold** of the CLI and search loop. It i
 - **Lemma-first planning** with automatic expansion on failure
 - **Run summaries** appended to `.lean` on failed attempts
 - **Settings** for solver choice and lemma limits
+- **LLM-only mode** (Lean CLI typecheck, no Dojo)
 - `ulam prove` and `ulam replay` commands
 - Best-first search with beam cap + repair loop
 - LLM adapters: OpenAI-compatible + Ollama + mock
@@ -60,7 +75,7 @@ This repo contains a **first working scaffold** of the CLI and search loop. It i
 - Trace logging to JSONL (`run.jsonl` by default)
 - Interactive menu (`ulam`) for configuration + guided workflows
 
-What is *not* implemented yet: toolchain pinning, robust value models, and full autoformalization workflows.
+What is *not* implemented yet: robust value models and full autoformalization workflows.
 
 Pipeline reference:
 - `docs/pipeline.md`
@@ -109,6 +124,8 @@ ulam formalize examples/Formalize.tex --out examples/Formalize.lean
 Formalization options:
 - `--no-equivalence` to skip statement equivalence checks.
 - `--artifacts-dir` to store per-round artifacts (defaults to `runs/formalize_YYYYMMDD_HHMMSS`).
+- `--proof-backend` (`dojo|llm`) to choose proof backend.
+- `--lean-backend` (`dojo|cli`) to choose typecheck backend.
 
 One-line installer (once the repo is public, replace `<ORG>/<REPO>`):
 
@@ -125,47 +142,71 @@ brew install ulam
 
 ---
 
-## Quickstart (local)
+## Commands
 Mock mode lets you smoke-test the CLI without Lean installed:
 
 ```bash
-python -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke
+python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke
 ```
 
 Natural language guidance:
 
 ```bash
-python -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --instruction "Use a short automation tactic first."
+python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --instruction "Use a short automation tactic first."
 ```
 
 Verbose logs (LLM suggestions + tactic outcomes):
 
 ```bash
-python -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --verbose
+python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --verbose
 ```
 
 Attach context files:
 
 ```bash
-python -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --context examples/Smoke.lean
+python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --context examples/Smoke.lean
 ```
 
 Replay the run:
 
 ```bash
-python -m ulam replay run.jsonl
+python3 -m ulam replay run.jsonl
 ```
 
 Run the regression suite (mock by default):
 
 ```bash
-python -m ulam bench --suite bench/regression.jsonl
+python3 -m ulam bench --suite bench/regression.jsonl
 ```
 
 LeanDojo-v2 mode (real Lean, requires a Lean project and `sorry` placeholder):
 
 ```bash
-python -m ulam prove path/to/File.lean --theorem MyTheorem --lean dojo --lean-project /path/to/lean-project
+python3 -m ulam prove path/to/File.lean --theorem MyTheorem --lean dojo --lean-project /path/to/lean-project
+```
+
+Lemma-first mode:
+
+```bash
+python3 -m ulam prove path/to/File.lean --theorem MyTheorem --prove-mode lemma
+```
+
+LLM-only mode (no Dojo, uses Lean CLI typecheck):
+
+```bash
+python3 -m ulam prove path/to/File.lean --theorem MyTheorem --prove-mode llm --llm-rounds 4
+```
+
+Formalize a .tex document:
+
+```bash
+python3 -m ulam formalize paper.tex --out paper.lean
+```
+
+Formalize with LLM-only proof attempts:
+
+```bash
+python3 -m ulam formalize paper.tex --proof-backend llm --lean-backend cli
 ```
 
 Install the CLI entrypoint if you want `ulam` directly:
@@ -204,7 +245,7 @@ Flags:
 - `--lakefile-lean` to generate a `lakefile.lean` mirror of `lakefile.toml`.
 
 Note: Pantograph is anchored to a specific Lean toolchain (from its `src/lean-toolchain`). UlamAI will
-align the Mathlib project to that toolchain when possible. citeturn5search4
+align the Mathlib project to that toolchain when possible.
 
 Install Lean + Lake (macOS/Linux):
 
@@ -239,7 +280,7 @@ OpenAI-compatible (default):
 - `ULAM_OPENAI_MODEL` (default `gpt-4.1`)
 
 Codex (ChatGPT subscription) login:
-- Run `codex login` and UlamAI can import credentials from `~/.codex/auth.json`.
+- Run `ulam auth codex` (or `codex login`) and UlamAI can import credentials from `~/.codex/auth.json`.
 - This is the same flow used by the official Codex CLI (ChatGPT sign‑in creates a key automatically).
 
 Codex CLI provider (subscription):
@@ -255,7 +296,7 @@ Claude (Anthropic):
 - `ULAM_ANTHROPIC_MODEL` (default `claude-3-5-sonnet-20240620`)
 
 Claude Code CLI provider (subscription):
-- Run `claude setup-token` and set `--llm claude_cli` (no API key required).
+- Run `ulam auth claude` (or `claude setup-token`) and set `--llm claude_cli` (no API key required).
 
 Embeddings (for retrieval):
 - `ULAM_EMBED_API_KEY` (defaults to `ULAM_OPENAI_API_KEY`)
@@ -274,6 +315,14 @@ Retrievers:
 Menu config file:
 - Stored at `.ulam/config.json` by default (override with `ULAM_CONFIG` or `ULAM_CONFIG_DIR`).
 - If no provider credentials are set, the menu will prompt you to configure them before proving.
+
+---
+
+## Troubleshooting
+
+- **LLM‑only mode fails to typecheck:** make sure `lean`/`lake` is on PATH and the file is inside a Lean project (has `lakefile.lean` or `lean-toolchain`).
+- **LeanDojo mismatch errors:** run `ulam -lean` in your project folder or re-run `ulam lean-setup` to align the toolchain.
+- **Codex/Claude CLI hangs:** set `LLM request timeout` in Settings or keep it `0` and use heartbeat logs to verify it’s running.
 
 ---
 

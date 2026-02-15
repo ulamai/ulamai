@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         choices=["mock", "openai", "ollama", "anthropic", "codex_cli", "claude_cli"],
         default="mock",
     )
-    prove.add_argument("--lean", choices=["mock", "dojo"], default="mock")
+    prove.add_argument("--lean", choices=["mock", "dojo", "cli"], default="mock")
     prove.add_argument(
         "--lean-project",
         type=Path,
@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--max-steps", type=int, default=64)
     prove.add_argument("--beam", type=int, default=4)
     prove.add_argument("--k", type=int, default=1, help="suggestions per state")
+    prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
     prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
     prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
     prove.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
@@ -117,7 +118,7 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--verbose", action="store_true", help="print search/LLM logs")
     prove.add_argument(
         "--prove-mode",
-        choices=["tactic", "lemma"],
+        choices=["tactic", "lemma", "llm"],
         default="tactic",
         help="proof search mode",
     )
@@ -181,6 +182,18 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--proof-repair", type=int, default=2)
     formalize.add_argument("--lean-project", type=Path, default=None)
     formalize.add_argument("--lean-import", action="append", default=[])
+    formalize.add_argument(
+        "--proof-backend",
+        choices=["dojo", "llm"],
+        default="dojo",
+        help="proof backend (dojo uses LeanDojo, llm uses Lean CLI)",
+    )
+    formalize.add_argument(
+        "--lean-backend",
+        choices=["dojo", "cli"],
+        default="dojo",
+        help="typecheck backend (dojo uses Pantograph, cli uses lake/lean)",
+    )
     formalize.add_argument("--no-equivalence", action="store_true", help="skip equivalence checks")
     formalize.add_argument("--artifacts-dir", type=Path, default=None)
     formalize.add_argument("--verbose", action="store_true")
@@ -343,6 +356,9 @@ def run_prove(args: argparse.Namespace) -> None:
             runner.close()
 
     try:
+        if args.prove_mode == "llm":
+            run_prove_llm(args)
+            return
         if args.prove_mode == "lemma":
             run_prove_lemma_first(args)
             return
@@ -377,6 +393,73 @@ def run_prove(args: argparse.Namespace) -> None:
     print("Failed to solve.")
     print(result.error or "unknown error")
     _summarize_failed_run(args)
+
+
+def run_prove_llm(args: argparse.Namespace) -> None:
+    try:
+        text = args.file.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"Failed to read Lean file: {exc}")
+        return
+    if not _file_has_decl(text, args.theorem):
+        print(f"Could not find `{args.theorem}` in {args.file}")
+        _suggest_proof_targets(args.file, args.theorem)
+        return
+
+    config = _llm_config_from_args(args)
+    llm = FormalizationLLM(args.llm, config)
+    instruction = args.instruction.strip() if args.instruction else ""
+    context = "\n\n".join(_read_context_files(args.context))
+    max_rounds = max(1, int(getattr(args, "llm_rounds", 4)))
+    project = args.lean_project or _find_lean_project_for_file(args.file)
+    if project:
+        print(f"[llm] using Lean project: {project}")
+    else:
+        print("[llm] no Lean project detected; attempting Lean CLI directly.")
+
+    from .lean.cli_check import lean_cli_check
+
+    error: str | None = None
+    for round_idx in range(1, max_rounds + 1):
+        print(f"[llm] round {round_idx}/{max_rounds}")
+        tex_snippet = _extract_tex_snippet(text, args.theorem)
+        print("[llm] requesting proof update...")
+        try:
+            updated = llm.prove(
+                lean_code=text,
+                name=args.theorem,
+                instruction=instruction,
+                tex_snippet=tex_snippet,
+                context=context,
+                error=error,
+            )
+        except Exception as exc:
+            print(f"[llm] error: {exc}")
+            break
+        if not updated.strip():
+            print("LLM returned empty output.")
+            break
+        updated = _normalize_llm_output(updated)
+        args.file.write_text(updated, encoding="utf-8")
+        text = updated
+        if _decl_has_placeholder(updated, args.theorem):
+            error = f"Declaration `{args.theorem}` still contains sorry/admit."
+            print(f"[typecheck] {error}")
+            continue
+        check_error = lean_cli_check(
+            args.file,
+            project_path=project,
+            timeout_s=max(30.0, float(args.timeout)),
+        )
+        if check_error:
+            error = check_error
+            print(f"[typecheck] error: {check_error[:200]}")
+            continue
+        print("Solved.")
+        print(f"Wrote proof to: {args.file}")
+        return
+
+    print("Failed to solve with LLM-only mode.")
 
 
 def run_prove_lemma_first(args: argparse.Namespace) -> None:
@@ -542,6 +625,13 @@ def _decl_needs_proof(text: str, name: str) -> bool:
     if not block:
         return False
     return re.search(r"\bsorry\b", block) is not None
+
+
+def _decl_has_placeholder(text: str, name: str) -> bool:
+    block = _decl_block(text, name)
+    if not block:
+        return False
+    return re.search(r"\b(sorry|admit)\b", block) is not None
 
 
 def _decl_block(text: str, name: str) -> str:
@@ -1884,6 +1974,10 @@ def run_formalize(args: argparse.Namespace) -> None:
     output_path = args.out if args.out else tex_path.with_suffix(".lean")
     context_files = [Path(p) for p in args.context]
 
+    proof_backend = args.proof_backend
+    lean_backend = args.lean_backend
+    if proof_backend == "llm":
+        lean_backend = "cli"
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -1900,6 +1994,8 @@ def run_formalize(args: argparse.Namespace) -> None:
         lean_project=args.lean_project,
         lean_imports=args.lean_import,
         verbose=bool(args.verbose),
+        proof_backend=proof_backend,
+        lean_backend=lean_backend,
         resume_path=None,
         artifact_dir=args.artifacts_dir,
         equivalence_checks=not args.no_equivalence,
@@ -2028,6 +2124,65 @@ def _make_llm(args: argparse.Namespace):
     if args.llm == "claude_cli":
         return ClaudeCLIClient(model=args.anthropic_model or None)
     raise RuntimeError(f"unknown LLM backend: {args.llm}")
+
+
+def _llm_config_from_args(args: argparse.Namespace) -> dict:
+    cfg = load_config()
+    cfg["llm_provider"] = args.llm
+    openai = cfg.setdefault("openai", {})
+    anthropic = cfg.setdefault("anthropic", {})
+    ollama = cfg.setdefault("ollama", {})
+    if args.llm in {"openai", "codex_cli"}:
+        if args.openai_key:
+            openai["api_key"] = args.openai_key
+        if args.openai_base_url:
+            openai["base_url"] = args.openai_base_url
+        if args.openai_model:
+            openai["model"] = args.openai_model
+            openai["codex_model"] = args.openai_model
+    if args.llm in {"anthropic", "claude_cli"}:
+        if args.anthropic_key:
+            anthropic["api_key"] = args.anthropic_key
+        if args.anthropic_setup_token:
+            anthropic["setup_token"] = args.anthropic_setup_token
+        if args.anthropic_base_url:
+            anthropic["base_url"] = args.anthropic_base_url
+        if args.anthropic_model:
+            anthropic["model"] = args.anthropic_model
+            anthropic["claude_model"] = args.anthropic_model
+    if args.llm == "ollama":
+        if args.ollama_base_url:
+            ollama["base_url"] = args.ollama_base_url
+        if args.ollama_model:
+            ollama["model"] = args.ollama_model
+    return cfg
+
+
+def _normalize_llm_output(text: str) -> str:
+    lines = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            lines.append(line)
+        else:
+            lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    return cleaned + "\n" if cleaned else ""
+
+
+def _extract_tex_snippet(text: str, name: str) -> str:
+    marker = f"ULAMAI_TEX_SNIPPET: {name}"
+    pattern = re.compile(rf"/-\\s*{re.escape(marker)}\\s*(.*?)\\s*-/", re.S)
+    match = pattern.search(text)
+    if match:
+        return match.group(1).strip()
+    original = re.search(r"/-\\s*ULAMAI_ORIGINAL_STATEMENT\\s*(.*?)\\s*-/", text, re.S)
+    if original:
+        return original.group(1).strip()
+    return ""
 
 
 def _make_retriever(args: argparse.Namespace):

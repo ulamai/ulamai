@@ -27,6 +27,18 @@ class FormalizationLLM:
         prompt = _build_improve_prompt(lean_code, failures, context)
         return self._call(prompt)
 
+    def prove(
+        self,
+        lean_code: str,
+        name: str,
+        instruction: str,
+        tex_snippet: str,
+        context: str,
+        error: str | None = None,
+    ) -> str:
+        prompt = _build_proof_prompt(lean_code, name, instruction, tex_snippet, context, error)
+        return self._call(prompt)
+
     def equivalence_check(self, tex_statement: str, lean_statement: str) -> dict:
         prompt = _build_equivalence_prompt(tex_statement, lean_statement)
         raw = self._call(prompt)
@@ -158,6 +170,41 @@ def _build_improve_prompt(lean_code: str, failures: list[str], context: str) -> 
     if context:
         prompt += "Context files:\n" + context + "\n\n"
     prompt += "Return ONLY updated Lean code."
+    return prompt
+
+
+def _build_proof_prompt(
+    lean_code: str,
+    name: str,
+    instruction: str,
+    tex_snippet: str,
+    context: str,
+    error: str | None,
+) -> str:
+    prompt = (
+        "You are a Lean 4 assistant. Output Lean code only.\n"
+        f"Task: complete the proof of `{name}` in the Lean file below.\n"
+        "- Preserve other declarations and imports.\n"
+        "- You may add helper lemmas before the target declaration if needed.\n"
+        "- Do NOT use `sorry` or `admit` in the proof of the target.\n\n"
+        "Lean file:\n"
+        f"{lean_code}\n\n"
+    )
+    if instruction:
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if tex_snippet:
+        snippet = tex_snippet.strip()
+        if len(snippet) > 1600:
+            snippet = snippet[:1600] + "\n-- (truncated)"
+        prompt += f"Informal proof snippet for {name}:\n{snippet}\n\n"
+    if context:
+        prompt += "Context files:\n" + context + "\n\n"
+    if error:
+        trimmed = error.strip()
+        if len(trimmed) > 2000:
+            trimmed = trimmed[:2000] + "\n-- (truncated)"
+        prompt += "Lean error:\n" + trimmed + "\n\n"
+    prompt += "Return ONLY the updated Lean file."
     return prompt
 
 
@@ -394,18 +441,36 @@ def _call_codex_cli(config: dict, prompt: str) -> str:
     from ..llm.cli_utils import codex_exec
 
     openai = config.get("openai", {})
+    llm_cfg = config.get("llm", {})
     model = openai.get("codex_model") or openai.get("model") or None
     system = "You are a Lean 4 formalization assistant. Output Lean code only."
-    return codex_exec(system, prompt, model=model)
+    timeout_s = float(llm_cfg.get("timeout_s", 0))
+    heartbeat_s = float(llm_cfg.get("heartbeat_s", 60))
+    return codex_exec(
+        system,
+        prompt,
+        model=model,
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
 
 
 def _call_claude_cli(config: dict, prompt: str) -> str:
     from ..llm.cli_utils import claude_print
 
     anthropic = config.get("anthropic", {})
+    llm_cfg = config.get("llm", {})
     model = anthropic.get("claude_model") or anthropic.get("model") or None
     system = "You are a Lean 4 formalization assistant. Output Lean code only."
-    return claude_print(system, prompt, model=model)
+    timeout_s = float(llm_cfg.get("timeout_s", 0))
+    heartbeat_s = float(llm_cfg.get("heartbeat_s", 60))
+    return claude_print(
+        system,
+        prompt,
+        model=model,
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
 
 
 def _parse_equivalence(raw: str) -> dict:
