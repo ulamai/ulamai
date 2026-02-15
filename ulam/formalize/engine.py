@@ -123,6 +123,18 @@ class FormalizationEngine:
             if failures:
                 _write_artifact(round_dir / "proof_failures.json", json.dumps(failures, indent=2))
             if not failures:
+                if typecheck_ok and _count_sorries(lean_code) == 0:
+                    axiom_error = _axiom_guardrail_error(lean_code, self._config.allow_axioms)
+                    if axiom_error:
+                        _log(self._config, f"[axiom] {axiom_error}")
+                        repaired = self._llm.repair(lean_code, axiom_error, context)
+                        if repaired.strip() and repaired != lean_code:
+                            repaired = _normalize_lean_output(repaired)
+                            repaired = _inject_tex_snippets(repaired, segments)
+                            _write_artifact(round_dir / "axiom_repair.lean", repaired)
+                            _write_diff(round_dir / "axiom_repair.diff", lean_code, repaired)
+                            lean_code = repaired
+                            continue
                 break
             if rounds >= self._config.max_rounds:
                 break
@@ -166,15 +178,33 @@ def _attempt_proofs(
     if config.max_proof_rounds <= 0:
         _log(config, "[prove] skipping proof search (disabled)")
         return 0, [], lean_code
-    if config.proof_backend == "llm":
+    mode = config.proof_backend or "tactic"
+    if mode == "dojo":
+        mode = "tactic"
+    if mode == "llm":
         if llm is None:
             _log(config, "[prove] skipping proof search (no LLM configured)")
             return 0, [], lean_code
         return _attempt_proofs_llm(lean_code, config, context, segments, llm)
+    if mode == "lemma":
+        if llm is None:
+            _log(config, "[prove] skipping lemma mode (no LLM configured)")
+            return 0, [], lean_code
+        return _attempt_proofs_lemma(lean_code, config, context, segments, llm)
     if not config.lean_project:
         _log(config, "[prove] skipping proof search (no Lean project configured)")
         return 0, [], lean_code
 
+    return _attempt_proofs_tactic(lean_code, config, context, segments, llm)
+
+
+def _attempt_proofs_tactic(
+    lean_code: str,
+    config: FormalizationConfig,
+    context: str,
+    segments,
+    llm: FormalizationLLM | None = None,
+) -> tuple[int, list[str], str]:
     names = _extract_decl_names(lean_code)
     failures: list[str] = []
     solved = 0
@@ -189,18 +219,133 @@ def _attempt_proofs(
         for name in pending:
             _log(config, f"[prove] attempting {name}")
             snippet = tex_snippets.get(name, "")
-            result, proof_lines = _run_prover(name, config, context, snippet)
+            result, proof_lines, _, error = _run_prover(name, config, context, snippet)
             if result:
                 lean_code = _replace_sorry(lean_code, name, proof_lines)
+                _write_output_inline(config, lean_code)
                 solved += 1
                 _log(config, f"[prove] solved {name}")
             else:
+                if error:
+                    _log(config, f"[prove] prover error for {name}: {error}")
+                    if llm is not None:
+                        repaired = llm.repair(lean_code, error, context)
+                        if repaired.strip() and repaired != lean_code:
+                            repaired = _normalize_lean_output(repaired)
+                            repaired = _inject_tex_snippets(repaired, segments)
+                            _write_output_inline(config, repaired)
+                            lean_code = repaired
                 next_pending.append(name)
                 _log(config, f"[prove] failed {name}")
         pending = next_pending
 
     failures.extend(pending)
     return solved, failures, lean_code
+
+
+def _attempt_proofs_lemma(
+    lean_code: str,
+    config: FormalizationConfig,
+    context: str,
+    segments,
+    llm: FormalizationLLM,
+) -> tuple[int, list[str], str]:
+    names = _extract_decl_names(lean_code)
+    pending = [name for name in names if _decl_has_sorry(lean_code, name)]
+    if not pending:
+        return 0, [], lean_code
+    tex_snippets = _build_tex_snippet_map(segments, lean_code)
+
+    for name in list(pending):
+        marker = _lemma_plan_marker(name)
+        if marker in lean_code:
+            continue
+        theorem_stmt, original_stmt = _extract_theorem_statement_from_text(lean_code, name)
+        if not theorem_stmt:
+            continue
+        original = tex_snippets.get(name, "") or original_stmt or theorem_stmt
+        plan_code = llm.plan_lemmas(
+            theorem_name=name,
+            theorem_statement=theorem_stmt,
+            original_statement=original,
+            context=context,
+        )
+        if not plan_code.strip():
+            continue
+        snippet = _strip_imports_from_snippet(plan_code)
+        blocks = _extract_decl_blocks(snippet)
+        lean_code, new_names = _insert_lemmas_before_in_text(lean_code, name, blocks)
+        if new_names:
+            lean_code = _insert_lemma_plan_marker(lean_code, name)
+            _write_output_inline(config, lean_code)
+
+    # Recompute pending after inserting lemma plans.
+    pending = [name for name in _extract_decl_names(lean_code) if _decl_has_sorry(lean_code, name)]
+    if not pending:
+        return 0, [], lean_code
+
+    queue: list[tuple[str, int]] = [(name, 0) for name in pending]
+    solved: set[str] = set()
+    failures: list[str] = []
+    total_decl_count = len(_extract_decl_names(lean_code))
+    completed = total_decl_count - len(queue)
+
+    while queue:
+        _log(config, f"[lemma-first] Progress {completed}/{total_decl_count} solved")
+        name, depth = queue.pop(0)
+        if name in solved:
+            continue
+        _log(config, f"[lemma-first] Proving {name}...")
+        trace_path = _lemma_trace_path(name)
+        result, proof_lines, trace_path, error = _run_prover(
+            name, config, context, tex_snippets.get(name, ""), trace_path=trace_path
+        )
+        if result:
+            lean_code = _replace_sorry(lean_code, name, proof_lines)
+            _write_output_inline(config, lean_code)
+            solved.add(name)
+            completed += 1
+            continue
+
+        if error:
+            _log(config, f"[lemma-first] prover error for {name}: {error}")
+            repaired = llm.repair(lean_code, error, context)
+            if repaired.strip() and repaired != lean_code:
+                repaired = _normalize_lean_output(repaired)
+                repaired = _inject_tex_snippets(repaired, segments)
+                _write_output_inline(config, repaired)
+                lean_code = repaired
+                queue.append((name, depth))
+            else:
+                failures.append(name)
+            continue
+
+        failures.append(name)
+        total_decl_count = len(_extract_decl_names(lean_code))
+        if total_decl_count >= config.lemma_max or depth >= config.lemma_depth:
+            _log(config, "[lemma-first] limits reached; stopping.")
+            break
+
+        expanded = _expand_lemmas_for_failure(
+            lean_code,
+            name,
+            trace_path,
+            context,
+            llm,
+        )
+        if not expanded:
+            _log(config, f"[lemma-first] failed to expand lemma {name}")
+            break
+        lean_code, new_names = expanded
+        if new_names:
+            _write_output_inline(config, lean_code)
+            for new_name in reversed(new_names):
+                queue.insert(0, (new_name, depth + 1))
+        queue.insert(0, (name, depth + 1))
+
+    pending = [name for name in _extract_decl_names(lean_code) if _decl_has_sorry(lean_code, name)]
+    failures.extend(name for name in pending if name not in solved)
+    return len(solved), failures, lean_code
 
 
 def _attempt_proofs_llm(
@@ -276,12 +421,19 @@ def _run_prover(
     config: FormalizationConfig,
     context: str,
     tex_snippet: str,
-) -> tuple[bool, list[str]]:
+    trace_path: Path | None = None,
+) -> tuple[bool, list[str], Path | None, str | None]:
     from ..lean.dojo import LeanDojoRunner
 
     llm_client = _make_llm_client(config)
-    runner = LeanDojoRunner(project_path=config.lean_project, imports=config.lean_imports)
-    trace = TraceLogger(None)
+    runner = LeanDojoRunner(
+        project_path=config.lean_project,
+        imports=config.lean_imports,
+        timeout_s=config.dojo_timeout_s,
+    )
+    trace = TraceLogger(trace_path)
+    error: str | None = None
+    result = None
     try:
         instruction = _format_proof_instruction(name, tex_snippet, context)
         run_config = RunConfig(
@@ -300,13 +452,17 @@ def _run_prover(
             verbose=config.verbose,
         )
         result = scripted_search(runner, llm_client, _null_retriever(), trace, run_config)
+    except Exception as exc:
+        error = str(exc)
     finally:
         trace.close()
         runner.close()
 
-    if result.solved:
-        return True, ["by"] + [f"  {line}" for line in result.proof]
-    return False, []
+    if error:
+        return False, [], trace_path, error
+    if result and result.solved:
+        return True, list(result.proof), trace_path, None
+    return False, [], trace_path, None
 
 
 def _make_llm_client(config: FormalizationConfig):
@@ -368,7 +524,7 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
     project_path = config.lean_project or _find_project_root(config.output_path)
     parsed_imports, body = _split_imports_for_typecheck(lean_code)
     imports = _merge_imports(config.lean_imports, parsed_imports)
-    server = _create_server(Server, project_path, imports)
+    server = _create_server(Server, project_path, imports, timeout_s=config.dojo_timeout_s)
     try:
         server.load_sorry(body)
         return None
@@ -414,8 +570,16 @@ def _replace_sorry(text: str, name: str, proof_lines: list[str]) -> str:
     next_decl = re.search(r"\b(theorem|lemma|example|proposition|corollary)\b", rest)
     end_idx = len(text) if not next_decl else match.end() + next_decl.start()
     block = text[match.end():end_idx]
-    new_block = block.replace("sorry", "\n".join(proof_lines), 1)
-    return text[: match.end()] + new_block + text[end_idx:]
+    sorry_match = re.search(r"\bsorry\b", block)
+    if not sorry_match:
+        return text
+    start = match.end() + sorry_match.start()
+    end = match.end() + sorry_match.end()
+    line_start = text.rfind("\n", 0, start) + 1
+    line_prefix = text[line_start:start]
+    indent = re.match(r"\s*", line_prefix).group(0) if line_prefix is not None else ""
+    proof_block = "\n".join(f"{indent}{line}" for line in proof_lines)
+    return text[:line_start] + proof_block + text[end:]
 
 
 def _normalize_lean_output(text: str) -> str:
@@ -494,6 +658,45 @@ def _normalize_imports(text: str) -> str:
             output_lines.append("")
     output_lines.extend(rest)
     return "\n".join(output_lines).strip()
+
+
+def _axiom_guardrail_error(text: str, allow_axioms: bool) -> Optional[str]:
+    if allow_axioms:
+        remaining, err = _strip_assumptions_block(text)
+        if err:
+            return err
+        cleaned = _strip_comments(remaining)
+        if re.search(r"\b(axiom|constant)\b", cleaned):
+            return (
+                "Axioms/constants are only allowed inside the ULAMAI assumptions block "
+                "(/- ULAMAI_ASSUMPTIONS_BEGIN -/ ... /- ULAMAI_ASSUMPTIONS_END -/)."
+            )
+        return None
+
+    cleaned = _strip_comments(text)
+    if re.search(r"\b(axiom|constant)\b", cleaned):
+        return "Axioms/constants are not allowed. Replace with lemma/theorem + sorry."
+    return None
+
+
+def _strip_comments(text: str) -> str:
+    no_block = re.sub(r"/-.*?-/", "", text, flags=re.S)
+    no_line = re.sub(r"--.*", "", no_block)
+    return no_line
+
+
+def _strip_assumptions_block(text: str) -> tuple[str, Optional[str]]:
+    begin = "/- ULAMAI_ASSUMPTIONS_BEGIN -/"
+    end = "/- ULAMAI_ASSUMPTIONS_END -/"
+    remaining = text
+    while True:
+        start = remaining.find(begin)
+        if start == -1:
+            return remaining, None
+        finish = remaining.find(end, start + len(begin))
+        if finish == -1:
+            return remaining, "Assumptions block is missing ULAMAI_ASSUMPTIONS_END."
+        remaining = remaining[:start] + remaining[finish + len(end) :]
 
 
 def _build_tex_snippet_map(segments, lean_code: str, max_chars: int = 1800) -> dict[str, str]:
@@ -579,6 +782,11 @@ def _fallback_lean(tex: str) -> str:
 
 def _count_sorries(text: str) -> int:
     return len(re.findall(r"\bsorry\b", text))
+
+
+def _write_output_inline(config: FormalizationConfig, lean_code: str) -> None:
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    config.output_path.write_text(_normalize_lean_output(lean_code), encoding="utf-8")
 
 
 def _log_progress(config: FormalizationConfig, total: int, remaining: int) -> None:
@@ -688,6 +896,10 @@ def _config_snapshot(config: FormalizationConfig) -> dict:
         "proof_k": config.proof_k,
         "proof_timeout_s": config.proof_timeout_s,
         "proof_repair": config.proof_repair,
+        "dojo_timeout_s": config.dojo_timeout_s,
+        "lemma_max": config.lemma_max,
+        "lemma_depth": config.lemma_depth,
+        "allow_axioms": config.allow_axioms,
         "proof_backend": config.proof_backend,
         "lean_backend": config.lean_backend,
         "lean_project": str(config.lean_project) if config.lean_project else None,
@@ -738,6 +950,196 @@ def _extract_decl_blocks(text: str) -> list[dict]:
             }
         )
     return blocks
+
+
+def _lemma_plan_marker(name: str) -> str:
+    return f"ULAMAI_LEMMA_PLAN:{name}"
+
+
+def _insert_lemma_plan_marker(text: str, name: str) -> str:
+    marker = _lemma_plan_marker(name)
+    if marker in text:
+        return text
+    block = f"/- {marker} -/\n"
+    pattern = re.compile(
+        rf"^\s*(theorem|lemma|example|proposition|corollary)\s+{re.escape(name)}\b",
+        re.M,
+    )
+    match = pattern.search(text)
+    if not match:
+        return text
+    return text[: match.start()] + block + text[match.start() :]
+
+
+def _extract_theorem_statement_from_text(text: str, theorem: str) -> tuple[str, str]:
+    original = _extract_original_statement(text)
+    decl_match = re.search(
+        rf"\b(theorem|lemma|example|proposition|corollary)\s+{re.escape(theorem)}\b",
+        text,
+    )
+    if not decl_match:
+        return "", original
+    proof_match = re.search(r":=\s*by\b", text[decl_match.end():], re.S)
+    if not proof_match:
+        return "", original
+    start = decl_match.end()
+    end = decl_match.end() + proof_match.start()
+    header = text[start:end]
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    colon_idx = None
+    i = 0
+    while i < len(header):
+        ch = header[i]
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+        elif ch == ":" and i + 1 < len(header) and header[i + 1] == "=":
+            i += 1
+        elif ch == ":" and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            colon_idx = i
+            break
+        i += 1
+    if colon_idx is None:
+        return "", original
+    stmt_raw = header[colon_idx + 1 :]
+    stmt = " ".join(stmt_raw.split())
+    return stmt, original
+
+
+def _extract_original_statement(text: str) -> str:
+    match = re.search(r"/-\s*ULAMAI_ORIGINAL_STATEMENT\s*(.*?)\s*-/", text, re.S)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _strip_imports_from_snippet(snippet: str) -> str:
+    lines = []
+    for line in snippet.splitlines():
+        if line.strip().startswith("import "):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _insert_lemmas_before_in_text(
+    text: str, target_name: str, blocks: list[dict]
+) -> tuple[str, list[str]]:
+    existing = set(_extract_decl_names(text))
+    kept_blocks: list[str] = []
+    new_names: list[str] = []
+    for block in blocks:
+        name = block.get("name") or ""
+        if not name or name == target_name:
+            continue
+        if name in existing:
+            continue
+        block_text = block.get("block", "").rstrip()
+        if not block_text:
+            continue
+        kept_blocks.append(block_text + "\n")
+        new_names.append(name)
+
+    if not kept_blocks:
+        return text, []
+
+    match = re.search(
+        rf"\b(theorem|lemma|example|proposition|corollary)\s+{re.escape(target_name)}\b",
+        text,
+    )
+    if match is None:
+        return text, []
+
+    insert_at = match.start()
+    insert_block = "\n".join(kept_blocks).rstrip() + "\n\n"
+    new_text = text[:insert_at] + insert_block + text[insert_at:]
+    return new_text, new_names
+
+
+def _lemma_trace_path(name: str) -> Path:
+    stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_]+", "_", name)
+    return Path("runs") / f"trace_{safe}_{stamp}.jsonl"
+
+
+def _read_trace_steps(path: Path, max_lines: int = 200) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if max_lines and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    steps: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            steps.append(json.loads(line))
+        except Exception:
+            continue
+    return steps
+
+
+def _summarize_trace_steps(steps: list[dict]) -> tuple[str, list[str], list[str]]:
+    last_goal = ""
+    failures: list[str] = []
+    successes: list[str] = []
+    for step in steps:
+        tactic = step.get("tactic", "")
+        ok = step.get("ok", False)
+        if step.get("state_pretty"):
+            last_goal = step["state_pretty"]
+        if ok:
+            if tactic:
+                successes.append(tactic)
+            continue
+        err = step.get("error") or "error"
+        if tactic:
+            failures.append(f"{tactic}: {err}")
+        else:
+            failures.append(str(err))
+    return last_goal, failures, successes
+
+
+def _expand_lemmas_for_failure(
+    lean_code: str,
+    lemma_name: str,
+    trace_path: Path | None,
+    context: str,
+    llm: FormalizationLLM,
+) -> tuple[str, list[str]] | None:
+    lemma_stmt, original_stmt = _extract_theorem_statement_from_text(lean_code, lemma_name)
+    if not lemma_stmt:
+        return None
+    steps = _read_trace_steps(trace_path) if trace_path else []
+    last_goal, failures, successes = _summarize_trace_steps(steps)
+    snippet = llm.expand_lemmas(
+        lemma_name=lemma_name,
+        lemma_statement=lemma_stmt,
+        last_goal=last_goal,
+        failures=failures,
+        successes=successes,
+        context=context,
+    )
+    if not snippet.strip():
+        return None
+    snippet = _strip_imports_from_snippet(snippet)
+    blocks = _extract_decl_blocks(snippet)
+    updated, new_names = _insert_lemmas_before_in_text(lean_code, lemma_name, blocks)
+    if not new_names:
+        return None
+    return updated, new_names
 
 
 def _decl_statement(block: str) -> str:

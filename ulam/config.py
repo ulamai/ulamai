@@ -38,6 +38,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "lean": {
         "project": "",
         "imports": [],
+        "dojo_timeout_s": 180,
     },
 }
 

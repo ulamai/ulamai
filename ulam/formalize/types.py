@@ -26,6 +26,10 @@ class FormalizationConfig:
     proof_k: int
     proof_timeout_s: float
     proof_repair: int
+    dojo_timeout_s: float
+    lemma_max: int
+    lemma_depth: int
+    allow_axioms: bool
     lean_project: Optional[Path]
     lean_imports: list[str]
     verbose: bool

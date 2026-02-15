@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from typing import Iterable
 
@@ -363,14 +364,35 @@ def _call_ollama(config: dict, prompt: str) -> str:
         "stream": False,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=120.0) as resp:
-        raw = resp.read().decode("utf-8")
-    return _extract_ollama(raw)
+    endpoints: list[str] = []
+    if base_url.endswith("/api"):
+        base_url = base_url[: -len("/api")]
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")]
+        endpoints.append(f"{base_url}/v1/chat/completions")
+    endpoints.append(f"{base_url}/api/chat")
+    endpoints.append(f"{base_url}/v1/chat/completions")
+    seen = set()
+    endpoints = [url for url in endpoints if not (url in seen or seen.add(url))]
+    last_error: Exception | None = None
+    for url in endpoints:
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                raw = resp.read().decode("utf-8")
+            return _extract_ollama(raw)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in (404, 405):
+                continue
+            raise
+    if last_error:
+        raise last_error
+    return ""
 
 
 def _call_anthropic(config: dict, prompt: str) -> str:
@@ -420,9 +442,18 @@ def _extract_openai(raw: str) -> str:
 def _extract_ollama(raw: str) -> str:
     data = json.loads(raw)
     message = data.get("message")
-    if not message or "content" not in message:
-        return ""
-    return message["content"]
+    if isinstance(message, dict) and "content" in message:
+        return message["content"]
+    choices = data.get("choices") or []
+    if choices:
+        choice = choices[0]
+        if "message" in choice and "content" in choice["message"]:
+            return choice["message"]["content"]
+        if "text" in choice:
+            return choice["text"]
+    if "response" in data and isinstance(data["response"], str):
+        return data["response"]
+    return ""
 
 
 def _extract_anthropic(raw: str) -> str:

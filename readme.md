@@ -55,10 +55,11 @@ Lean backends:
 
 ---
 
-## Status (v0.1.4)
+## Status (v0.1.5)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
+- **Axiom guardrail** (disallow axioms/constants by default; optional assumptions block)
 - **Resume last formalization** in the menu + reuse prior artifacts
 - **Per-lemma LaTeX proof snippets** injected into Lean comments and LLM prompts
 - **Formalize proof search** now runs sequential tactic scripts (better multi-step chaining)
@@ -289,6 +290,21 @@ Codex CLI provider (subscription):
 Ollama:
 - `ULAM_OLLAMA_BASE_URL` (default `http://localhost:11434`)
 - `ULAM_OLLAMA_MODEL` (default `llama3.1`)
+How to set it up (example with Llama 3.1 8B):
+```bash
+# 1) Install Ollama
+brew install ollama  # or follow https://ollama.com/download
+
+# 2) Start the server
+ollama serve
+
+# 3) Pull a model
+ollama pull llama3.1:8b
+
+# 4) Point Ulam to it (optional; defaults shown)
+export ULAM_OLLAMA_BASE_URL="http://localhost:11434"
+export ULAM_OLLAMA_MODEL="llama3.1:8b"
+```
 
 Claude (Anthropic):
 - `ULAM_ANTHROPIC_API_KEY` or `ULAM_ANTHROPIC_SETUP_TOKEN`

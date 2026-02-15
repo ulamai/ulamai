@@ -23,6 +23,16 @@ def run_claude_setup_token() -> Optional[str]:
     return None
 
 
+def run_claude_login() -> None:
+    try:
+        subprocess.run(
+            ["claude", "auth", "login"],
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("claude CLI not found on PATH") from exc
+
+
 def _extract_token(text: str) -> Optional[str]:
     matches = re.findall(r"\bsk-[A-Za-z0-9_-]{20,}\b", text)
     if matches:
