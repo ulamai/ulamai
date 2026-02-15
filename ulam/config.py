@@ -8,6 +8,10 @@ from typing import Any, Dict
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "llm_provider": "openai",
+    "llm": {
+        "timeout_s": 0,
+        "heartbeat_s": 60,
+    },
     "openai": {
         "api_key": "",
         "base_url": "https://api.openai.com",

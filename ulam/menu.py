@@ -131,8 +131,8 @@ def _configure_ollama(config: dict) -> None:
 
 def _configure_prover(config: dict) -> None:
     prove = config.setdefault("prove", {})
-    mode = _prompt("Default proof mode (tactic|lemma)", default=prove.get("mode", "tactic")).strip().lower()
-    if mode not in {"tactic", "lemma"}:
+    mode = _prompt("Default proof mode (tactic|lemma|llm)", default=prove.get("mode", "tactic")).strip().lower()
+    if mode not in {"tactic", "lemma", "llm"}:
         mode = "tactic"
     prove["mode"] = mode
     solver = _prompt(
@@ -151,6 +151,25 @@ def _configure_prover(config: dict) -> None:
         prove["k"] = max(1, int(suggestion_raw))
     except Exception:
         prove["k"] = 1
+    llm_rounds_default = str(prove.get("llm_rounds", 4))
+    llm_rounds_raw = _prompt("LLM-only max rounds", default=llm_rounds_default).strip()
+    try:
+        prove["llm_rounds"] = max(1, int(llm_rounds_raw))
+    except Exception:
+        prove["llm_rounds"] = 4
+    llm_section = config.setdefault("llm", {})
+    timeout_default = str(llm_section.get("timeout_s", 0))
+    timeout_raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=timeout_default).strip()
+    try:
+        llm_section["timeout_s"] = max(0, int(float(timeout_raw)))
+    except Exception:
+        llm_section["timeout_s"] = 0
+    heartbeat_default = str(llm_section.get("heartbeat_s", 60))
+    heartbeat_raw = _prompt("LLM heartbeat interval (seconds, 0 = off)", default=heartbeat_default).strip()
+    try:
+        llm_section["heartbeat_s"] = max(0, int(float(heartbeat_raw)))
+    except Exception:
+        llm_section["heartbeat_s"] = 60
     lemma_max = _prompt("Lemma max count", default=str(prove.get("lemma_max", 60))).strip()
     lemma_depth = _prompt("Lemma max depth", default=str(prove.get("lemma_depth", 60))).strip()
     try:
@@ -161,6 +180,25 @@ def _configure_prover(config: dict) -> None:
         prove["lemma_depth"] = max(1, int(lemma_depth))
     except Exception:
         prove["lemma_depth"] = 60
+
+    formalize = config.setdefault("formalize", {})
+    proof_backend = _prompt(
+        "Formalize proof backend (dojo|llm)",
+        default=formalize.get("proof_backend", "dojo"),
+    ).strip().lower()
+    if proof_backend not in {"dojo", "llm"}:
+        proof_backend = "dojo"
+    formalize["proof_backend"] = proof_backend
+    lean_backend_default = formalize.get(
+        "lean_backend", "cli" if proof_backend == "llm" else "dojo"
+    )
+    lean_backend = _prompt(
+        "Formalize typecheck backend (dojo|cli)",
+        default=lean_backend_default,
+    ).strip().lower()
+    if lean_backend not in {"dojo", "cli"}:
+        lean_backend = "dojo"
+    formalize["lean_backend"] = lean_backend
     print("\nSaved prover settings.\n")
 
 
@@ -174,9 +212,9 @@ def _menu_prove(config: dict) -> None:
     context_files = _parse_paths(extra_paths)
     prove_defaults = config.get("prove", {})
     prove_mode = _prompt(
-        "Proof mode (tactic|lemma)", default=prove_defaults.get("mode", "tactic")
+        "Proof mode (tactic|lemma|llm)", default=prove_defaults.get("mode", "tactic")
     ).strip().lower()
-    if prove_mode not in {"tactic", "lemma"}:
+    if prove_mode not in {"tactic", "lemma", "llm"}:
         prove_mode = "tactic"
     config.setdefault("prove", {})["mode"] = prove_mode
     save_config(config)
@@ -243,13 +281,18 @@ def _menu_prove(config: dict) -> None:
         print("LLM not configured. Saved task only; configure an LLM to run.")
         return
 
-    proceed, lean_project = _ensure_lean_backend(config, Path(file_path))
+    proceed, lean_project = _ensure_lean_backend(
+        config, Path(file_path), require_dojo=(prove_mode != "llm")
+    )
     if not proceed:
         return
 
     args = _build_args_from_config(config, file_path, theorem, instruction, context_files)
     args.prove_mode = prove_mode
-    if lean_project is None:
+    if prove_mode == "llm":
+        args.lean = "cli"
+        args.lean_project = lean_project
+    elif lean_project is None:
         args.lean = "mock"
         args.lean_project = None
         print("Running with mock Lean backend (no Lean project configured).")
@@ -287,6 +330,9 @@ def _menu_formalize(config: dict) -> None:
 
     lean_project_raw = config.get("lean", {}).get("project", "")
     lean_project = Path(lean_project_raw) if lean_project_raw else None
+    formalize_cfg = config.get("formalize", {})
+    proof_backend = formalize_cfg.get("proof_backend", "dojo")
+    lean_backend = formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo")
     cfg = FormalizationConfig(
         tex_path=tex_file,
         output_path=Path(output_path),
@@ -303,6 +349,8 @@ def _menu_formalize(config: dict) -> None:
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
+        proof_backend=proof_backend,
+        lean_backend=lean_backend,
         resume_path=None,
         artifact_dir=None,
         equivalence_checks=True,
@@ -343,6 +391,12 @@ def _menu_formalize_resume(config: dict) -> None:
         if candidate.exists():
             lean_project = candidate
     context_files = [Path(p) for p in snapshot.get("context_files", []) if p]
+    formalize_cfg = config.get("formalize", {})
+    proof_backend = snapshot.get("proof_backend", formalize_cfg.get("proof_backend", "dojo"))
+    lean_backend = snapshot.get(
+        "lean_backend",
+        formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo"),
+    )
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -359,6 +413,8 @@ def _menu_formalize_resume(config: dict) -> None:
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
+        proof_backend=proof_backend,
+        lean_backend=lean_backend,
         resume_path=resume_path,
         artifact_dir=None,
         equivalence_checks=bool(snapshot.get("equivalence_checks", True)),
@@ -443,6 +499,7 @@ def _build_args_from_config(
         max_steps=64,
         beam=4,
         k=int(prove.get("k", 1)),
+        llm_rounds=int(prove.get("llm_rounds", 4)),
         timeout=5.0,
         repair=2,
         seed=0,
@@ -651,12 +708,14 @@ def _sanitize_lean_name(value: str) -> str:
     return name or "ulam_theorem"
 
 
-def _ensure_lean_backend(config: dict, file_path: Path) -> tuple[bool, Path | None]:
+def _ensure_lean_backend(
+    config: dict, file_path: Path, require_dojo: bool = True
+) -> tuple[bool, Path | None]:
     lean = config.setdefault("lean", {})
     project_raw = lean.get("project", "")
     project_path = Path(project_raw).expanduser() if project_raw else None
     if project_path and _looks_like_lean_project(project_path):
-        if not _lean_dojo_available():
+        if require_dojo and not _lean_dojo_available():
             return _handle_missing_dojo()
         return True, project_path
 
@@ -667,7 +726,7 @@ def _ensure_lean_backend(config: dict, file_path: Path) -> tuple[bool, Path | No
         lean["project"] = str(detected)
         save_config(config)
         print(f"Detected Lean project: {detected}")
-        if not _lean_dojo_available():
+        if require_dojo and not _lean_dojo_available():
             return _handle_missing_dojo()
         return True, detected
 
@@ -682,7 +741,7 @@ def _ensure_lean_backend(config: dict, file_path: Path) -> tuple[bool, Path | No
         return True, None
     lean["project"] = str(chosen)
     save_config(config)
-    if not _lean_dojo_available():
+    if require_dojo and not _lean_dojo_available():
         return _handle_missing_dojo()
     return True, chosen
 

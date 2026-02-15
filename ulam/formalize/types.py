@@ -29,6 +29,8 @@ class FormalizationConfig:
     lean_project: Optional[Path]
     lean_imports: list[str]
     verbose: bool
+    proof_backend: str = "dojo"
+    lean_backend: str = "dojo"
     resume_path: Optional[Path] = None
     artifact_dir: Optional[Path] = None
     equivalence_checks: bool = True
