@@ -191,6 +191,17 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="allow axioms/constants only inside ULAMAI assumptions block",
     )
+    formalize.add_argument(
+        "--segment",
+        action="store_true",
+        help="segment long TeX and formalize piece-wise",
+    )
+    formalize.add_argument(
+        "--segment-words",
+        type=int,
+        default=1000,
+        help="word threshold/chunk size for segmentation",
+    )
     formalize.add_argument("--lean-project", type=Path, default=None)
     formalize.add_argument("--lean-import", action="append", default=[])
     formalize.add_argument(
@@ -2050,6 +2061,14 @@ def run_formalize(args: argparse.Namespace) -> None:
         equivalence_checks=not args.no_equivalence,
     )
     llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
+    if args.segment:
+        from .formalize.segmentation import run_segmented_formalize
+
+        max_words = max(200, int(args.segment_words))
+        out_path = run_segmented_formalize(cfg, llm, max_words=max_words)
+        print(f"Wrote: {out_path}")
+        return
+
     engine = FormalizationEngine(cfg, llm)
     result = engine.run()
     print(f"Wrote: {result.output_path}")

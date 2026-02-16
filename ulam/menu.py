@@ -17,6 +17,7 @@ from .auth import (
     run_claude_login,
 )
 from .formalize.engine import FormalizationEngine
+from .formalize.segmentation import should_segment, run_segmented_formalize
 from .formalize.llm import FormalizationLLM
 from .formalize.types import FormalizationConfig
 from .config import load_config, save_config
@@ -206,6 +207,13 @@ def _configure_prover(config: dict) -> None:
         lean_section["dojo_timeout_s"] = max(30, int(float(dojo_timeout_raw)))
     except Exception:
         lean_section["dojo_timeout_s"] = 180
+    segment_section = config.setdefault("segmentation", {})
+    chunk_default = str(segment_section.get("chunk_words", 1000))
+    chunk_raw = _prompt("Segment chunk size (words)", default=chunk_default).strip()
+    try:
+        segment_section["chunk_words"] = max(200, int(chunk_raw))
+    except Exception:
+        segment_section["chunk_words"] = 1000
 
     formalize = config.setdefault("formalize", {})
     formalize_mode_default = formalize.get("proof_backend", "inherit")
@@ -349,13 +357,6 @@ def _menu_formalize(config: dict) -> None:
         print(f"File not found: {tex_file}")
         return
 
-    payload = {
-        "tex_path": tex_path,
-        "context_files": [str(p) for p in context_files],
-        "output_path": output_path,
-    }
-    _save_task(kind="formalize_tex", payload=payload)
-
     lean_project_raw = config.get("lean", {}).get("project", "")
     lean_project = Path(lean_project_raw) if lean_project_raw else None
     formalize_cfg = config.get("formalize", {})
@@ -394,6 +395,29 @@ def _menu_formalize(config: dict) -> None:
         artifact_dir=None,
         equivalence_checks=True,
     )
+
+    chunk_words = int(config.get("segmentation", {}).get("chunk_words", 1000))
+    if should_segment(tex_file.read_text(encoding="utf-8", errors="ignore"), threshold_words=chunk_words):
+        seg_choice = _prompt("Segment TeX and formalize piece-wise (Y/n)", default="y").strip().lower()
+        if seg_choice not in {"n", "no", "false", "0"}:
+            payload = {
+                "tex_path": tex_path,
+                "context_files": [str(p) for p in context_files],
+                "output_path": output_path,
+                "segmented": True,
+            }
+            _save_task(kind="formalize_tex", payload=payload)
+            llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
+            out_path = run_segmented_formalize(cfg, llm, max_words=chunk_words)
+            print(f"Wrote: {out_path}")
+            return
+
+    payload = {
+        "tex_path": tex_path,
+        "context_files": [str(p) for p in context_files],
+        "output_path": output_path,
+    }
+    _save_task(kind="formalize_tex", payload=payload)
     llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
     engine = FormalizationEngine(cfg, llm)
     result = engine.run()
@@ -408,6 +432,60 @@ def _menu_formalize_resume(config: dict) -> None:
     artifact_dir = _find_latest_formalize_artifact()
     if not artifact_dir:
         print("No previous formalization runs found in runs/.")
+        return
+    manifest_path = artifact_dir / "segment_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        tex_path = Path(manifest.get("tex_path", "")).expanduser()
+        output_path = Path(manifest.get("output_path", "")).expanduser()
+        context_files = [Path(p) for p in manifest.get("context_files", []) if p]
+        lean_project_raw = config.get("lean", {}).get("project", "")
+        lean_project = Path(lean_project_raw) if lean_project_raw else None
+        proof_backend = config.get("formalize", {}).get("proof_backend", "inherit")
+        if proof_backend == "inherit":
+            proof_backend = config.get("prove", {}).get("mode", "tactic")
+        if proof_backend == "dojo":
+            proof_backend = "tactic"
+        if proof_backend not in {"tactic", "lemma", "llm"}:
+            proof_backend = "tactic"
+        lean_backend = config.get("formalize", {}).get(
+            "lean_backend", "cli" if proof_backend == "llm" else "dojo"
+        )
+        dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
+        cfg = FormalizationConfig(
+            tex_path=tex_path,
+            output_path=output_path,
+            context_files=context_files,
+            max_rounds=5,
+            max_repairs=2,
+            max_equivalence_repairs=2,
+            max_proof_rounds=1,
+            proof_max_steps=64,
+            proof_beam=4,
+            proof_k=int(config.get("prove", {}).get("k", 1)),
+            proof_timeout_s=5.0,
+            proof_repair=2,
+            dojo_timeout_s=dojo_timeout_s,
+            lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
+            lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
+            allow_axioms=bool(config.get("prove", {}).get("allow_axioms", False)),
+            lean_project=lean_project,
+            lean_imports=config.get("lean", {}).get("imports", []),
+            verbose=True,
+            proof_backend=proof_backend,
+            lean_backend=lean_backend,
+            resume_path=None,
+            artifact_dir=artifact_dir,
+            equivalence_checks=True,
+        )
+        llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
+        max_words = int(
+            manifest.get("max_words", config.get("segmentation", {}).get("chunk_words", 1000))
+        )
+        out_path = run_segmented_formalize(
+            cfg, llm, artifact_dir=artifact_dir, max_words=max_words
+        )
+        print(f"Wrote: {out_path}")
         return
     snapshot = _load_formalize_snapshot(artifact_dir)
     if not snapshot:
