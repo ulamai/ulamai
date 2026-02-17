@@ -11,6 +11,8 @@ TAP_REPO="${TAP_REPO:-ulamai/homebrew-ulamai}"
 FORMULA_PATH="${FORMULA_PATH:-Formula/ulamai.rb}"
 REPO_OWNER="${REPO_OWNER:-ulamai}"
 REPO_NAME="${REPO_NAME:-ulamai}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_FORMULA="${TEMPLATE_FORMULA:-$SCRIPT_DIR/../homebrew-ulamai/Formula/ulamai.rb}"
 
 TMP_DIR="$(mktemp -d)"
 TARBALL_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/tags/${TAG}.tar.gz"
@@ -19,6 +21,8 @@ curl -fsSL "$TARBALL_URL" -o "$TMP_DIR/ulamai.tar.gz"
 SHA="$(shasum -a 256 "$TMP_DIR/ulamai.tar.gz" | awk '{print $1}')"
 
 git clone "https://github.com/${TAP_REPO}.git" "$TMP_DIR/tap"
+
+cp "$TEMPLATE_FORMULA" "$TMP_DIR/tap/$FORMULA_PATH"
 
 export FORMULA="$TMP_DIR/tap/$FORMULA_PATH"
 export TAG SHA REPO_OWNER REPO_NAME
