@@ -166,6 +166,8 @@ brew tap ulamai/ulamai
 brew install ulamai
 ```
 
+Maintainers: the Homebrew tap is auto-updated on release. See `.github/workflows/update-homebrew-tap.yml` and `scripts/update_homebrew_tap.sh` (requires `TAP_PUSH_TOKEN` with push access to `ulamai/homebrew-ulamai`).
+
 ---
 
 ## Commands
