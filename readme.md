@@ -55,7 +55,7 @@ Lean backends:
 
 ---
 
-## Status (v0.1.5)
+## Status (v0.1.6)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
@@ -85,10 +85,25 @@ Pipeline reference:
 
 ## Install
 
+Homebrew (recommended):
+
+```bash
+brew tap ulamai/ulamai
+brew install ulamai
+```
+
 From a clone:
 
 ```bash
+git clone https://github.com/ulamai/ulamai.git
+cd ulamai
 ./install.sh
+```
+
+If your Python is externally managed (PEP‑668), you can force a user install:
+
+```bash
+ULAM_BREAK_SYSTEM_PACKAGES=1 ./install.sh
 ```
 
 Then:
@@ -127,18 +142,19 @@ Formalization options:
 - `--artifacts-dir` to store per-round artifacts (defaults to `runs/formalize_YYYYMMDD_HHMMSS`).
 - `--proof-backend` (`dojo|llm`) to choose proof backend.
 - `--lean-backend` (`dojo|cli`) to choose typecheck backend.
+- `--segment` and `--segment-words` to formalize long TeX piece‑wise.
 
-One-line installer (once the repo is public, replace `<ORG>/<REPO>`):
+One-line installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<ORG>/<REPO>/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ulamai/ulamai/main/install.sh | bash
 ```
 
-Homebrew (planned; will require a tap repo):
+Homebrew (tap):
 
 ```bash
-brew tap <ORG>/tap
-brew install ulam
+brew tap ulamai/ulamai
+brew install ulamai
 ```
 
 ---
