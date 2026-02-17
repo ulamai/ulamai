@@ -7,7 +7,7 @@ A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that c
 - **Retrieval** (premise selection from mathlib / local repos)
 - **Search + caching** (best-first / beam + transposition table)
 
-Ulam AI is designed to plug into **Codex / Claude Code / Ollama** (or any OpenAI-compatible endpoint) and produce **machine-checked Lean 4 proofs**.
+Ulam AI is designed to plug into **Codex / Claude Code / Ollama** and produce **machine-checked Lean 4 proofs**.
 
 ---
 
@@ -42,10 +42,10 @@ ulam
 
 Suggested Codex model: `gpt-5.2-codex` (or `gpt-5.3-codex` if available).
 
-Example for option **2** (Natural language guidance):
+Example for Prove with natural language guidance:
 
 ```text
-prove that every PID is a UFD; use mathlib's IsPrincipalIdealRing → UniqueFactorizationMonoid
+prove that every PID is a UFD
 ```
 
 ---
