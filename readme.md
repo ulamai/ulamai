@@ -13,9 +13,18 @@ Ulam AI is designed to plug into **Codex / Claude Code / Ollama** (or any OpenAI
 
 ## Quickstart
 
+With Homebrew:
+
+```bash
+brew tap ulamai/ulamai
+brew install ulamai
+```
+
 From a fresh clone:
 
 ```bash
+git clone https://github.com/ulamai/ulamai.git
+cd ulamai
 ./install.sh
 ```
 
