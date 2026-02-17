@@ -7,8 +7,13 @@ class Ulamai < Formula
 
   def install
     libexec.install Dir["*"]
+    src_dir = libexec/"ulamai-#{version}"
+    unless src_dir.exist?
+      candidates = Dir[libexec/"*"].select { |p| File.directory?(p) }
+      src_dir = Pathname.new(candidates.first) if candidates.any?
+    end
     ENV["ULAM_VENV_DIR"] = (libexec/"venv").to_s
-    system "bash", "#{libexec}/install.sh"
+    system "bash", (src_dir/"install.sh").to_s
     bin.install_symlink libexec/"venv/bin/ulam" => "ulam"
   end
 
