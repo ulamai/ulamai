@@ -12,7 +12,6 @@ class Ulamai < Formula
     ENV["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     ENV["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
     system python, "-m", "pip", "install", ".", "--prefix=#{prefix}"
-    bin.install_symlink prefix/"bin/ulam" => "ulam"
   end
 
   test do
