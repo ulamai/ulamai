@@ -193,7 +193,7 @@ def _configure_prover(config: dict) -> None:
         prove["lemma_depth"] = max(1, int(lemma_depth))
     except Exception:
         prove["lemma_depth"] = 60
-    allow_axioms_default = "y" if prove.get("allow_axioms", False) else "n"
+    allow_axioms_default = "y" if prove.get("allow_axioms", True) else "n"
     allow_axioms_raw = _prompt("Allow axioms (Y/n)", default=allow_axioms_default).strip().lower()
     allow_axioms = allow_axioms_raw in {"y", "yes", "true", "1"}
     prove["allow_axioms"] = allow_axioms
@@ -235,6 +235,30 @@ def _configure_prover(config: dict) -> None:
     if lean_backend not in {"dojo", "cli"}:
         lean_backend = "dojo"
     formalize["lean_backend"] = lean_backend
+    formalize_max_rounds_raw = _prompt(
+        "Formalize max rounds",
+        default=str(formalize.get("max_rounds", 5)),
+    ).strip()
+    try:
+        formalize["max_rounds"] = max(1, int(formalize_max_rounds_raw))
+    except Exception:
+        formalize["max_rounds"] = 5
+    formalize_max_proof_rounds_raw = _prompt(
+        "Formalize proof rounds",
+        default=str(formalize.get("max_proof_rounds", 1)),
+    ).strip()
+    try:
+        formalize["max_proof_rounds"] = max(1, int(formalize_max_proof_rounds_raw))
+    except Exception:
+        formalize["max_proof_rounds"] = 1
+    formalize_proof_repair_raw = _prompt(
+        "Formalize proof repair attempts",
+        default=str(formalize.get("proof_repair", 2)),
+    ).strip()
+    try:
+        formalize["proof_repair"] = max(0, int(formalize_proof_repair_raw))
+    except Exception:
+        formalize["proof_repair"] = 2
     print("\nSaved prover settings.\n")
 
 
@@ -368,24 +392,36 @@ def _menu_formalize(config: dict) -> None:
     if proof_backend not in {"tactic", "lemma", "llm"}:
         proof_backend = "tactic"
     lean_backend = formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo")
+    try:
+        max_rounds = max(1, int(formalize_cfg.get("max_rounds", 5)))
+    except Exception:
+        max_rounds = 5
+    try:
+        max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
+    except Exception:
+        max_proof_rounds = 1
+    try:
+        proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
+    except Exception:
+        proof_repair = 2
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_file,
         output_path=Path(output_path),
         context_files=context_files,
-        max_rounds=5,
+        max_rounds=max_rounds,
         max_repairs=2,
         max_equivalence_repairs=2,
-        max_proof_rounds=1,
+        max_proof_rounds=max_proof_rounds,
         proof_max_steps=64,
         proof_beam=4,
         proof_k=int(config.get("prove", {}).get("k", 1)),
         proof_timeout_s=5.0,
-        proof_repair=2,
+        proof_repair=proof_repair,
         dojo_timeout_s=dojo_timeout_s,
         lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
         lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
-        allow_axioms=bool(config.get("prove", {}).get("allow_axioms", False)),
+        allow_axioms=bool(config.get("prove", {}).get("allow_axioms", True)),
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
         verbose=True,
@@ -451,24 +487,37 @@ def _menu_formalize_resume(config: dict) -> None:
         lean_backend = config.get("formalize", {}).get(
             "lean_backend", "cli" if proof_backend == "llm" else "dojo"
         )
+        formalize_cfg = config.get("formalize", {})
+        try:
+            max_rounds = max(1, int(formalize_cfg.get("max_rounds", 5)))
+        except Exception:
+            max_rounds = 5
+        try:
+            max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
+        except Exception:
+            max_proof_rounds = 1
+        try:
+            proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
+        except Exception:
+            proof_repair = 2
         dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
         cfg = FormalizationConfig(
             tex_path=tex_path,
             output_path=output_path,
             context_files=context_files,
-            max_rounds=5,
+            max_rounds=max_rounds,
             max_repairs=2,
             max_equivalence_repairs=2,
-            max_proof_rounds=1,
+            max_proof_rounds=max_proof_rounds,
             proof_max_steps=64,
             proof_beam=4,
             proof_k=int(config.get("prove", {}).get("k", 1)),
             proof_timeout_s=5.0,
-            proof_repair=2,
+            proof_repair=proof_repair,
             dojo_timeout_s=dojo_timeout_s,
             lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
             lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
-            allow_axioms=bool(config.get("prove", {}).get("allow_axioms", False)),
+            allow_axioms=bool(config.get("prove", {}).get("allow_axioms", True)),
             lean_project=lean_project,
             lean_imports=config.get("lean", {}).get("imports", []),
             verbose=True,
@@ -520,25 +569,37 @@ def _menu_formalize_resume(config: dict) -> None:
         "lean_backend",
         formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo"),
     )
+    try:
+        default_max_rounds = max(1, int(formalize_cfg.get("max_rounds", 5)))
+    except Exception:
+        default_max_rounds = 5
+    try:
+        default_max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
+    except Exception:
+        default_max_proof_rounds = 1
+    try:
+        default_proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
+    except Exception:
+        default_proof_repair = 2
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
         context_files=context_files,
-        max_rounds=max(5, int(snapshot.get("max_rounds", 5))),
+        max_rounds=max(1, int(snapshot.get("max_rounds", default_max_rounds))),
         max_repairs=int(snapshot.get("max_repairs", 2)),
         max_equivalence_repairs=int(snapshot.get("max_equivalence_repairs", 2)),
-        max_proof_rounds=int(snapshot.get("max_proof_rounds", 1)),
+        max_proof_rounds=max(1, int(snapshot.get("max_proof_rounds", default_max_proof_rounds))),
         proof_max_steps=int(snapshot.get("proof_max_steps", 64)),
         proof_beam=int(snapshot.get("proof_beam", 4)),
         proof_k=int(snapshot.get("proof_k", 8)),
         proof_timeout_s=float(snapshot.get("proof_timeout_s", 5.0)),
-        proof_repair=int(snapshot.get("proof_repair", 2)),
+        proof_repair=max(0, int(snapshot.get("proof_repair", default_proof_repair))),
         dojo_timeout_s=float(snapshot.get("dojo_timeout_s", dojo_timeout_s)),
         lemma_max=int(snapshot.get("lemma_max", config.get("prove", {}).get("lemma_max", 60))),
         lemma_depth=int(snapshot.get("lemma_depth", config.get("prove", {}).get("lemma_depth", 60))),
         allow_axioms=bool(
-            snapshot.get("allow_axioms", config.get("prove", {}).get("allow_axioms", False))
+            snapshot.get("allow_axioms", config.get("prove", {}).get("allow_axioms", True))
         ),
         lean_project=lean_project,
         lean_imports=config.get("lean", {}).get("imports", []),
@@ -641,7 +702,7 @@ def _build_args_from_config(
         autop=bool(prove.get("autop", True)),
         lemma_max=int(prove.get("lemma_max", 60)),
         lemma_depth=int(prove.get("lemma_depth", 60)),
-        allow_axioms=bool(prove.get("allow_axioms", False)),
+        allow_axioms=bool(prove.get("allow_axioms", True)),
         openai_key=openai.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", ""),
         openai_base_url=openai.get("base_url", "https://api.openai.com"),
         openai_model=openai_model,

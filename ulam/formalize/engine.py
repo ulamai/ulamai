@@ -662,20 +662,11 @@ def _normalize_imports(text: str) -> str:
 
 def _axiom_guardrail_error(text: str, allow_axioms: bool) -> Optional[str]:
     if allow_axioms:
-        remaining, err = _strip_assumptions_block(text)
-        if err:
-            return err
-        cleaned = _strip_comments(remaining)
-        if re.search(r"\b(axiom|constant)\b", cleaned):
-            return (
-                "Axioms/constants are only allowed inside the ULAMAI assumptions block "
-                "(/- ULAMAI_ASSUMPTIONS_BEGIN -/ ... /- ULAMAI_ASSUMPTIONS_END -/)."
-            )
         return None
 
     cleaned = _strip_comments(text)
     if re.search(r"\b(axiom|constant)\b", cleaned):
-        return "Axioms/constants are not allowed. Replace with lemma/theorem + sorry."
+        return "Axioms/constants are disabled (--no-allow-axioms)."
     return None
 
 
@@ -683,20 +674,6 @@ def _strip_comments(text: str) -> str:
     no_block = re.sub(r"/-.*?-/", "", text, flags=re.S)
     no_line = re.sub(r"--.*", "", no_block)
     return no_line
-
-
-def _strip_assumptions_block(text: str) -> tuple[str, Optional[str]]:
-    begin = "/- ULAMAI_ASSUMPTIONS_BEGIN -/"
-    end = "/- ULAMAI_ASSUMPTIONS_END -/"
-    remaining = text
-    while True:
-        start = remaining.find(begin)
-        if start == -1:
-            return remaining, None
-        finish = remaining.find(end, start + len(begin))
-        if finish == -1:
-            return remaining, "Assumptions block is missing ULAMAI_ASSUMPTIONS_END."
-        remaining = remaining[:start] + remaining[finish + len(end) :]
 
 
 def _build_tex_snippet_map(segments, lean_code: str, max_chars: int = 1800) -> dict[str, str]:
