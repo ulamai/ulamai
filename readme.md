@@ -64,11 +64,11 @@ Lean backends:
 
 ---
 
-## Status (v0.1.6)
+## Status (v0.1.7)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
-- **Axiom guardrail** (disallow axioms/constants by default; optional assumptions block)
+- **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
 - **Per-lemma LaTeX proof snippets** injected into Lean comments and LLM prompts
 - **Formalize proof search** now runs sequential tactic scripts (better multi-step chaining)

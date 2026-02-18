@@ -115,8 +115,9 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
     prove.add_argument(
         "--allow-axioms",
-        action="store_true",
-        help="allow axioms/constants only inside ULAMAI assumptions block",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow axioms/constants anywhere (default: enabled)",
     )
     prove.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     prove.add_argument("--seed", type=int, default=0)
@@ -188,8 +189,9 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--proof-repair", type=int, default=2)
     formalize.add_argument(
         "--allow-axioms",
-        action="store_true",
-        help="allow axioms/constants only inside ULAMAI assumptions block",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow axioms/constants anywhere (default: enabled)",
     )
     formalize.add_argument(
         "--segment",
@@ -322,6 +324,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run_prove(args: argparse.Namespace) -> None:
+    allow_axioms = _resolve_allow_axioms(args)
     context = "\n\n".join(_read_context_files(args.context))
     config = RunConfig(
         file_path=args.file,
@@ -415,7 +418,7 @@ def run_prove(args: argparse.Namespace) -> None:
         except Exception:
             updated = ""
         if updated:
-            axiom_error = _axiom_guardrail_error(updated, bool(getattr(args, "allow_axioms", False)))
+            axiom_error = _axiom_guardrail_error(updated, allow_axioms)
             if axiom_error:
                 print(f"[axiom] {axiom_error}")
         return
@@ -426,6 +429,7 @@ def run_prove(args: argparse.Namespace) -> None:
 
 
 def run_prove_llm(args: argparse.Namespace) -> None:
+    allow_axioms = _resolve_allow_axioms(args)
     try:
         text = args.file.read_text(encoding="utf-8")
     except Exception as exc:
@@ -485,7 +489,7 @@ def run_prove_llm(args: argparse.Namespace) -> None:
             error = check_error
             print(f"[typecheck] error: {check_error[:200]}")
             continue
-        axiom_error = _axiom_guardrail_error(updated, bool(getattr(args, "allow_axioms", False)))
+        axiom_error = _axiom_guardrail_error(updated, allow_axioms)
         if axiom_error:
             error = axiom_error
             print(f"[axiom] {axiom_error}")
@@ -1019,6 +1023,14 @@ def _autop_enabled(args: argparse.Namespace) -> bool:
     if hasattr(args, "no_autop"):
         return not bool(getattr(args, "no_autop"))
     return True
+
+
+def _resolve_allow_axioms(args: argparse.Namespace, config: dict | None = None) -> bool:
+    explicit = getattr(args, "allow_axioms", None)
+    if explicit is not None:
+        return bool(explicit)
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("prove", {}).get("allow_axioms", True))
 
 
 def run_replay(args: argparse.Namespace) -> None:
@@ -2031,9 +2043,7 @@ def run_formalize(args: argparse.Namespace) -> None:
     if proof_backend == "llm":
         lean_backend = "cli"
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
-    allow_axioms = bool(getattr(args, "allow_axioms", False)) or bool(
-        config.get("prove", {}).get("allow_axioms", False)
-    )
+    allow_axioms = _resolve_allow_axioms(args, config)
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -2243,20 +2253,11 @@ def _normalize_llm_output(text: str) -> str:
 
 def _axiom_guardrail_error(text: str, allow_axioms: bool) -> str | None:
     if allow_axioms:
-        remaining, err = _strip_assumptions_block(text)
-        if err:
-            return err
-        cleaned = _strip_comments(remaining)
-        if re.search(r"\b(axiom|constant)\b", cleaned):
-            return (
-                "Axioms/constants are only allowed inside the ULAMAI assumptions block "
-                "(/- ULAMAI_ASSUMPTIONS_BEGIN -/ ... /- ULAMAI_ASSUMPTIONS_END -/)."
-            )
         return None
 
     cleaned = _strip_comments(text)
     if re.search(r"\b(axiom|constant)\b", cleaned):
-        return "Axioms/constants are not allowed. Replace with lemma/theorem + sorry."
+        return "Axioms/constants are disabled (--no-allow-axioms)."
     return None
 
 
@@ -2264,20 +2265,6 @@ def _strip_comments(text: str) -> str:
     no_block = re.sub(r"/-.*?-/", "", text, flags=re.S)
     no_line = re.sub(r"--.*", "", no_block)
     return no_line
-
-
-def _strip_assumptions_block(text: str) -> tuple[str, str | None]:
-    begin = "/- ULAMAI_ASSUMPTIONS_BEGIN -/"
-    end = "/- ULAMAI_ASSUMPTIONS_END -/"
-    remaining = text
-    while True:
-        start = remaining.find(begin)
-        if start == -1:
-            return remaining, None
-        finish = remaining.find(end, start + len(begin))
-        if finish == -1:
-            return remaining, "Assumptions block is missing ULAMAI_ASSUMPTIONS_END."
-        remaining = remaining[:start] + remaining[finish + len(end) :]
 
 
 def _extract_tex_snippet(text: str, name: str) -> str:

@@ -35,6 +35,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "model": "text-embedding-3-small",
         "cache": ".ulam/embeddings.json",
     },
+    "prove": {
+        "allow_axioms": True,
+    },
+    "formalize": {
+        "proof_backend": "inherit",
+        "lean_backend": "dojo",
+        "max_rounds": 5,
+        "max_proof_rounds": 1,
+        "proof_repair": 2,
+    },
     "lean": {
         "project": "",
         "imports": [],
