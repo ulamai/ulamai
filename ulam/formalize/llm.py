@@ -100,6 +100,10 @@ class FormalizationLLM:
             return _call_codex_cli(self._config, prompt)
         if self._provider == "claude_cli":
             return _call_claude_cli(self._config, prompt)
+        if self._provider == "gemini":
+            return _call_gemini(self._config, prompt)
+        if self._provider == "gemini_cli":
+            return _call_gemini_cli(self._config, prompt)
         return ""
 
 
@@ -426,6 +430,40 @@ def _call_anthropic(config: dict, prompt: str) -> str:
     return _extract_anthropic(raw)
 
 
+def _call_gemini(config: dict, prompt: str) -> str:
+    gemini = config.get("gemini", {})
+    api_key = (
+        gemini.get("api_key", "")
+        or os.environ.get("ULAM_GEMINI_API_KEY", "")
+        or os.environ.get("GEMINI_API_KEY", "")
+    )
+    if not api_key:
+        return ""
+    base_url = gemini.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+    model = gemini.get("model", "gemini-3-pro-preview")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a Lean 4 formalization assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 3000,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        _gemini_chat_endpoint(base_url),
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=120.0) as resp:
+        raw = resp.read().decode("utf-8")
+    return _extract_openai(raw)
+
+
 def _extract_openai(raw: str) -> str:
     data = json.loads(raw)
     choices = data.get("choices") or []
@@ -502,6 +540,33 @@ def _call_claude_cli(config: dict, prompt: str) -> str:
         timeout_s=timeout_s,
         heartbeat_s=heartbeat_s,
     )
+
+
+def _call_gemini_cli(config: dict, prompt: str) -> str:
+    from ..llm.cli_utils import gemini_exec
+
+    gemini = config.get("gemini", {})
+    llm_cfg = config.get("llm", {})
+    model = gemini.get("cli_model") or gemini.get("model") or None
+    system = "You are a Lean 4 formalization assistant. Output Lean code only."
+    timeout_s = float(llm_cfg.get("timeout_s", 0))
+    heartbeat_s = float(llm_cfg.get("heartbeat_s", 60))
+    return gemini_exec(
+        system,
+        prompt,
+        model=model,
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
+
+
+def _gemini_chat_endpoint(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/openai") or base.endswith("/openai/v1") or base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
 
 
 def _parse_equivalence(raw: str) -> dict:

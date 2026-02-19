@@ -17,6 +17,8 @@ from .llm import (
     AnthropicClient,
     ClaudeCLIClient,
     CodexCLIClient,
+    GeminiCLIClient,
+    GeminiClient,
     MockLLMClient,
     OllamaClient,
     OpenAICompatClient,
@@ -32,6 +34,7 @@ from .auth import (
     run_codex_login,
     run_claude_setup_token,
     run_claude_login,
+    run_gemini_login,
 )
 from .retrieve import (
     EmbeddingRetriever,
@@ -63,7 +66,16 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--theorem", required=True, help="theorem name to prove")
     prove.add_argument(
         "--llm",
-        choices=["mock", "openai", "ollama", "anthropic", "codex_cli", "claude_cli"],
+        choices=[
+            "mock",
+            "openai",
+            "ollama",
+            "anthropic",
+            "codex_cli",
+            "claude_cli",
+            "gemini",
+            "gemini_cli",
+        ],
         default="mock",
     )
     prove.add_argument("--lean", choices=["mock", "dojo", "cli"], default="mock")
@@ -167,12 +179,27 @@ def main(argv: list[str] | None = None) -> None:
         default=os.environ.get("ULAM_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
     )
     prove.add_argument("--anthropic-model", default=os.environ.get("ULAM_ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
+    prove.add_argument(
+        "--gemini-api-key",
+        default=os.environ.get("ULAM_GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", "")),
+    )
+    prove.add_argument(
+        "--gemini-base-url",
+        default=os.environ.get(
+            "ULAM_GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+    )
+    prove.add_argument(
+        "--gemini-model",
+        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3-pro-preview"),
+    )
 
     replay = sub.add_parser("replay", help="replay or summarize a run trace")
     replay.add_argument("trace", type=Path, help="trace jsonl path")
 
-    auth = sub.add_parser("auth", help="authenticate with Codex or Claude Code")
-    auth.add_argument("provider", choices=["codex", "claude"])
+    auth = sub.add_parser("auth", help="authenticate with Codex, Claude, or Gemini CLI")
+    auth.add_argument("provider", choices=["codex", "claude", "gemini"])
 
     formalize = sub.add_parser("formalize", help="formalize a .tex document to Lean")
     formalize.add_argument("tex", type=Path, help="path to .tex file")
@@ -226,7 +253,16 @@ def main(argv: list[str] | None = None) -> None:
     bench.add_argument("--suite", type=Path, required=True, help="jsonl suite path")
     bench.add_argument(
         "--llm",
-        choices=["mock", "openai", "ollama", "anthropic", "codex_cli", "claude_cli"],
+        choices=[
+            "mock",
+            "openai",
+            "ollama",
+            "anthropic",
+            "codex_cli",
+            "claude_cli",
+            "gemini",
+            "gemini_cli",
+        ],
         default="mock",
     )
     bench.add_argument("--lean", choices=["mock", "dojo"], default="mock")
@@ -295,6 +331,21 @@ def main(argv: list[str] | None = None) -> None:
         "--anthropic-model",
         default=os.environ.get("ULAM_ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
     )
+    bench.add_argument(
+        "--gemini-api-key",
+        default=os.environ.get("ULAM_GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", "")),
+    )
+    bench.add_argument(
+        "--gemini-base-url",
+        default=os.environ.get(
+            "ULAM_GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+    )
+    bench.add_argument(
+        "--gemini-model",
+        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3-pro-preview"),
+    )
 
     lean_setup = sub.add_parser(
         "lean-setup", help="install Lean + LeanDojo and create a Lean project"
@@ -351,6 +402,8 @@ def run_prove(args: argparse.Namespace) -> None:
                 model = args.openai_model
             elif args.llm in {"anthropic", "claude_cli"}:
                 model = args.anthropic_model
+            elif args.llm in {"gemini", "gemini_cli"}:
+                model = args.gemini_model
             elif args.llm == "ollama":
                 model = args.ollama_model
             label = args.llm
@@ -958,6 +1011,8 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
                 model = args.openai_model
             elif args.llm in {"anthropic", "claude_cli"}:
                 model = args.anthropic_model
+            elif args.llm in {"gemini", "gemini_cli"}:
+                model = args.gemini_model
             elif args.llm == "ollama":
                 model = args.ollama_model
             label = args.llm
@@ -1116,6 +1171,34 @@ def run_auth(args: argparse.Namespace) -> None:
         config["llm_provider"] = "anthropic"
         save_config(config)
         print("Claude setup-token saved.")
+        return
+    if args.provider == "gemini":
+        print("Gemini auth options:")
+        print("1. Gemini CLI auth check (runs `gemini -p`, opens browser if needed)")
+        print("2. Use API key")
+        choice = input("Auth method [1]: ").strip() or "1"
+        if choice == "1":
+            print("Running Gemini CLI auth check...")
+            print("If Gemini prints 'Data collection is disabled.', that line is informational.")
+            print("This triggers subscription confirmation now (instead of first formalize/prove call).")
+            try:
+                run_gemini_login()
+            except Exception as exc:
+                print(f"Gemini login failed: {exc}")
+                return
+            config["llm_provider"] = "gemini_cli"
+            save_config(config)
+            print("Gemini CLI auth check completed.")
+            return
+        api_key = input("Gemini API key: ").strip()
+        if not api_key:
+            print("No API key entered.")
+            return
+        section = config.setdefault("gemini", {})
+        section["api_key"] = api_key
+        config["llm_provider"] = "gemini"
+        save_config(config)
+        print("Gemini API key saved.")
         return
 
 
@@ -1563,6 +1646,12 @@ def _formalization_config_from_args(args: argparse.Namespace) -> dict:
             "base_url": args.anthropic_base_url,
             "model": args.anthropic_model,
             "claude_model": args.anthropic_model,
+        },
+        "gemini": {
+            "api_key": args.gemini_api_key,
+            "base_url": args.gemini_base_url,
+            "model": args.gemini_model,
+            "cli_model": args.gemini_model,
         },
         "ollama": {
             "base_url": args.ollama_base_url,
@@ -2196,11 +2285,21 @@ def _make_llm(args: argparse.Namespace):
             base_url=args.anthropic_base_url,
             model=args.anthropic_model,
         )
+    if args.llm == "gemini":
+        if not args.gemini_api_key:
+            raise RuntimeError("Gemini API key missing. Set ULAM_GEMINI_API_KEY or --gemini-api-key.")
+        return GeminiClient(
+            api_key=args.gemini_api_key,
+            base_url=args.gemini_base_url,
+            model=args.gemini_model,
+        )
     if args.llm == "codex_cli":
         model = args.openai_model or None
         return CodexCLIClient(model=model)
     if args.llm == "claude_cli":
         return ClaudeCLIClient(model=args.anthropic_model or None)
+    if args.llm == "gemini_cli":
+        return GeminiCLIClient(model=args.gemini_model or None)
     raise RuntimeError(f"unknown LLM backend: {args.llm}")
 
 
@@ -2210,6 +2309,7 @@ def _llm_config_from_args(args: argparse.Namespace) -> dict:
     openai = cfg.setdefault("openai", {})
     anthropic = cfg.setdefault("anthropic", {})
     ollama = cfg.setdefault("ollama", {})
+    gemini = cfg.setdefault("gemini", {})
     if args.llm in {"openai", "codex_cli"}:
         if args.openai_key:
             openai["api_key"] = args.openai_key
@@ -2233,6 +2333,14 @@ def _llm_config_from_args(args: argparse.Namespace) -> dict:
             ollama["base_url"] = args.ollama_base_url
         if args.ollama_model:
             ollama["model"] = args.ollama_model
+    if args.llm in {"gemini", "gemini_cli"}:
+        if args.gemini_api_key:
+            gemini["api_key"] = args.gemini_api_key
+        if args.gemini_base_url:
+            gemini["base_url"] = args.gemini_base_url
+        if args.gemini_model:
+            gemini["model"] = args.gemini_model
+            gemini["cli_model"] = args.gemini_model
     return cfg
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import difflib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -472,6 +473,8 @@ def _make_llm_client(config: FormalizationConfig):
         AnthropicClient,
         CodexCLIClient,
         ClaudeCLIClient,
+        GeminiClient,
+        GeminiCLIClient,
     )
 
     cfg = _load_global_config()
@@ -502,6 +505,20 @@ def _make_llm_client(config: FormalizationConfig):
         anthropic_cfg = cfg.get("anthropic", {})
         model = anthropic_cfg.get("claude_model") or anthropic_cfg.get("model") or "claude-3-5-sonnet-20240620"
         return ClaudeCLIClient(model=model)
+    if provider == "gemini":
+        gemini_cfg = cfg.get("gemini", {})
+        api_key = gemini_cfg.get("api_key", "") or os.environ.get("ULAM_GEMINI_API_KEY", "") or os.environ.get(
+            "GEMINI_API_KEY", ""
+        )
+        return GeminiClient(
+            api_key=api_key,
+            base_url=gemini_cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai"),
+            model=gemini_cfg.get("model", "gemini-3-pro-preview"),
+        )
+    if provider == "gemini_cli":
+        gemini_cfg = cfg.get("gemini", {})
+        model = gemini_cfg.get("cli_model") or gemini_cfg.get("model") or "gemini-3-pro-preview"
+        return GeminiCLIClient(model=model)
     raise RuntimeError("No LLM provider configured")
 
 

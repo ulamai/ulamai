@@ -7,7 +7,7 @@ A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that c
 - **Retrieval** (premise selection from mathlib / local repos)
 - **Search + caching** (best-first / beam + transposition table)
 
-Ulam AI is designed to plug into **Codex / Claude Code / Ollama** and produce **machine-checked Lean 4 proofs**.
+Ulam AI is designed to plug into **Codex / Claude Code / Gemini CLI / Ollama** and produce **machine-checked Lean 4 proofs**.
 
 ---
 
@@ -79,7 +79,7 @@ This repo contains a **first working scaffold** of the CLI and search loop. It i
 - **LLM-only mode** (Lean CLI typecheck, no Dojo)
 - `ulam prove` and `ulam replay` commands
 - Best-first search with beam cap + repair loop
-- LLM adapters: OpenAI-compatible + Ollama + mock
+- LLM adapters: OpenAI-compatible + Anthropic + Gemini + Ollama + CLI wrappers
 - Lean runner: mock implementation + LeanDojo-v2/PyPantograph runner (external install required)
 - Retrieval: token-overlap or embedding-based from a `--premises` file
 - Trace logging to JSONL (`run.jsonl` by default)
@@ -132,6 +132,7 @@ Login from CLI:
 ```bash
 ulam auth codex
 ulam auth claude
+ulam auth gemini
 ```
 
 Formalize a LaTeX document:
@@ -341,6 +342,14 @@ Claude (Anthropic):
 Claude Code CLI provider (subscription):
 - Run `ulam auth claude` (or `claude setup-token`) and set `--llm claude_cli` (no API key required).
 
+Gemini API:
+- `ULAM_GEMINI_API_KEY` (or `GEMINI_API_KEY`)
+- `ULAM_GEMINI_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta/openai`)
+- `ULAM_GEMINI_MODEL` (default `gemini-3-pro-preview`)
+
+Gemini CLI provider (subscription/login):
+- Run `ulam auth gemini` and complete the browser confirmation when prompted, then set `--llm gemini_cli` (no API key required).
+
 Embeddings (for retrieval):
 - `ULAM_EMBED_API_KEY` (defaults to `ULAM_OPENAI_API_KEY`)
 - `ULAM_EMBED_BASE_URL` (defaults to `ULAM_OPENAI_BASE_URL`)
@@ -365,7 +374,7 @@ Menu config file:
 
 - **LLM‑only mode fails to typecheck:** make sure `lean`/`lake` is on PATH and the file is inside a Lean project (has `lakefile.lean` or `lean-toolchain`).
 - **LeanDojo mismatch errors:** run `ulam -lean` in your project folder or re-run `ulam lean-setup` to align the toolchain.
-- **Codex/Claude CLI hangs:** set `LLM request timeout` in Settings or keep it `0` and use heartbeat logs to verify it’s running.
+- **Codex/Claude/Gemini CLI hangs:** set `LLM request timeout` in Settings or keep it `0` and use heartbeat logs to verify it’s running.
 
 ---
 

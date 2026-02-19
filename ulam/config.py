@@ -29,6 +29,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "model": "claude-3-5-sonnet-20240620",
         "claude_model": "",
     },
+    "gemini": {
+        "api_key": "",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-3-pro-preview",
+        "cli_model": "",
+    },
     "embed": {
         "api_key": "",
         "base_url": "https://api.openai.com",

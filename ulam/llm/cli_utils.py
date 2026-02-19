@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+_GEMINI_NOISE_LINE_PATTERNS = (
+    re.compile(r"^\s*data\s+collection\s+is\s+disabled\.?\s*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*accessing\s+resource\s+attributes\s+before\s+async\s+attributes\s+settled\.?\s*$",
+        re.IGNORECASE,
+    ),
+)
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 def codex_exec(
@@ -93,6 +103,80 @@ def claude_print(
     )
 
 
+def gemini_exec(
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    timeout_s: float | None = None,
+    heartbeat_s: float | None = None,
+) -> str:
+    prompt = system_prompt.strip() + "\n\n" + user_prompt.strip()
+    cmd = ["gemini", "-p", prompt]
+    if model:
+        cmd.extend(["-m", model])
+    return _gemini_exec_impl(
+        cmd,
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+        retry_login=True,
+    )
+
+
+def _gemini_exec_impl(
+    cmd: list[str],
+    timeout_s: float | None,
+    heartbeat_s: float | None,
+    retry_login: bool,
+) -> str:
+    proc = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    start = time.time()
+    last_beat = start
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.time()
+            if heartbeat_s and heartbeat_s > 0 and now - last_beat >= heartbeat_s:
+                elapsed = int(now - start)
+                print(f"[llm] still running ({elapsed}s)...")
+                last_beat = now
+            if timeout_s and timeout_s > 0 and now - start >= timeout_s:
+                proc.kill()
+                raise RuntimeError(f"gemini exec timed out after {timeout_s:.0f}s")
+    if proc.returncode != 0:
+        err = _strip_gemini_startup_noise((stderr or "").strip())
+        out = _strip_gemini_startup_noise((stdout or "").strip())
+        msg = err or out or f"gemini exec failed (exit {proc.returncode})"
+        if retry_login and "not logged in" in msg.lower():
+            _gemini_auth_login()
+            return _gemini_exec_impl(
+                cmd,
+                timeout_s=timeout_s,
+                heartbeat_s=heartbeat_s,
+                retry_login=False,
+            )
+        raise RuntimeError(msg)
+    return _strip_gemini_startup_noise(stdout)
+
+
+def _strip_gemini_startup_noise(text: str) -> str:
+    if not text:
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        normalized = _ANSI_ESCAPE_RE.sub("", line).strip()
+        if any(pattern.match(normalized) for pattern in _GEMINI_NOISE_LINE_PATTERNS):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _claude_print_impl(
     cmd: list[str],
     user_prompt: str,
@@ -148,5 +232,18 @@ def _claude_print_impl(
 def _claude_auth_login() -> None:
     try:
         subprocess.run(["claude", "auth", "login"], check=False)
+    except Exception:
+        return
+
+
+def _gemini_auth_login() -> None:
+    try:
+        subprocess.run(
+            ["gemini", "-p", "Reply with exactly: OK"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+        )
     except Exception:
         return
