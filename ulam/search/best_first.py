@@ -8,6 +8,7 @@ from typing import Optional
 
 from ..llm import LLMClient
 from ..retrieve import Retriever
+from ..state import state_hash
 from ..trace import TraceLogger
 from ..types import ProofState, ProofStep, RunConfig, TacticResult
 
@@ -331,10 +332,12 @@ def _step_from_result(
     return ProofStep(
         state_key=state.key,
         state_pretty=state.pretty,
+        state_hash=state_hash(state.pretty),
         tactic=tactic,
         ok=result.ok,
         error=result.error,
         new_state_key=result.new_state.key if result.new_state else None,
+        new_state_hash=state_hash(result.new_state.pretty) if result.new_state else None,
         solved=result.is_solved,
         cached=cached,
         elapsed_ms=elapsed_ms,

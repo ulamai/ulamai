@@ -23,10 +23,12 @@ class TacticResult:
 class ProofStep:
     state_key: str
     state_pretty: str
+    state_hash: Optional[str]
     tactic: str
     ok: bool
     error: Optional[str]
     new_state_key: Optional[str]
+    new_state_hash: Optional[str]
     solved: bool
     cached: bool = False
     elapsed_ms: Optional[int] = None
