@@ -15,6 +15,7 @@ from .auth import (
     run_codex_login,
     run_claude_setup_token,
     run_claude_login,
+    run_gemini_login,
 )
 from .formalize.engine import FormalizationEngine
 from .formalize.segmentation import should_segment, run_segmented_formalize
@@ -30,7 +31,7 @@ def run_menu() -> None:
         print(f"Version: {__version__}")
         print(f"Provider: {_provider_label(config)}")
         print()
-        print("1. Configure LLM (Codex/OpenAI, Claude, Ollama)")
+        print("1. Configure LLM (Codex/OpenAI, Claude, Ollama, Gemini)")
         print("2. Prove with natural language guidance")
         print("3. Formalize .tex to Lean")
         print("4. Resume last formalization")
@@ -66,6 +67,7 @@ def _configure_llm(config: dict) -> None:
     print("1. Codex/OpenAI (subscription or API key)")
     print("2. Claude (Anthropic)")
     print("3. Ollama")
+    print("4. Gemini")
     choice = _prompt("Provider", default="1")
     if choice == "1":
         config["llm_provider"] = "openai"
@@ -76,6 +78,9 @@ def _configure_llm(config: dict) -> None:
     elif choice == "3":
         config["llm_provider"] = "ollama"
         _configure_ollama(config)
+    elif choice == "4":
+        config["llm_provider"] = "gemini"
+        _configure_gemini(config)
     else:
         print("Unknown provider.")
     print("\nSaved configuration.\n")
@@ -140,6 +145,28 @@ def _configure_ollama(config: dict) -> None:
         "Base URL", default=section.get("base_url", "http://localhost:11434")
     )
     section["model"] = _prompt("Model", default=section.get("model", "llama3.1"))
+
+
+def _configure_gemini(config: dict) -> None:
+    section = config.setdefault("gemini", {})
+    print("\nGemini auth:")
+    print("1. Gemini CLI auth check (runs `gemini -p`, opens browser if needed)")
+    print("2. Use API key")
+    choice = _prompt("Auth method", default="1")
+    default_model = _default_gemini_model(section)
+    suggestions = _gemini_model_suggestions(section, default_model)
+    if choice == "1":
+        _login_gemini_cli()
+        config["llm_provider"] = "gemini_cli"
+        section["cli_model"] = _prompt_model_choice("Gemini CLI model", default_model, suggestions)
+        return
+    section["api_key"] = _prompt("API key", default=section.get("api_key", ""))
+    config["llm_provider"] = "gemini"
+    section["base_url"] = _prompt(
+        "Base URL",
+        default=section.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    )
+    section["model"] = _prompt_model_choice("Model", default_model, suggestions)
 
 
 def _configure_prover(config: dict) -> None:
@@ -668,6 +695,7 @@ def _build_args_from_config(
     openai = config.get("openai", {})
     ollama = config.get("ollama", {})
     anthropic = config.get("anthropic", {})
+    gemini = config.get("gemini", {})
     embed = config.get("embed", {})
     lean = config.get("lean", {})
     prove = config.get("prove", {})
@@ -677,6 +705,9 @@ def _build_args_from_config(
     anthropic_model = anthropic.get("model", "")
     if provider == "claude_cli":
         anthropic_model = anthropic.get("claude_model") or anthropic_model
+    gemini_model = gemini.get("model", "gemini-3-pro-preview")
+    if provider == "gemini_cli":
+        gemini_model = gemini.get("cli_model") or gemini_model or _default_gemini_model(gemini)
 
     from argparse import Namespace
 
@@ -719,6 +750,14 @@ def _build_args_from_config(
         anthropic_setup_token=anthropic.get("setup_token", "") or os.environ.get("ULAM_ANTHROPIC_SETUP_TOKEN", ""),
         anthropic_base_url=anthropic.get("base_url", "https://api.anthropic.com"),
         anthropic_model=anthropic_model,
+        gemini_api_key=gemini.get("api_key", "")
+        or os.environ.get("ULAM_GEMINI_API_KEY", "")
+        or os.environ.get("GEMINI_API_KEY", ""),
+        gemini_base_url=gemini.get(
+            "base_url",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+        gemini_model=gemini_model,
         verbose=True,
     )
 
@@ -1137,6 +1176,33 @@ def _claude_models_from_stats(limit: int = 6) -> list[str]:
     return [name for _, name in ranked[:limit]]
 
 
+def _default_gemini_model(section: dict) -> str:
+    explicit = section.get("cli_model") or section.get("model")
+    if explicit:
+        return explicit
+    env_model = os.environ.get("ULAM_GEMINI_MODEL", "")
+    if env_model:
+        return env_model
+    return "gemini-3-pro-preview"
+
+
+def _gemini_model_suggestions(section: dict, default: str) -> list[str]:
+    suggestions = [
+        default,
+        section.get("cli_model", ""),
+        section.get("model", ""),
+        "gemini-3-pro-preview",
+        "gemini-3-pro",
+        "gemini-3-flash-preview",
+        "gemini-3-flash",
+    ]
+    suggestions += _split_models(os.environ.get("ULAM_GEMINI_MODELS", ""))
+    options = [model for model in _dedupe(suggestions) if model != "gemini-2.5-pro"]
+    options = options[:7]
+    options.append("gemini-2.5-pro")
+    return options
+
+
 def _split_models(raw: str) -> list[str]:
     if not raw:
         return []
@@ -1208,6 +1274,17 @@ def _login_claude_cli() -> None:
         print(f"Claude login failed: {exc}")
 
 
+def _login_gemini_cli() -> None:
+    print("Running Gemini CLI auth check...")
+    print("If Gemini prints 'Data collection is disabled.', that line is informational.")
+    print("This triggers subscription confirmation now (instead of first formalize/prove call).")
+    try:
+        run_gemini_login()
+    except Exception as exc:
+        print(f"Gemini login failed: {exc}")
+        print("Install Gemini CLI first (e.g., `npm i -g @google/gemini-cli`).")
+
+
 def _print_banner() -> None:
     banner = [
         " _    _ _                          _____ ",
@@ -1252,6 +1329,16 @@ def _provider_label(config: dict) -> str:
         return "Ollama" if base_url else "Ollama (no base URL)"
     if provider == "claude_cli":
         return "Claude Code CLI"
+    if provider == "gemini":
+        section = config.get("gemini", {})
+        key = (
+            section.get("api_key", "")
+            or os.environ.get("ULAM_GEMINI_API_KEY", "")
+            or os.environ.get("GEMINI_API_KEY", "")
+        )
+        return "Gemini API" if key else "Gemini API (no API key)"
+    if provider == "gemini_cli":
+        return "Gemini CLI"
     return provider
 
 
@@ -1288,6 +1375,22 @@ def _ensure_llm_ready(config: dict, allow_placeholder: bool) -> bool:
         base_url = config.get("ollama", {}).get("base_url", "")
         if not base_url:
             print("Ollama base URL is missing. Choose option 1 to configure it.")
+            return False
+        return True
+    if provider == "gemini":
+        section = config.get("gemini", {})
+        key = (
+            section.get("api_key", "")
+            or os.environ.get("ULAM_GEMINI_API_KEY", "")
+            or os.environ.get("GEMINI_API_KEY", "")
+        )
+        if not key:
+            print("No Gemini API key configured. Choose option 1 to configure it.")
+            return False
+        return True
+    if provider == "gemini_cli":
+        if not _command_exists("gemini"):
+            print("Gemini CLI is not installed. Install it with: npm i -g @google/gemini-cli")
             return False
         return True
     return False

@@ -5,6 +5,8 @@ from .ollama import OllamaClient
 from .anthropic import AnthropicClient
 from .cli_codex import CodexCLIClient
 from .cli_claude import ClaudeCLIClient
+from .gemini import GeminiClient
+from .cli_gemini import GeminiCLIClient
 
 __all__ = [
     "LLMClient",
@@ -14,4 +16,6 @@ __all__ = [
     "AnthropicClient",
     "CodexCLIClient",
     "ClaudeCLIClient",
+    "GeminiClient",
+    "GeminiCLIClient",
 ]
