@@ -206,7 +206,12 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--out", type=Path, default=None, help="output .lean path")
     formalize.add_argument("--context", action="append", default=[], help="context files (.lean/.tex)")
     formalize.add_argument("--max-rounds", type=int, default=5)
-    formalize.add_argument("--max-repairs", type=int, default=2)
+    formalize.add_argument(
+        "--max-repairs",
+        type=int,
+        default=None,
+        help="max typecheck repairs (default: same as --max-rounds)",
+    )
     formalize.add_argument("--max-equivalence-repairs", type=int, default=2)
     formalize.add_argument("--max-proof-rounds", type=int, default=1)
     formalize.add_argument("--proof-max-steps", type=int, default=64)
@@ -1174,13 +1179,11 @@ def run_auth(args: argparse.Namespace) -> None:
         return
     if args.provider == "gemini":
         print("Gemini auth options:")
-        print("1. Gemini CLI auth check (runs `gemini -p`, opens browser if needed)")
+        print("1. Gemini CLI OAuth login (browser callback + manual fallback)")
         print("2. Use API key")
         choice = input("Auth method [1]: ").strip() or "1"
         if choice == "1":
-            print("Running Gemini CLI auth check...")
-            print("If Gemini prints 'Data collection is disabled.', that line is informational.")
-            print("This triggers subscription confirmation now (instead of first formalize/prove call).")
+            print("Starting Gemini OAuth login...")
             try:
                 run_gemini_login()
             except Exception as exc:
@@ -1188,7 +1191,7 @@ def run_auth(args: argparse.Namespace) -> None:
                 return
             config["llm_provider"] = "gemini_cli"
             save_config(config)
-            print("Gemini CLI auth check completed.")
+            print("Gemini OAuth login completed.")
             return
         api_key = input("Gemini API key: ").strip()
         if not api_key:
@@ -2131,14 +2134,16 @@ def run_formalize(args: argparse.Namespace) -> None:
     lean_backend = args.lean_backend
     if proof_backend == "llm":
         lean_backend = "cli"
+    max_rounds = max(1, int(args.max_rounds))
+    max_repairs = max_rounds if args.max_repairs is None else max(0, int(args.max_repairs))
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     allow_axioms = _resolve_allow_axioms(args, config)
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
         context_files=context_files,
-        max_rounds=args.max_rounds,
-        max_repairs=args.max_repairs,
+        max_rounds=max_rounds,
+        max_repairs=max_repairs,
         max_equivalence_repairs=args.max_equivalence_repairs,
         max_proof_rounds=args.max_proof_rounds,
         proof_max_steps=args.proof_max_steps,
@@ -2172,7 +2177,11 @@ def run_formalize(args: argparse.Namespace) -> None:
     result = engine.run()
     print(f"Wrote: {result.output_path}")
     print(f"Typecheck: {'ok' if result.typecheck_ok else 'failed'}")
-    print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    print(f"Proof-search solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    if result.error:
+        print(f"Failure reason: {str(result.error).splitlines()[0]}")
+    if not result.typecheck_ok and result.remaining_sorries == 0:
+        print("Note: no sorries remain, but Lean typecheck errors remain.")
     if result.artifact_dir:
         print(f"Artifacts: {result.artifact_dir}")
 

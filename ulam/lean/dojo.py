@@ -166,10 +166,18 @@ def _create_server(
     if _lean_options_invalid(os.environ.get("LEAN_CORE_OPTIONS")):
         print("[lean] LEAN_CORE_OPTIONS contains invalid entries; ignoring for this run.")
         env_updates["LEAN_CORE_OPTIONS"] = ""
+    quiet_stderr = _pantograph_stderr_quiet()
     if env_updates:
         with _temporary_env(env_updates):
-            return Server(**kwargs)
-    return Server(**kwargs)
+            with _redirect_stderr_to_devnull(quiet_stderr):
+                return Server(**kwargs)
+    with _redirect_stderr_to_devnull(quiet_stderr):
+        return Server(**kwargs)
+
+
+def _pantograph_stderr_quiet() -> bool:
+    raw = os.environ.get("ULAM_PANTOGRAPH_QUIET", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _default_dojo_timeout() -> Optional[float]:
@@ -348,6 +356,49 @@ def _temporary_env(updates: dict[str, str | None]):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = old
+
+
+@contextmanager
+def _redirect_stderr_to_devnull(enabled: bool):
+    if not enabled:
+        yield
+        return
+    saved_fd: int | None = None
+    devnull_fd: int | None = None
+    try:
+        saved_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+    except Exception:
+        if devnull_fd is not None:
+            try:
+                os.close(devnull_fd)
+            except Exception:
+                pass
+        if saved_fd is not None:
+            try:
+                os.close(saved_fd)
+            except Exception:
+                pass
+        yield
+        return
+    try:
+        yield
+    finally:
+        if saved_fd is not None:
+            try:
+                os.dup2(saved_fd, 2)
+            except Exception:
+                pass
+            try:
+                os.close(saved_fd)
+            except Exception:
+                pass
+        if devnull_fd is not None:
+            try:
+                os.close(devnull_fd)
+            except Exception:
+                pass
 
 
 def _load_sorries(server: Any, text: str) -> list[Any]:

@@ -48,6 +48,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "proof_backend": "inherit",
         "lean_backend": "dojo",
         "max_rounds": 5,
+        "max_repairs": 5,
+        "max_equivalence_repairs": 2,
         "max_proof_rounds": 1,
         "proof_repair": 2,
     },
