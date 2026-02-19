@@ -64,7 +64,7 @@ Lean backends:
 
 ---
 
-## Status (v0.1.7)
+## Status (v0.1.8)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
