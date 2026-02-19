@@ -178,10 +178,10 @@ def _configure_prover(config: dict) -> None:
         mode = "tactic"
     prove["mode"] = mode
     solver = _prompt(
-        "Default solver (auto|search|script)",
+        "Default solver (auto|search|script|portfolio)",
         default=prove.get("solver", "script"),
     ).strip().lower()
-    if solver not in {"auto", "search", "script"}:
+    if solver not in {"auto", "search", "script", "portfolio"}:
         solver = "auto"
     prove["solver"] = solver
     autop_default = "y" if prove.get("autop", True) else "n"
@@ -193,6 +193,12 @@ def _configure_prover(config: dict) -> None:
         prove["k"] = max(1, int(suggestion_raw))
     except Exception:
         prove["k"] = 1
+    retriever_k_default = str(prove.get("retriever_k", 8))
+    retriever_k_raw = _prompt("Retrieved premises per state", default=retriever_k_default).strip()
+    try:
+        prove["retriever_k"] = max(1, int(retriever_k_raw))
+    except Exception:
+        prove["retriever_k"] = 8
     llm_rounds_default = str(prove.get("llm_rounds", 4))
     llm_rounds_raw = _prompt("LLM-only max rounds", default=llm_rounds_default).strip()
     try:
@@ -746,6 +752,7 @@ def _build_args_from_config(
         max_steps=64,
         beam=4,
         k=int(prove.get("k", 1)),
+        retriever_k=int(prove.get("retriever_k", 8)),
         llm_rounds=int(prove.get("llm_rounds", 4)),
         timeout=5.0,
         repair=2,

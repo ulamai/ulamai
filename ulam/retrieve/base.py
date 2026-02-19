@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Iterable
 
@@ -37,4 +38,12 @@ class SimpleRetriever(Retriever):
 
 
 def _tokenize(text: str) -> set[str]:
-    return {token.strip().lower() for token in text.split() if token.strip()}
+    # Lean-aware tokenization: keep identifiers (`Nat.succ`, `h'`) and also
+    # break dotted names into useful subparts (`Nat`, `succ`).
+    tokens: set[str] = set()
+    for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_'.]*", text):
+        lowered = ident.lower()
+        tokens.add(lowered)
+        if "." in lowered:
+            tokens.update(part for part in lowered.split(".") if part)
+    return tokens

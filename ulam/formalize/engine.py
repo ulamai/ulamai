@@ -46,6 +46,7 @@ class FormalizationEngine:
         solved = 0
         typecheck_ok = False
         last_typecheck_error: str | None = None
+        error_counts: dict[str, int] = {}
         while rounds < self._config.max_rounds:
             rounds += 1
             _log(self._config, f"[formalize] round {rounds}/{self._config.max_rounds}")
@@ -57,9 +58,15 @@ class FormalizationEngine:
             if check_error:
                 typecheck_ok = False
                 last_typecheck_error = check_error
+                fingerprint = _error_fingerprint(check_error)
+                repeat_count = error_counts.get(fingerprint, 0) + 1
+                error_counts[fingerprint] = repeat_count
                 _log(self._config, f"[typecheck] error: {_error_preview(check_error)}")
                 _write_artifact(round_dir / "typecheck_error.txt", check_error)
                 repairs += 1
+                if repeat_count >= 3:
+                    _log(self._config, "[stagnation] repeated typecheck error; stopping early")
+                    break
                 if repairs > self._config.max_repairs:
                     return FormalizationResult(
                         output_path=self._config.output_path,
@@ -81,7 +88,14 @@ class FormalizationEngine:
                         artifact_dir=artifact_dir,
                     )
                 _log(self._config, "[repair] requesting LLM repair")
-                repaired = self._llm.repair(lean_code, check_error, context)
+                repair_error = check_error
+                if repeat_count >= 2:
+                    repair_error = (
+                        check_error
+                        + "\n\nStagnation note: a similar typecheck error has repeated in prior rounds. "
+                        "Make a materially different repair strategy."
+                    )
+                repaired = self._llm.repair(lean_code, repair_error, context)
                 if repaired.strip() and repaired != lean_code:
                     repaired = _normalize_lean_output(repaired)
                     repaired = _inject_tex_snippets(repaired, segments)
@@ -386,6 +400,7 @@ def _attempt_proofs_llm(
             _log(config, f"[prove] attempting {name}")
             snippet = tex_snippets.get(name, "")
             error: str | None = None
+            error_counts: dict[str, int] = {}
             success = False
             attempts = max(1, int(config.proof_repair) + 1)
             for attempt in range(1, attempts + 1):
@@ -410,10 +425,18 @@ def _attempt_proofs_llm(
                 lean_code = updated
                 if _decl_has_placeholder(updated, name):
                     error = f"Declaration `{name}` still contains sorry/admit."
+                    repeat = _record_error_count(error_counts, error)
+                    if repeat >= 3:
+                        _log(config, f"[stagnation] repeated placeholder error for {name}")
+                        break
                     continue
                 check_error = _typecheck(updated, config)
                 if check_error:
                     error = check_error
+                    repeat = _record_error_count(error_counts, check_error)
+                    if repeat >= 3:
+                        _log(config, f"[stagnation] repeated typecheck error for {name}")
+                        break
                     continue
                 solved += 1
                 success = True
@@ -444,6 +467,7 @@ def _run_prover(
     result = None
     try:
         llm_client = _make_llm_client(config)
+        retriever = _proof_retriever(config.output_path, name)
         runner = LeanDojoRunner(
             project_path=config.lean_project,
             imports=config.lean_imports,
@@ -460,12 +484,13 @@ def _run_prover(
             repair_attempts=config.proof_repair,
             seed=0,
             trace_path=None,
+            retriever_k=8,
             autop=True,
             instruction=instruction,
             context=None,
             verbose=config.verbose,
         )
-        result = scripted_search(runner, llm_client, _null_retriever(), trace, run_config)
+        result = scripted_search(runner, llm_client, retriever, trace, run_config)
     except Exception as exc:
         error = _augment_lean_error(
             str(exc) or repr(exc),
@@ -640,6 +665,22 @@ def _error_preview(error: str, max_lines: int = 10, max_chars: int = 900) -> str
     if truncated:
         clipped = clipped.rstrip() + "\n[truncated]"
     return clipped
+
+
+def _error_fingerprint(error: str) -> str:
+    text = (error or "").strip()
+    if not text:
+        return "<empty>"
+    first_line = text.splitlines()[0].strip().lower()
+    first_line = re.sub(r":[0-9]+:[0-9]+", ":#:#", first_line)
+    first_line = re.sub(r"\b[0-9]{2,}\b", "#", first_line)
+    return first_line[:220]
+
+
+def _record_error_count(counter: dict[str, int], error: str) -> int:
+    fingerprint = _error_fingerprint(error)
+    counter[fingerprint] = counter.get(fingerprint, 0) + 1
+    return counter[fingerprint]
 
 
 def _extract_decl_names(text: str) -> list[str]:
@@ -917,6 +958,48 @@ def _null_retriever():
     from ..retrieve import NullRetriever
 
     return NullRetriever()
+
+
+def _proof_retriever(file_path: Path, theorem_name: str):
+    # Optional local retrieval: collect nearby declarations from the current
+    # Lean file and feed them to script search as lightweight premises.
+    from ..retrieve import SimpleRetriever
+
+    enabled = os.environ.get("ULAM_FORMALIZE_LOCAL_RETRIEVER", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return _null_retriever()
+    premises = _local_decl_premises(file_path, theorem_name)
+    if not premises:
+        return _null_retriever()
+    return SimpleRetriever(premises)
+
+
+def _local_decl_premises(
+    file_path: Path,
+    theorem_name: str,
+    *,
+    max_items: int = 256,
+    max_statement_chars: int = 320,
+) -> list[str]:
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    decls = _extract_decl_blocks(text)
+    premises: list[str] = []
+    for decl in decls:
+        name = str(decl.get("name", "")).strip()
+        if not name or name == theorem_name:
+            continue
+        statement = " ".join(str(decl.get("statement", "")).split())
+        if not statement:
+            continue
+        if len(statement) > max_statement_chars:
+            statement = statement[:max_statement_chars] + " ..."
+        premises.append(f"{name}: {statement}")
+        if len(premises) >= max_items:
+            break
+    return premises
 
 
 def _load_global_config() -> dict:

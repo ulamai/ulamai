@@ -64,7 +64,7 @@ Lean backends:
 
 ---
 
-## Status (v0.1.8)
+## Status (v0.1.9)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
@@ -153,6 +153,8 @@ Formalization options:
 - `--proof-backend` (`dojo|llm`) to choose proof backend.
 - `--lean-backend` (`dojo|cli`) to choose typecheck backend.
 - `--segment` and `--segment-words` to formalize long TeX piece‑wise.
+- Local declaration retrieval is enabled by default during formalize proof search;
+  set `ULAM_FORMALIZE_LOCAL_RETRIEVER=0` to disable it.
 
 One-line installer:
 
@@ -367,6 +369,12 @@ Retrievers:
 - `--retriever simple` (token overlap)
 - `--retriever embedding` (OpenAI-compatible embeddings)
 - `--retriever none`
+- `--retriever-k N` to control how many premises are injected per state (default `8`)
+
+Solver strategy:
+- `--solver search` for best-first tactic search
+- `--solver script` for sequential script mode
+- `--solver portfolio` to run script-first then best-first fallback
 
 Menu config file:
 - Stored at `.ulam/config.json` by default (override with `ULAM_CONFIG` or `ULAM_CONFIG_DIR`).
