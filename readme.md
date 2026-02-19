@@ -67,6 +67,7 @@ Lean backends:
 ## Status (v0.1.10)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
+- **v0.1.10 highlights:** deterministic `replay --execute --strict` with pinned run metadata + auto-indexed retrieval (`ulam index`) from local/mathlib declarations
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
