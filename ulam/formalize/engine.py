@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import difflib
 import json
@@ -44,6 +45,7 @@ class FormalizationEngine:
         equiv_repairs = 0
         solved = 0
         typecheck_ok = False
+        last_typecheck_error: str | None = None
         while rounds < self._config.max_rounds:
             rounds += 1
             _log(self._config, f"[formalize] round {rounds}/{self._config.max_rounds}")
@@ -53,7 +55,9 @@ class FormalizationEngine:
             self._write_output(lean_code)
             check_error = _typecheck(lean_code, self._config)
             if check_error:
-                _log(self._config, f"[typecheck] error: {check_error[:200]}")
+                typecheck_ok = False
+                last_typecheck_error = check_error
+                _log(self._config, f"[typecheck] error: {_error_preview(check_error)}")
                 _write_artifact(round_dir / "typecheck_error.txt", check_error)
                 repairs += 1
                 if repairs > self._config.max_repairs:
@@ -63,7 +67,7 @@ class FormalizationEngine:
                         typecheck_ok=False,
                         solved=0,
                         remaining_sorries=_count_sorries(lean_code),
-                        error="max repairs reached",
+                        error=f"max repairs reached ({self._config.max_repairs})",
                         artifact_dir=artifact_dir,
                     )
                 if rounds >= self._config.max_rounds:
@@ -85,6 +89,10 @@ class FormalizationEngine:
                     _write_diff(round_dir / "repair.diff", lean_code, repaired)
                     lean_code = repaired
                 else:
+                    if not repaired.strip():
+                        _log(self._config, "[repair] empty response; stopping early")
+                    else:
+                        _log(self._config, "[repair] no effective changes; stopping early")
                     break
                 if not lean_code.strip():
                     break
@@ -148,6 +156,10 @@ class FormalizationEngine:
                 _write_diff(round_dir / "improve.diff", lean_code, improved)
                 lean_code = improved
             else:
+                if not improved.strip():
+                    _log(self._config, "[improve] empty response; stopping early")
+                else:
+                    _log(self._config, "[improve] no effective changes; stopping early")
                 break
             if not lean_code.strip():
                 break
@@ -160,7 +172,7 @@ class FormalizationEngine:
             typecheck_ok=typecheck_ok,
             solved=solved,
             remaining_sorries=_count_sorries(lean_code),
-            error=None if typecheck_ok else "typecheck failed",
+            error=None if typecheck_ok else (last_typecheck_error or "typecheck failed"),
             artifact_dir=artifact_dir,
         )
 
@@ -426,16 +438,17 @@ def _run_prover(
 ) -> tuple[bool, list[str], Path | None, str | None]:
     from ..lean.dojo import LeanDojoRunner
 
-    llm_client = _make_llm_client(config)
-    runner = LeanDojoRunner(
-        project_path=config.lean_project,
-        imports=config.lean_imports,
-        timeout_s=config.dojo_timeout_s,
-    )
     trace = TraceLogger(trace_path)
+    runner = None
     error: str | None = None
     result = None
     try:
+        llm_client = _make_llm_client(config)
+        runner = LeanDojoRunner(
+            project_path=config.lean_project,
+            imports=config.lean_imports,
+            timeout_s=config.dojo_timeout_s,
+        )
         instruction = _format_proof_instruction(name, tex_snippet, context)
         run_config = RunConfig(
             file_path=config.output_path,
@@ -454,10 +467,18 @@ def _run_prover(
         )
         result = scripted_search(runner, llm_client, _null_retriever(), trace, run_config)
     except Exception as exc:
-        error = str(exc)
+        error = _augment_lean_error(
+            str(exc) or repr(exc),
+            output_path=config.output_path,
+            project_path=config.lean_project,
+        )
     finally:
         trace.close()
-        runner.close()
+        if runner is not None:
+            try:
+                runner.close()
+            except Exception:
+                pass
 
     if error:
         return False, [], trace_path, error
@@ -526,8 +547,11 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
     if config.lean_backend == "cli":
         from ..lean.cli_check import lean_cli_check
 
-        project_path = config.lean_project or _find_lean_project(config.output_path)
-        return lean_cli_check(config.output_path, project_path=project_path, timeout_s=60.0)
+        try:
+            project_path = config.lean_project or _find_lean_project(config.output_path)
+            return lean_cli_check(config.output_path, project_path=project_path, timeout_s=60.0)
+        except Exception as exc:
+            return str(exc) or repr(exc)
 
     if not config.lean_project:
         return None
@@ -535,23 +559,87 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
         from pantograph import Server  # type: ignore
     except ImportError:
         return "Pantograph not installed."
+    except Exception as exc:
+        return str(exc) or repr(exc)
 
     from ..lean.dojo import _create_server, _find_project_root  # type: ignore
 
+    server = None
     project_path = config.lean_project or _find_project_root(config.output_path)
-    parsed_imports, body = _split_imports_for_typecheck(lean_code)
-    imports = _merge_imports(config.lean_imports, parsed_imports)
-    server = _create_server(Server, project_path, imports, timeout_s=config.dojo_timeout_s)
     try:
+        parsed_imports, body = _split_imports_for_typecheck(lean_code)
+        imports = _merge_imports(config.lean_imports, parsed_imports)
+        server = _create_server(Server, project_path, imports, timeout_s=config.dojo_timeout_s)
         server.load_sorry(body)
         return None
     except Exception as exc:  # pragma: no cover
-        return str(exc)
+        return _augment_lean_error(
+            str(exc) or repr(exc),
+            output_path=config.output_path,
+            project_path=project_path,
+        )
     finally:
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+
+
+def _augment_lean_error(error: str, output_path: Path, project_path: Path | None) -> str:
+    base = _normalize_lean_error_message(error)
+    detail = _lean_cli_diagnostic(output_path, project_path)
+    if not detail:
+        return base
+    normalized = detail.strip()
+    if normalized and normalized in base:
+        return base
+    return f"{base}\n\nLean CLI diagnostic:\n{detail}"
+
+
+def _lean_cli_diagnostic(output_path: Path, project_path: Path | None) -> str | None:
+    try:
+        from ..lean.cli_check import lean_cli_check
+
+        return lean_cli_check(output_path, project_path=project_path, timeout_s=60.0)
+    except Exception:
+        return None
+
+
+def _normalize_lean_error_message(error: str) -> str:
+    text = (error or "").strip()
+    if not text:
+        return text
+    if text.startswith("{") and text.endswith("}"):
         try:
-            server.close()
+            payload = ast.literal_eval(text)
         except Exception:
-            pass
+            payload = None
+        if isinstance(payload, dict):
+            desc = payload.get("desc")
+            code = payload.get("error")
+            if isinstance(desc, str) and desc.strip():
+                if isinstance(code, str) and code.strip():
+                    return f"{desc}\n(error: {code})"
+                return desc
+    return text
+
+
+def _error_preview(error: str, max_lines: int = 10, max_chars: int = 900) -> str:
+    text = (error or "").strip()
+    if not text:
+        return text
+    truncated = False
+    lines = text.splitlines()
+    clipped = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
+        truncated = True
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars].rstrip()
+        truncated = True
+    if truncated:
+        clipped = clipped.rstrip() + "\n[truncated]"
+    return clipped
 
 
 def _extract_decl_names(text: str) -> list[str]:

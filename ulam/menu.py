@@ -10,6 +10,8 @@ from . import __version__
 from .cli import run_prove
 from .auth import (
     codex_auth_path,
+    gemini_oauth_creds_path,
+    has_gemini_oauth_credentials,
     load_codex_api_key,
     load_codex_tokens,
     run_codex_login,
@@ -150,7 +152,7 @@ def _configure_ollama(config: dict) -> None:
 def _configure_gemini(config: dict) -> None:
     section = config.setdefault("gemini", {})
     print("\nGemini auth:")
-    print("1. Gemini CLI auth check (runs `gemini -p`, opens browser if needed)")
+    print("1. Gemini CLI OAuth login (browser callback + manual fallback)")
     print("2. Use API key")
     choice = _prompt("Auth method", default="1")
     default_model = _default_gemini_model(section)
@@ -270,6 +272,7 @@ def _configure_prover(config: dict) -> None:
         formalize["max_rounds"] = max(1, int(formalize_max_rounds_raw))
     except Exception:
         formalize["max_rounds"] = 5
+    formalize["max_repairs"] = formalize["max_rounds"]
     formalize_max_proof_rounds_raw = _prompt(
         "Formalize proof rounds",
         default=str(formalize.get("max_proof_rounds", 1)),
@@ -424,6 +427,10 @@ def _menu_formalize(config: dict) -> None:
     except Exception:
         max_rounds = 5
     try:
+        max_equivalence_repairs = max(0, int(formalize_cfg.get("max_equivalence_repairs", 2)))
+    except Exception:
+        max_equivalence_repairs = 2
+    try:
         max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
     except Exception:
         max_proof_rounds = 1
@@ -437,8 +444,8 @@ def _menu_formalize(config: dict) -> None:
         output_path=Path(output_path),
         context_files=context_files,
         max_rounds=max_rounds,
-        max_repairs=2,
-        max_equivalence_repairs=2,
+        max_repairs=max_rounds,
+        max_equivalence_repairs=max_equivalence_repairs,
         max_proof_rounds=max_proof_rounds,
         proof_max_steps=64,
         proof_beam=4,
@@ -486,7 +493,11 @@ def _menu_formalize(config: dict) -> None:
     result = engine.run()
     print(f"Wrote: {result.output_path}")
     print(f"Typecheck: {'ok' if result.typecheck_ok else 'failed'}")
-    print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    print(f"Proof-search solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    if result.error:
+        print(f"Failure reason: {str(result.error).splitlines()[0]}")
+    if not result.typecheck_ok and result.remaining_sorries == 0:
+        print("Note: no sorries remain, but Lean typecheck errors remain.")
     if result.artifact_dir:
         print(f"Artifacts: {result.artifact_dir}")
 
@@ -520,6 +531,10 @@ def _menu_formalize_resume(config: dict) -> None:
         except Exception:
             max_rounds = 5
         try:
+            max_equivalence_repairs = max(0, int(formalize_cfg.get("max_equivalence_repairs", 2)))
+        except Exception:
+            max_equivalence_repairs = 2
+        try:
             max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
         except Exception:
             max_proof_rounds = 1
@@ -533,8 +548,8 @@ def _menu_formalize_resume(config: dict) -> None:
             output_path=output_path,
             context_files=context_files,
             max_rounds=max_rounds,
-            max_repairs=2,
-            max_equivalence_repairs=2,
+            max_repairs=max_rounds,
+            max_equivalence_repairs=max_equivalence_repairs,
             max_proof_rounds=max_proof_rounds,
             proof_max_steps=64,
             proof_beam=4,
@@ -601,6 +616,12 @@ def _menu_formalize_resume(config: dict) -> None:
     except Exception:
         default_max_rounds = 5
     try:
+        default_max_equivalence_repairs = max(
+            0, int(formalize_cfg.get("max_equivalence_repairs", 2))
+        )
+    except Exception:
+        default_max_equivalence_repairs = 2
+    try:
         default_max_proof_rounds = max(1, int(formalize_cfg.get("max_proof_rounds", 1)))
     except Exception:
         default_max_proof_rounds = 1
@@ -613,15 +634,15 @@ def _menu_formalize_resume(config: dict) -> None:
         tex_path=tex_path,
         output_path=output_path,
         context_files=context_files,
-        max_rounds=max(1, int(snapshot.get("max_rounds", default_max_rounds))),
-        max_repairs=int(snapshot.get("max_repairs", 2)),
-        max_equivalence_repairs=int(snapshot.get("max_equivalence_repairs", 2)),
-        max_proof_rounds=max(1, int(snapshot.get("max_proof_rounds", default_max_proof_rounds))),
+        max_rounds=default_max_rounds,
+        max_repairs=default_max_rounds,
+        max_equivalence_repairs=default_max_equivalence_repairs,
+        max_proof_rounds=default_max_proof_rounds,
         proof_max_steps=int(snapshot.get("proof_max_steps", 64)),
         proof_beam=int(snapshot.get("proof_beam", 4)),
         proof_k=int(snapshot.get("proof_k", 8)),
         proof_timeout_s=float(snapshot.get("proof_timeout_s", 5.0)),
-        proof_repair=max(0, int(snapshot.get("proof_repair", default_proof_repair))),
+        proof_repair=default_proof_repair,
         dojo_timeout_s=float(snapshot.get("dojo_timeout_s", dojo_timeout_s)),
         lemma_max=int(snapshot.get("lemma_max", config.get("prove", {}).get("lemma_max", 60))),
         lemma_depth=int(snapshot.get("lemma_depth", config.get("prove", {}).get("lemma_depth", 60))),
@@ -642,7 +663,11 @@ def _menu_formalize_resume(config: dict) -> None:
     result = engine.run()
     print(f"Wrote: {result.output_path}")
     print(f"Typecheck: {'ok' if result.typecheck_ok else 'failed'}")
-    print(f"Solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    print(f"Proof-search solved: {result.solved}, Remaining sorries: {result.remaining_sorries}")
+    if result.error:
+        print(f"Failure reason: {str(result.error).splitlines()[0]}")
+    if not result.typecheck_ok and result.remaining_sorries == 0:
+        print("Note: no sorries remain, but Lean typecheck errors remain.")
     if result.artifact_dir:
         print(f"Artifacts: {result.artifact_dir}")
 
@@ -1275,14 +1300,13 @@ def _login_claude_cli() -> None:
 
 
 def _login_gemini_cli() -> None:
-    print("Running Gemini CLI auth check...")
-    print("If Gemini prints 'Data collection is disabled.', that line is informational.")
-    print("This triggers subscription confirmation now (instead of first formalize/prove call).")
+    print("Starting Gemini OAuth login...")
     try:
         run_gemini_login()
     except Exception as exc:
         print(f"Gemini login failed: {exc}")
-        print("Install Gemini CLI first (e.g., `npm i -g @google/gemini-cli`).")
+        if "not found on PATH" in str(exc):
+            print("Install Gemini CLI first (e.g., `npm i -g @google/gemini-cli`).")
 
 
 def _print_banner() -> None:
@@ -1338,7 +1362,7 @@ def _provider_label(config: dict) -> str:
         )
         return "Gemini API" if key else "Gemini API (no API key)"
     if provider == "gemini_cli":
-        return "Gemini CLI"
+        return "Gemini CLI" if has_gemini_oauth_credentials() else "Gemini CLI (not logged in)"
     return provider
 
 
@@ -1391,6 +1415,13 @@ def _ensure_llm_ready(config: dict, allow_placeholder: bool) -> bool:
     if provider == "gemini_cli":
         if not _command_exists("gemini"):
             print("Gemini CLI is not installed. Install it with: npm i -g @google/gemini-cli")
+            return False
+        if not has_gemini_oauth_credentials():
+            path = gemini_oauth_creds_path()
+            print(
+                "Gemini CLI OAuth credentials were not found. "
+                f"Run option 1 to configure Gemini login (expected: {path})."
+            )
             return False
         return True
     return False

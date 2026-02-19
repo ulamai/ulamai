@@ -348,7 +348,11 @@ Gemini API:
 - `ULAM_GEMINI_MODEL` (default `gemini-3-pro-preview`)
 
 Gemini CLI provider (subscription/login):
-- Run `ulam auth gemini` and complete the browser confirmation when prompted, then set `--llm gemini_cli` (no API key required).
+- Run `ulam auth gemini`, complete OAuth in your browser (or paste the callback URL/code if auto-callback fails), then set `--llm gemini_cli` (no API key required).
+- If OAuth client discovery fails, set:
+  - `ULAM_GEMINI_OAUTH_CLIENT_ID`
+  - `ULAM_GEMINI_OAUTH_CLIENT_SECRET`
+  - or `ULAM_GEMINI_OAUTH2_JS` (path to Gemini CLI `oauth2.js`)
 
 Embeddings (for retrieval):
 - `ULAM_EMBED_API_KEY` (defaults to `ULAM_OPENAI_API_KEY`)

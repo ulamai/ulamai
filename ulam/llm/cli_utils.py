@@ -118,7 +118,6 @@ def gemini_exec(
         cmd,
         timeout_s=timeout_s,
         heartbeat_s=heartbeat_s,
-        retry_login=True,
     )
 
 
@@ -126,7 +125,6 @@ def _gemini_exec_impl(
     cmd: list[str],
     timeout_s: float | None,
     heartbeat_s: float | None,
-    retry_login: bool,
 ) -> str:
     proc = subprocess.Popen(
         cmd,
@@ -153,13 +151,10 @@ def _gemini_exec_impl(
         err = _strip_gemini_startup_noise((stderr or "").strip())
         out = _strip_gemini_startup_noise((stdout or "").strip())
         msg = err or out or f"gemini exec failed (exit {proc.returncode})"
-        if retry_login and "not logged in" in msg.lower():
-            _gemini_auth_login()
-            return _gemini_exec_impl(
-                cmd,
-                timeout_s=timeout_s,
-                heartbeat_s=heartbeat_s,
-                retry_login=False,
+        if _looks_like_gemini_auth_error(msg):
+            raise RuntimeError(
+                "Gemini CLI is not authenticated. Run `ulam auth gemini` or use "
+                "Settings -> Configure LLM -> Gemini and complete OAuth login."
             )
         raise RuntimeError(msg)
     return _strip_gemini_startup_noise(stdout)
@@ -175,6 +170,18 @@ def _strip_gemini_startup_noise(text: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _looks_like_gemini_auth_error(text: str) -> bool:
+    lower = text.lower()
+    markers = (
+        "not logged in",
+        "login required",
+        "oauth",
+        "authorization required",
+        "authenticate",
+    )
+    return any(marker in lower for marker in markers)
 
 
 def _claude_print_impl(
@@ -232,18 +239,5 @@ def _claude_print_impl(
 def _claude_auth_login() -> None:
     try:
         subprocess.run(["claude", "auth", "login"], check=False)
-    except Exception:
-        return
-
-
-def _gemini_auth_login() -> None:
-    try:
-        subprocess.run(
-            ["gemini", "-p", "Reply with exactly: OK"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=300,
-        )
     except Exception:
         return
