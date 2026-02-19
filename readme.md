@@ -64,7 +64,7 @@ Lean backends:
 
 ---
 
-## Status (v0.1.9)
+## Status (v0.1.10)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
@@ -204,10 +204,22 @@ Replay the run:
 python3 -m ulam replay run.jsonl
 ```
 
+Execute deterministic replay (re-run every tactic from the trace):
+
+```bash
+python3 -m ulam replay run.jsonl --execute --strict
+```
+
 Run the regression suite (mock by default):
 
 ```bash
 python3 -m ulam bench --suite bench/regression.jsonl
+```
+
+Build a retrieval index from local project + mathlib declarations:
+
+```bash
+python3 -m ulam index build --project /path/to/lean-project --scope both --out .ulam/premises_both.jsonl
 ```
 
 LeanDojo-v2 mode (real Lean, requires a Lean project and `sorry` placeholder):
@@ -370,6 +382,16 @@ Retrievers:
 - `--retriever embedding` (OpenAI-compatible embeddings)
 - `--retriever none`
 - `--retriever-k N` to control how many premises are injected per state (default `8`)
+- If `--premises` is omitted, Ulam can auto-index declarations from Lean sources:
+  - `--retriever-source local|mathlib|both`
+  - `--retriever-build auto|always|never`
+  - `--retriever-index path/to/index.jsonl` (default `.ulam/premises_<source>.jsonl` in project)
+  - Build explicitly with `ulam index build ...`
+
+Replay metadata:
+- Each run trace `*.jsonl` now writes a sidecar `*.meta.json` with pinned environment data
+  (Lean backend, project path, toolchain, mathlib commit/rev, file hash, and run config).
+- `ulam replay ... --execute --strict` checks and replays against that metadata.
 
 Solver strategy:
 - `--solver search` for best-first tactic search

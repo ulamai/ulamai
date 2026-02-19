@@ -199,6 +199,25 @@ def _configure_prover(config: dict) -> None:
         prove["retriever_k"] = max(1, int(retriever_k_raw))
     except Exception:
         prove["retriever_k"] = 8
+    retriever_source = _prompt(
+        "Auto retriever source (local|mathlib|both)",
+        default=prove.get("retriever_source", "local"),
+    ).strip().lower()
+    if retriever_source not in {"local", "mathlib", "both"}:
+        retriever_source = "local"
+    prove["retriever_source"] = retriever_source
+    retriever_build = _prompt(
+        "Auto retriever index build (auto|always|never)",
+        default=prove.get("retriever_build", "auto"),
+    ).strip().lower()
+    if retriever_build not in {"auto", "always", "never"}:
+        retriever_build = "auto"
+    prove["retriever_build"] = retriever_build
+    retriever_index = _prompt(
+        "Auto retriever index path (blank = default)",
+        default=prove.get("retriever_index", ""),
+    ).strip()
+    prove["retriever_index"] = retriever_index
     llm_rounds_default = str(prove.get("llm_rounds", 4))
     llm_rounds_raw = _prompt("LLM-only max rounds", default=llm_rounds_default).strip()
     try:
@@ -749,6 +768,9 @@ def _build_args_from_config(
         lean="dojo" if _infer_use_lean(lean) else "mock",
         premises=None,
         retriever="none",
+        retriever_source=prove.get("retriever_source", "local"),
+        retriever_build=prove.get("retriever_build", "auto"),
+        retriever_index=Path(prove.get("retriever_index", "")) if prove.get("retriever_index") else None,
         max_steps=64,
         beam=4,
         k=int(prove.get("k", 1)),

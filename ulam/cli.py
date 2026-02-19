@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import hashlib
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import __version__
 from .lean.base import LeanRunner
 from .lean.dojo import LeanDojoRunner
 from .lean.mock import MockLeanRunner
@@ -44,8 +46,12 @@ from .retrieve import (
     NullRetriever,
     OpenAIEmbeddingClient,
     SimpleRetriever,
+    build_premise_index,
+    load_index_premises,
+    load_index_stats,
 )
 from .search import best_first_search, scripted_search
+from .state import state_hash
 from .trace import TraceLogger
 from .types import RunConfig
 
@@ -106,7 +112,25 @@ def main(argv: list[str] | None = None) -> None:
         "--retriever",
         choices=["none", "simple", "embedding"],
         default="simple",
-        help="retriever type (requires --premises for simple/embedding)",
+        help="retriever type",
+    )
+    prove.add_argument(
+        "--retriever-source",
+        choices=["local", "mathlib", "both"],
+        default="local",
+        help="auto-index source when --premises is not provided",
+    )
+    prove.add_argument(
+        "--retriever-build",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="index build policy when using auto-indexed retrieval",
+    )
+    prove.add_argument(
+        "--retriever-index",
+        type=Path,
+        default=None,
+        help="path to retrieval index jsonl (default: .ulam/premises_<source>.jsonl in project)",
     )
     prove.add_argument(
         "--retriever-k",
@@ -206,6 +230,16 @@ def main(argv: list[str] | None = None) -> None:
 
     replay = sub.add_parser("replay", help="replay or summarize a run trace")
     replay.add_argument("trace", type=Path, help="trace jsonl path")
+    replay.add_argument("--meta", type=Path, default=None, help="optional trace metadata path")
+    replay.add_argument("--execute", action="store_true", help="execute trace deterministically")
+    replay.add_argument("--strict", action="store_true", help="fail on any mismatch")
+    replay.add_argument("--align-toolchain", action="store_true", help="attempt toolchain alignment from metadata")
+    replay.add_argument("--file", type=Path, default=None, help="override Lean file for replay")
+    replay.add_argument("--theorem", default="", help="override theorem name for replay")
+    replay.add_argument("--lean", choices=["mock", "dojo"], default=None, help="override Lean backend")
+    replay.add_argument("--lean-project", type=Path, default=None, help="override Lean project root")
+    replay.add_argument("--lean-import", action="append", default=[], help="additional Lean imports")
+    replay.add_argument("--timeout", type=float, default=5.0, help="tactic timeout for execute replay")
 
     auth = sub.add_parser("auth", help="authenticate with Codex, Claude, or Gemini CLI")
     auth.add_argument("provider", choices=["codex", "claude", "gemini"])
@@ -299,6 +333,17 @@ def main(argv: list[str] | None = None) -> None:
         choices=["none", "simple", "embedding"],
         default="simple",
     )
+    bench.add_argument(
+        "--retriever-source",
+        choices=["local", "mathlib", "both"],
+        default="local",
+    )
+    bench.add_argument(
+        "--retriever-build",
+        choices=["auto", "always", "never"],
+        default="auto",
+    )
+    bench.add_argument("--retriever-index", type=Path, default=None)
     bench.add_argument("--retriever-k", type=int, default=8)
     bench.add_argument(
         "--embed-api-key",
@@ -367,6 +412,20 @@ def main(argv: list[str] | None = None) -> None:
         default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3-pro-preview"),
     )
 
+    index = sub.add_parser("index", help="build or inspect retrieval indices")
+    index_sub = index.add_subparsers(dest="index_command", required=True)
+    index_build = index_sub.add_parser("build", help="build premise index from Lean sources")
+    index_build.add_argument("--project", type=Path, default=Path.cwd(), help="Lean project root")
+    index_build.add_argument("--scope", choices=["local", "mathlib", "both"], default="both")
+    index_build.add_argument(
+        "--out",
+        type=Path,
+        default=Path(".ulam/premises_both.jsonl"),
+        help="index output path",
+    )
+    index_stats = index_sub.add_parser("stats", help="print premise index statistics")
+    index_stats.add_argument("--index", type=Path, default=Path(".ulam/premises_both.jsonl"))
+
     lean_setup = sub.add_parser(
         "lean-setup", help="install Lean + LeanDojo and create a Lean project"
     )
@@ -388,6 +447,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "bench":
         run_bench(args)
+        return
+    if args.command == "index":
+        run_index(args)
         return
     if args.command == "lean-setup":
         run_lean_setup(args)
@@ -441,6 +503,16 @@ def run_prove(args: argparse.Namespace) -> None:
             print(f"[run] solver={solver}")
             print(f"[run] autop={'on' if config.autop else 'off'}")
 
+        _write_trace_metadata(
+            config.trace_path,
+            _trace_metadata_payload(
+                args=args,
+                mode="prove",
+                solver=solver,
+                file_path=args.file,
+                theorem=args.theorem,
+            ),
+        )
         runner = _make_runner(args)
         llm = _make_llm(args)
         retriever = _make_retriever(args)
@@ -1069,6 +1141,16 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
             print(f"[run] trace={config.trace_path}")
             print(f"[run] solver={solver}")
 
+        _write_trace_metadata(
+            config.trace_path,
+            _trace_metadata_payload(
+                args=args,
+                mode="prove",
+                solver=solver,
+                file_path=args.file,
+                theorem=theorem,
+            ),
+        )
         runner = _make_runner(args)
         llm = _make_llm(args)
         retriever = _make_retriever(args)
@@ -1204,27 +1286,405 @@ def run_replay(args: argparse.Namespace) -> None:
         print(f"Trace not found: {args.trace}")
         sys.exit(1)
 
-    steps = 0
-    solved = False
-    tactics: list[str] = []
-    with args.trace.open("r", encoding="utf-8") as fh:
+    trace_rows = _load_trace_rows(args.trace)
+    meta = _load_trace_metadata(args.trace, getattr(args, "meta", None))
+
+    if not getattr(args, "execute", False):
+        solved = any(bool(row.get("solved")) for row in trace_rows)
+        print(f"Steps: {len(trace_rows)}")
+        print(f"Solved: {solved}")
+        tactics = [str(row.get("tactic", "")).strip() for row in trace_rows if str(row.get("tactic", "")).strip()]
+        if tactics:
+            print("Tactics:")
+            for tactic in tactics:
+                print(f"- {tactic}")
+        if meta:
+            print("Metadata:")
+            print(f"- Ulam: {meta.get('ulam_version', '?')}")
+            print(f"- Lean backend: {meta.get('lean_backend', '?')}")
+            print(f"- Toolchain: {meta.get('lean_toolchain') or '(unknown)'}")
+            print(f"- Mathlib commit: {meta.get('mathlib_commit') or '(unknown)'}")
+        return
+
+    _execute_replay(args, trace_rows, meta)
+
+
+def run_index(args: argparse.Namespace) -> None:
+    if args.index_command == "build":
+        project = Path(args.project).expanduser().resolve()
+        scope = args.scope
+        out = Path(args.out).expanduser()
+        if not out.is_absolute():
+            out = project / out
+        stats = build_premise_index(project, out, scope=scope)
+        print(f"Index written: {out}")
+        print(f"Records: {stats.get('records', 0)}")
+        print(f"Local files: {stats.get('local_files', 0)}")
+        print(f"Mathlib files: {stats.get('mathlib_files', 0)}")
+        return
+    if args.index_command == "stats":
+        index_path = Path(args.index).expanduser()
+        if not index_path.is_absolute():
+            index_path = Path.cwd() / index_path
+        stats = load_index_stats(index_path)
+        print(f"Index: {index_path}")
+        print(f"Records: {stats.get('records', 0)}")
+        print(f"Local records: {stats.get('local_records', 0)}")
+        print(f"Mathlib records: {stats.get('mathlib_records', 0)}")
+        return
+    raise RuntimeError(f"unknown index command: {args.index_command}")
+
+
+def _load_trace_rows(trace_path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with trace_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            payload = json.loads(line)
-            steps += 1
-            tactics.append(payload.get("tactic", ""))
-            if payload.get("solved"):
-                solved = True
-                break
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+    return rows
 
-    print(f"Steps: {steps}")
-    print(f"Solved: {solved}")
-    if tactics:
-        print("Tactics:")
-        for tactic in tactics:
-            print(f"- {tactic}")
+
+def _trace_meta_path(trace_path: Path) -> Path:
+    if trace_path.suffix == ".jsonl":
+        return trace_path.with_suffix(".meta.json")
+    return trace_path.with_name(trace_path.name + ".meta.json")
+
+
+def _write_trace_metadata(trace_path: Path | None, metadata: dict | None) -> None:
+    if trace_path is None or metadata is None:
+        return
+    if str(trace_path) == "-":
+        return
+    meta_path = _trace_meta_path(trace_path)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _load_trace_metadata(trace_path: Path, explicit: Path | None) -> dict:
+    path = explicit if explicit is not None else _trace_meta_path(trace_path)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _trace_metadata_payload(
+    *,
+    args: argparse.Namespace,
+    mode: str,
+    solver: str,
+    file_path: Path,
+    theorem: str,
+) -> dict:
+    file_abs = file_path.expanduser().resolve()
+    lean_project = getattr(args, "lean_project", None) or _find_lean_project_for_file(file_abs)
+    lean_project_path = lean_project.expanduser().resolve() if isinstance(lean_project, Path) else None
+    lean_toolchain = _read_toolchain_file(lean_project_path / "lean-toolchain") if lean_project_path else None
+    mathlib_rev = _mathlib_rev_from_manifest(lean_project_path) if lean_project_path else None
+    mathlib_commit = _mathlib_commit_from_checkout(lean_project_path) if lean_project_path else None
+    return {
+        "schema": 1,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ulam_version": __version__,
+        "mode": mode,
+        "file": str(file_abs),
+        "file_sha256": _sha256_file(file_abs),
+        "theorem": theorem,
+        "lean_backend": getattr(args, "lean", "mock"),
+        "lean_project": str(lean_project_path) if lean_project_path else "",
+        "lean_imports": list(getattr(args, "lean_import", []) or []),
+        "lean_toolchain": lean_toolchain or "",
+        "mathlib_rev": mathlib_rev or "",
+        "mathlib_commit": mathlib_commit or "",
+        "solver": solver,
+        "prove_mode": getattr(args, "prove_mode", "tactic"),
+        "retriever": getattr(args, "retriever", "none"),
+        "retriever_source": getattr(args, "retriever_source", "local"),
+        "retriever_index": str(getattr(args, "retriever_index", "") or ""),
+        "seed": int(getattr(args, "seed", 0)),
+        "max_steps": int(getattr(args, "max_steps", 0)),
+        "beam": int(getattr(args, "beam", 0)),
+        "k": int(getattr(args, "k", 0)),
+        "timeout_s": float(getattr(args, "timeout", 0.0)),
+        "repair_attempts": int(getattr(args, "repair", 0)),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _mathlib_commit_from_checkout(project_path: Path | None) -> str:
+    if project_path is None:
+        return ""
+    repo = project_path / ".lake" / "packages" / "mathlib"
+    if not repo.exists():
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _mathlib_rev_from_manifest(project_path: Path | None) -> str:
+    if project_path is None:
+        return ""
+    manifest = project_path / "lake-manifest.json"
+    if not manifest.exists():
+        return ""
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    packages = payload.get("packages", [])
+    if not isinstance(packages, list):
+        return ""
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        if str(package.get("name", "")).strip() != "mathlib":
+            continue
+        rev = str(package.get("rev", "")).strip()
+        if rev:
+            return rev
+        version = str(package.get("version", "")).strip()
+        if version:
+            return version
+    return ""
+
+
+def _execute_replay(args: argparse.Namespace, trace_rows: list[dict], metadata: dict) -> None:
+    if not trace_rows:
+        print("Trace is empty.")
+        if args.strict:
+            sys.exit(1)
+        return
+
+    replay_file = args.file or _path_from_meta(metadata.get("file"))
+    theorem = (args.theorem or str(metadata.get("theorem", "")).strip()).strip()
+    lean_backend = args.lean or str(metadata.get("lean_backend", "")).strip() or "mock"
+    if replay_file is None or not theorem:
+        print("Replay execute requires theorem and file (from metadata or --file/--theorem).")
+        sys.exit(1)
+    if not replay_file.exists():
+        print(f"Replay file not found: {replay_file}")
+        sys.exit(1)
+    if lean_backend not in {"mock", "dojo"}:
+        print(f"Replay execute backend `{lean_backend}` is not supported (use mock or dojo).")
+        sys.exit(1)
+
+    replay_project = args.lean_project or _path_from_meta(metadata.get("lean_project"))
+    lean_imports = list(args.lean_import) if args.lean_import else list(metadata.get("lean_imports", []) or [])
+    runner_args = argparse.Namespace(
+        lean=lean_backend,
+        lean_project=replay_project,
+        lean_import=lean_imports,
+    )
+
+    if not _check_replay_environment(
+        metadata=metadata,
+        replay_file=replay_file,
+        replay_project=replay_project,
+        strict=bool(args.strict),
+        align_toolchain=bool(args.align_toolchain),
+    ):
+        sys.exit(1)
+
+    runner = _make_runner(runner_args)
+    states_by_logged_key: dict[str, object] = {}
+    states_by_hash: dict[str, list[object]] = {}
+    divergences = 0
+    executed = 0
+
+    try:
+        initial = runner.start(replay_file, theorem)
+        first_key = str(trace_rows[0].get("state_key", "")).strip()
+        if first_key:
+            states_by_logged_key[first_key] = initial
+        _remember_state(states_by_hash, initial)
+
+        for idx, payload in enumerate(trace_rows, start=1):
+            state = _resolve_replay_state(payload, states_by_logged_key, states_by_hash, initial if idx == 1 else None)
+            if state is None:
+                print(f"[replay] step {idx}: missing state mapping.")
+                divergences += 1
+                if args.strict:
+                    break
+                continue
+            tactic = str(payload.get("tactic", "")).strip()
+            result = runner.apply(state, tactic, float(args.timeout))
+            executed += 1
+
+            mismatch = _compare_replay_step(payload, result)
+            if mismatch:
+                divergences += 1
+                print(f"[replay] step {idx}: {mismatch}")
+                if args.strict:
+                    break
+
+            if result.ok and result.new_state is not None:
+                new_key = str(payload.get("new_state_key", "")).strip()
+                if new_key:
+                    states_by_logged_key[new_key] = result.new_state
+                _remember_state(states_by_hash, result.new_state)
+    finally:
+        runner.close()
+
+    print(f"Replayed steps: {executed}/{len(trace_rows)}")
+    print(f"Divergences: {divergences}")
+    if divergences == 0:
+        print("Deterministic replay: OK")
+        return
+    if args.strict:
+        sys.exit(1)
+
+
+def _path_from_meta(value: object) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return Path(text).expanduser()
+
+
+def _check_replay_environment(
+    *,
+    metadata: dict,
+    replay_file: Path,
+    replay_project: Path | None,
+    strict: bool,
+    align_toolchain: bool,
+) -> bool:
+    expected_toolchain = str(metadata.get("lean_toolchain", "")).strip()
+    expected_mathlib_commit = str(metadata.get("mathlib_commit", "")).strip()
+    if not expected_toolchain and not expected_mathlib_commit:
+        return True
+    project = replay_project or _find_lean_project_for_file(replay_file)
+    if project is None:
+        print("[replay] warning: no Lean project found for environment checks.")
+        return not strict
+    project = project.expanduser().resolve()
+
+    if align_toolchain and expected_toolchain:
+        current_toolchain = _read_toolchain_file(project / "lean-toolchain")
+        if current_toolchain != expected_toolchain:
+            env = _extend_path(os.environ.copy(), Path("~/.elan/bin").expanduser())
+            if _which("elan", env):
+                print(f"[replay] aligning toolchain to {expected_toolchain}...")
+                _align_mathlib_to_toolchain(project, env, expected_toolchain)
+
+    mismatches: list[str] = []
+    current_toolchain = _read_toolchain_file(project / "lean-toolchain")
+    current_mathlib_commit = _mathlib_commit_from_checkout(project)
+    if expected_toolchain:
+        if not current_toolchain:
+            mismatches.append(f"toolchain expected {expected_toolchain}, found (missing)")
+        elif expected_toolchain != current_toolchain:
+            mismatches.append(f"toolchain expected {expected_toolchain}, found {current_toolchain}")
+    if expected_mathlib_commit:
+        if not current_mathlib_commit:
+            mismatches.append(
+                f"mathlib commit expected {expected_mathlib_commit[:12]}, found (missing)"
+            )
+        elif expected_mathlib_commit != current_mathlib_commit:
+            mismatches.append(
+                f"mathlib commit expected {expected_mathlib_commit[:12]}, found {current_mathlib_commit[:12]}"
+            )
+    if not mismatches:
+        return True
+    print("[replay] environment mismatch:")
+    for item in mismatches:
+        print(f"- {item}")
+    return not strict
+
+
+def _remember_state(states_by_hash: dict[str, list[object]], state) -> None:
+    digest = state_hash(state.pretty)
+    bucket = states_by_hash.setdefault(digest, [])
+    bucket.append(state)
+
+
+def _resolve_replay_state(
+    payload: dict,
+    states_by_logged_key: dict[str, object],
+    states_by_hash: dict[str, list[object]],
+    fallback_state,
+):
+    state_key = str(payload.get("state_key", "")).strip()
+    if state_key and state_key in states_by_logged_key:
+        return states_by_logged_key[state_key]
+    expected_hash = _expected_state_hash(payload, key="state_hash", pretty_key="state_pretty")
+    if expected_hash and expected_hash in states_by_hash and states_by_hash[expected_hash]:
+        state = states_by_hash[expected_hash][0]
+        if state_key:
+            states_by_logged_key[state_key] = state
+        return state
+    if fallback_state is not None:
+        if state_key:
+            states_by_logged_key[state_key] = fallback_state
+        return fallback_state
+    return None
+
+
+def _compare_replay_step(payload: dict, result) -> str:
+    expected_ok = bool(payload.get("ok", False))
+    expected_solved = bool(payload.get("solved", False))
+    if result.ok != expected_ok:
+        return f"ok mismatch (expected {expected_ok}, got {result.ok})"
+    if result.is_solved != expected_solved:
+        return f"solved mismatch (expected {expected_solved}, got {result.is_solved})"
+    expected_error_kind = str(payload.get("error_kind") or _bench_error_kind(payload.get("error")) or "")
+    actual_error_kind = _bench_error_kind(result.error) or ""
+    if not expected_ok and expected_error_kind and expected_error_kind != actual_error_kind:
+        return f"error kind mismatch (expected {expected_error_kind}, got {actual_error_kind or 'none'})"
+    expected_new_hash = _expected_state_hash(payload, key="new_state_hash")
+    if expected_new_hash:
+        if result.new_state is None:
+            return "expected new state but tactic produced none"
+        actual_new_hash = state_hash(result.new_state.pretty)
+        if actual_new_hash != expected_new_hash:
+            return f"new state hash mismatch (expected {expected_new_hash[:12]}, got {actual_new_hash[:12]})"
+    return ""
+
+
+def _expected_state_hash(payload: dict, *, key: str, pretty_key: str | None = None) -> str:
+    raw = payload.get(key)
+    if raw is None:
+        value = ""
+    elif isinstance(raw, str):
+        value = raw.strip()
+    else:
+        value = str(raw).strip()
+    if value.lower() == "none":
+        value = ""
+    if value:
+        return value
+    if pretty_key:
+        pretty = str(payload.get(pretty_key, ""))
+        if pretty:
+            return state_hash(pretty)
+    return ""
 
 
 def run_auth(args: argparse.Namespace) -> None:
@@ -1312,11 +1772,17 @@ def run_auth(args: argparse.Namespace) -> None:
 
 
 def _has_lean_setup_flag(argv: list[str]) -> bool:
-    return any(flag in argv for flag in ("-lean", "--lean", "--lean-setup"))
+    if not argv:
+        return False
+    return argv[0] in {"-lean", "--lean", "--lean-setup"}
 
 
 def _strip_lean_setup_flags(argv: list[str]) -> list[str]:
-    return [arg for arg in argv if arg not in ("-lean", "--lean", "--lean-setup")]
+    if not argv:
+        return []
+    if argv[0] in {"-lean", "--lean", "--lean-setup"}:
+        return argv[1:]
+    return argv
 
 
 def _parse_lean_setup_args(argv: list[str]) -> argparse.Namespace:
@@ -2341,6 +2807,16 @@ def run_bench(args: argparse.Namespace) -> None:
             context=context,
             verbose=bool(args.verbose),
         )
+        _write_trace_metadata(
+            trace_path,
+            _trace_metadata_payload(
+                args=case_args,
+                mode="bench",
+                solver=solver,
+                file_path=file_path,
+                theorem=theorem,
+            ),
+        )
         runner = _make_runner(case_args)
         retriever = _make_retriever(case_args)
         trace = TraceLogger(trace_path)
@@ -2534,12 +3010,49 @@ def _extract_tex_snippet(text: str, name: str) -> str:
 
 
 def _make_retriever(args: argparse.Namespace):
-    if args.retriever == "none" or args.premises is None:
+    if args.retriever == "none":
         return NullRetriever()
-    if not args.premises.exists():
-        raise RuntimeError(f"Premises file not found: {args.premises}")
-    with args.premises.open("r", encoding="utf-8") as fh:
-        premises = [line.rstrip("\n") for line in fh]
+    premises: list[str] = []
+    if args.premises is not None:
+        if not args.premises.exists():
+            raise RuntimeError(f"Premises file not found: {args.premises}")
+        with args.premises.open("r", encoding="utf-8") as fh:
+            premises = [line.rstrip("\n") for line in fh]
+    else:
+        source = str(getattr(args, "retriever_source", "local")).strip().lower() or "local"
+        build_mode = str(getattr(args, "retriever_build", "auto")).strip().lower() or "auto"
+        file_path = getattr(args, "file", None)
+        project = getattr(args, "lean_project", None)
+        if project is None and isinstance(file_path, Path):
+            project = _find_lean_project_for_file(file_path)
+        if project is None:
+            if args.retriever == "simple":
+                if getattr(args, "verbose", False):
+                    print("[retriever] no Lean project found; using null retriever.")
+                return NullRetriever()
+            raise RuntimeError(
+                "Automatic retrieval index requires a Lean project. "
+                "Set --lean-project or provide --premises."
+            )
+        project = Path(project).expanduser().resolve()
+        index_path = _resolve_retriever_index_path(args, project, source)
+        if build_mode not in {"auto", "always", "never"}:
+            build_mode = "auto"
+        if build_mode == "always" or (build_mode == "auto" and not index_path.exists()):
+            stats = build_premise_index(project, index_path, scope=source)
+            if getattr(args, "verbose", False):
+                print(
+                    f"[retriever] indexed {stats.get('records', 0)} premises "
+                    f"({source}) -> {index_path}"
+                )
+        if not index_path.exists():
+            raise RuntimeError(
+                f"Retriever index not found: {index_path}. "
+                "Run `ulam index build` or set --retriever-build auto/always."
+            )
+        premises = load_index_premises(index_path)
+        if not premises:
+            raise RuntimeError(f"Retriever index is empty: {index_path}")
     if args.retriever == "simple":
         return SimpleRetriever(premises)
     if args.retriever == "embedding":
@@ -2559,3 +3072,13 @@ def _make_retriever(args: argparse.Namespace):
             batch_size=args.embed_batch_size,
         )
     raise RuntimeError(f"unknown retriever: {args.retriever}")
+
+
+def _resolve_retriever_index_path(args: argparse.Namespace, project: Path, source: str) -> Path:
+    path = getattr(args, "retriever_index", None)
+    if path is None:
+        path = Path(".ulam") / f"premises_{source}.jsonl"
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = project.expanduser().resolve() / path
+    return path
