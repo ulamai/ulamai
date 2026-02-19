@@ -29,6 +29,8 @@ class ProofStep:
     new_state_key: Optional[str]
     solved: bool
     cached: bool = False
+    elapsed_ms: Optional[int] = None
+    error_kind: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class RunConfig:
     repair_attempts: int
     seed: int
     trace_path: Optional[Path]
+    retriever_k: int = 8
     autop: bool = True
     instruction: Optional[str] = None
     context: Optional[list[str]] = None

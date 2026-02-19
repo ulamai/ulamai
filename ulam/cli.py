@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import statistics
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .lean.base import LeanRunner
@@ -106,6 +109,12 @@ def main(argv: list[str] | None = None) -> None:
         help="retriever type (requires --premises for simple/embedding)",
     )
     prove.add_argument(
+        "--retriever-k",
+        type=int,
+        default=8,
+        help="number of retrieved premises per state",
+    )
+    prove.add_argument(
         "--embed-api-key",
         default=os.environ.get("ULAM_EMBED_API_KEY", os.environ.get("ULAM_OPENAI_API_KEY", "")),
     )
@@ -143,7 +152,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     prove.add_argument(
         "--solver",
-        choices=["auto", "search", "script"],
+        choices=["auto", "search", "script", "portfolio"],
         default="script",
         help="tactic solver (auto=script for lemma-first, search otherwise)",
     )
@@ -290,6 +299,7 @@ def main(argv: list[str] | None = None) -> None:
         choices=["none", "simple", "embedding"],
         default="simple",
     )
+    bench.add_argument("--retriever-k", type=int, default=8)
     bench.add_argument(
         "--embed-api-key",
         default=os.environ.get("ULAM_EMBED_API_KEY", os.environ.get("ULAM_OPENAI_API_KEY", "")),
@@ -309,6 +319,11 @@ def main(argv: list[str] | None = None) -> None:
     bench.add_argument("--k", type=int, default=1, help="suggestions per state")
     bench.add_argument("--timeout", type=float, default=5.0)
     bench.add_argument("--repair", type=int, default=2)
+    bench.add_argument(
+        "--solver",
+        choices=["search", "script", "portfolio"],
+        default="search",
+    )
     bench.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     bench.add_argument("--seed", type=int, default=0)
     bench.add_argument("--trace-dir", type=Path, default=Path("bench_traces"))
@@ -381,7 +396,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def run_prove(args: argparse.Namespace) -> None:
     allow_axioms = _resolve_allow_axioms(args)
-    context = "\n\n".join(_read_context_files(args.context))
+    context = _read_context_files(args.context)
     config = RunConfig(
         file_path=args.file,
         theorem=args.theorem,
@@ -392,6 +407,7 @@ def run_prove(args: argparse.Namespace) -> None:
         repair_attempts=args.repair,
         seed=args.seed,
         trace_path=args.trace,
+        retriever_k=max(1, int(getattr(args, "retriever_k", 8))),
         autop=_autop_enabled(args),
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
@@ -424,16 +440,13 @@ def run_prove(args: argparse.Namespace) -> None:
             print(f"[run] trace={config.trace_path}")
             print(f"[run] solver={solver}")
             print(f"[run] autop={'on' if config.autop else 'off'}")
-            print(f"[run] autop={'on' if config.autop else 'off'}")
 
         runner = _make_runner(args)
         llm = _make_llm(args)
         retriever = _make_retriever(args)
         trace = TraceLogger(config.trace_path)
         try:
-            if solver == "script":
-                return scripted_search(runner, llm, retriever, trace, config)
-            return best_first_search(runner, llm, retriever, trace, config)
+            return _run_with_solver(solver, runner, llm, retriever, trace, config)
         finally:
             trace.close()
             runner.close()
@@ -481,22 +494,27 @@ def run_prove(args: argparse.Namespace) -> None:
                 print(f"[axiom] {axiom_error}")
         return
 
+    if _resolve_solver(args) == "portfolio" and args.prove_mode == "tactic":
+        print("[portfolio] search stages failed; trying LLM-only fallback.")
+        if run_prove_llm(args):
+            return
+
     print("Failed to solve.")
     print(result.error or "unknown error")
     _summarize_failed_run(args)
 
 
-def run_prove_llm(args: argparse.Namespace) -> None:
+def run_prove_llm(args: argparse.Namespace) -> bool:
     allow_axioms = _resolve_allow_axioms(args)
     try:
         text = args.file.read_text(encoding="utf-8")
     except Exception as exc:
         print(f"Failed to read Lean file: {exc}")
-        return
+        return False
     if not _file_has_decl(text, args.theorem):
         print(f"Could not find `{args.theorem}` in {args.file}")
         _suggest_proof_targets(args.file, args.theorem)
-        return
+        return False
 
     config = _llm_config_from_args(args)
     llm = FormalizationLLM(args.llm, config)
@@ -512,6 +530,7 @@ def run_prove_llm(args: argparse.Namespace) -> None:
     from .lean.cli_check import lean_cli_check
 
     error: str | None = None
+    error_counts: dict[str, int] = {}
     for round_idx in range(1, max_rounds + 1):
         print(f"[llm] round {round_idx}/{max_rounds}")
         tex_snippet = _extract_tex_snippet(text, args.theorem)
@@ -532,11 +551,18 @@ def run_prove_llm(args: argparse.Namespace) -> None:
             print("LLM returned empty output.")
             break
         updated = _normalize_llm_output(updated)
+        if updated.strip() == text.strip():
+            print("[stagnation] LLM returned no effective code changes.")
+            break
         args.file.write_text(updated, encoding="utf-8")
         text = updated
         if _decl_has_placeholder(updated, args.theorem):
             error = f"Declaration `{args.theorem}` still contains sorry/admit."
             print(f"[typecheck] {error}")
+            count = _record_error_count(error_counts, error)
+            if count >= 3:
+                print("[stagnation] same error repeated multiple rounds; stopping.")
+                break
             continue
         check_error = lean_cli_check(
             args.file,
@@ -546,17 +572,26 @@ def run_prove_llm(args: argparse.Namespace) -> None:
         if check_error:
             error = check_error
             print(f"[typecheck] error: {check_error[:200]}")
+            count = _record_error_count(error_counts, check_error)
+            if count >= 3:
+                print("[stagnation] same typecheck error repeated multiple rounds; stopping.")
+                break
             continue
         axiom_error = _axiom_guardrail_error(updated, allow_axioms)
         if axiom_error:
             error = axiom_error
             print(f"[axiom] {axiom_error}")
+            count = _record_error_count(error_counts, axiom_error)
+            if count >= 3:
+                print("[stagnation] same axiom guardrail error repeated multiple rounds; stopping.")
+                break
             continue
         print("Solved.")
         print(f"Wrote proof to: {args.file}")
-        return
+        return True
 
     print("Failed to solve with LLM-only mode.")
+    return False
 
 
 def run_prove_lemma_first(args: argparse.Namespace) -> None:
@@ -1003,6 +1038,7 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         repair_attempts=args.repair,
         seed=args.seed,
         trace_path=trace_path,
+        retriever_k=max(1, int(getattr(args, "retriever_k", 8))),
         autop=_autop_enabled(args),
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
@@ -1038,9 +1074,7 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         retriever = _make_retriever(args)
         trace = TraceLogger(config.trace_path)
         try:
-            if solver == "script":
-                return scripted_search(runner, llm, retriever, trace, config)
-            return best_first_search(runner, llm, retriever, trace, config)
+            return _run_with_solver(solver, runner, llm, retriever, trace, config)
         finally:
             trace.close()
             runner.close()
@@ -1070,11 +1104,83 @@ def _trace_path_for_theorem(args: argparse.Namespace, theorem: str) -> Path | No
 
 def _resolve_solver(args: argparse.Namespace) -> str:
     solver = getattr(args, "solver", "auto") or "auto"
-    if solver not in {"auto", "search", "script"}:
+    if solver not in {"auto", "search", "script", "portfolio"}:
         solver = "auto"
     if solver == "auto":
         return "script" if getattr(args, "prove_mode", "tactic") == "lemma" else "search"
     return solver
+
+
+def _run_with_solver(
+    solver: str,
+    runner,
+    llm,
+    retriever,
+    trace: TraceLogger,
+    config: RunConfig,
+) -> SearchResult:
+    if solver == "script":
+        return scripted_search(runner, llm, retriever, trace, config)
+    if solver == "portfolio":
+        return _portfolio_search(runner, llm, retriever, trace, config)
+    return best_first_search(runner, llm, retriever, trace, config)
+
+
+def _portfolio_search(
+    runner,
+    llm,
+    retriever,
+    trace: TraceLogger,
+    config: RunConfig,
+) -> SearchResult:
+    total_steps = max(1, int(config.max_steps))
+    stage1_steps = min(total_steps, max(1, int(total_steps * 0.4)))
+    first_cfg = replace(config, max_steps=stage1_steps)
+    first = scripted_search(runner, llm, retriever, trace, first_cfg)
+    if first.solved:
+        return first
+    remaining = total_steps - first.steps
+    if remaining <= 0:
+        return first
+    second_cfg = replace(config, max_steps=remaining)
+    second = best_first_search(runner, llm, retriever, trace, second_cfg)
+    if second.solved:
+        return SearchResult(True, second.proof, first.steps + second.steps, None)
+    error = second.error or first.error or "portfolio exhausted"
+    return SearchResult(False, [], first.steps + second.steps, error)
+
+
+def _bench_error_kind(error: str | None) -> str | None:
+    if not error:
+        return None
+    lowered = error.lower()
+    if "timeout" in lowered:
+        return "timeout"
+    if "unknown identifier" in lowered:
+        return "unknown_identifier"
+    if "type mismatch" in lowered:
+        return "type_mismatch"
+    if "unsolved goals" in lowered:
+        return "unsolved_goals"
+    if "unexpected token" in lowered or "parse error" in lowered:
+        return "parse_error"
+    return "other"
+
+
+def _record_error_count(counter: dict[str, int], error: str) -> int:
+    fingerprint = _error_fingerprint(error)
+    counter[fingerprint] = counter.get(fingerprint, 0) + 1
+    return counter[fingerprint]
+
+
+def _error_fingerprint(error: str) -> str:
+    text = (error or "").strip()
+    if not text:
+        return "<empty>"
+    first_line = text.splitlines()[0].strip().lower()
+    first_line = re.sub(r":[0-9]+:[0-9]+", ":#:#", first_line)
+    first_line = re.sub(r"\b[0-9]{2,}\b", "#", first_line)
+    return first_line[:220]
 
 
 def _autop_enabled(args: argparse.Namespace) -> bool:
@@ -2205,11 +2311,15 @@ def run_bench(args: argparse.Namespace) -> None:
 
     llm = _make_llm(args)
     solved = 0
-    results: list[tuple[str, bool]] = []
+    results: list[dict[str, object]] = []
+    error_kinds: Counter[str] = Counter()
+    step_counts: list[int] = []
+    durations_s: list[float] = []
     for idx, (file_path, theorem, premises) in enumerate(cases, start=1):
         case_args = argparse.Namespace(**vars(args))
         case_args.premises = premises if premises is not None else args.premises
         context = _read_context_files(case_args.context)
+        solver = _resolve_solver(case_args)
         trace_path = None
         if args.trace_dir:
             args.trace_dir.mkdir(parents=True, exist_ok=True)
@@ -2225,6 +2335,7 @@ def run_bench(args: argparse.Namespace) -> None:
             repair_attempts=args.repair,
             seed=args.seed,
             trace_path=trace_path,
+            retriever_k=max(1, int(getattr(args, "retriever_k", 8))),
             autop=_autop_enabled(case_args),
             instruction=args.instruction.strip() if args.instruction else None,
             context=context,
@@ -2233,19 +2344,45 @@ def run_bench(args: argparse.Namespace) -> None:
         runner = _make_runner(case_args)
         retriever = _make_retriever(case_args)
         trace = TraceLogger(trace_path)
+        start = time.perf_counter()
         try:
-            result = best_first_search(runner, llm, retriever, trace, config)
+            result = _run_with_solver(solver, runner, llm, retriever, trace, config)
         finally:
             trace.close()
             runner.close()
-        results.append((theorem, result.solved))
+        duration_s = time.perf_counter() - start
+        durations_s.append(duration_s)
+        step_counts.append(result.steps)
+        kind = _bench_error_kind(result.error)
+        if kind:
+            error_kinds[kind] += 1
+        results.append(
+            {
+                "theorem": theorem,
+                "solved": result.solved,
+                "steps": result.steps,
+                "duration_s": duration_s,
+                "error_kind": kind,
+            }
+        )
         if result.solved:
             solved += 1
         status = "solved" if result.solved else "failed"
-        print(f"[{idx}/{len(cases)}] {theorem}: {status}")
+        print(
+            f"[{idx}/{len(cases)}] {theorem}: {status} "
+            f"(steps={result.steps}, time={duration_s:.2f}s)"
+        )
 
     print(f"Total: {len(cases)}")
     print(f"Solved: {solved}")
+    if results:
+        success_rate = (100.0 * solved) / len(results)
+        print(f"Success rate: {success_rate:.1f}%")
+        print(f"Median steps: {statistics.median(step_counts):.1f}")
+        print(f"Median time: {statistics.median(durations_s):.2f}s")
+    if error_kinds:
+        summary = ", ".join(f"{name}={count}" for name, count in error_kinds.most_common(5))
+        print(f"Top failure kinds: {summary}")
 
 
 def _read_context_files(paths: list[Path], max_chars: int = 8000) -> list[str]:

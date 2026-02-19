@@ -43,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "prove": {
         "allow_axioms": True,
+        "retriever_k": 8,
     },
     "formalize": {
         "proof_backend": "inherit",
