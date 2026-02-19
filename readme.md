@@ -308,7 +308,7 @@ OpenAI-compatible (default):
 - `ULAM_OPENAI_BASE_URL` (default `https://api.openai.com`)
 - `ULAM_OPENAI_MODEL` (default `gpt-4.1`)
 
-Codex (ChatGPT subscription) login:
+OpenAI (ChatGPT subscription) login:
 - Run `ulam auth codex` (or `codex login`) and UlamAI can import credentials from `~/.codex/auth.json`.
 - This is the same flow used by the official Codex CLI (ChatGPT sign‑in creates a key automatically).
 

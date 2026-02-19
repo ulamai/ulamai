@@ -33,7 +33,7 @@ def run_menu() -> None:
         print(f"Version: {__version__}")
         print(f"Provider: {_provider_label(config)}")
         print()
-        print("1. Configure LLM (Codex/OpenAI, Claude, Ollama, Gemini)")
+        print("1. Configure LLM (OpenAI, Claude, Ollama, Gemini)")
         print("2. Prove with natural language guidance")
         print("3. Formalize .tex to Lean")
         print("4. Resume last formalization")
@@ -66,7 +66,7 @@ def run_menu() -> None:
 
 def _configure_llm(config: dict) -> None:
     print("\nChoose provider:")
-    print("1. Codex/OpenAI (subscription or API key)")
+    print("1. OpenAI (subscription or API key)")
     print("2. Claude (Anthropic)")
     print("3. Ollama")
     print("4. Gemini")
@@ -90,7 +90,7 @@ def _configure_llm(config: dict) -> None:
 
 def _configure_openai(config: dict) -> None:
     section = config.setdefault("openai", {})
-    print("\nOpenAI/Codex auth:")
+    print("\nOpenAI auth:")
     print("1. Sign in with ChatGPT (Codex CLI)")
     print("2. Use API key")
     choice = _prompt("Auth method", default="1")
@@ -1332,7 +1332,7 @@ def _provider_label(config: dict) -> str:
     provider = config.get("llm_provider", "openai")
     if provider == "openai":
         key = config.get("openai", {}).get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
-        return "Codex/OpenAI" if key else "Codex/OpenAI (no API key)"
+        return "OpenAI" if key else "OpenAI (no API key)"
     if provider == "codex_cli":
         tokens = load_codex_tokens()
         return "Codex CLI (subscription)" if tokens else "Codex CLI (not logged in)"
