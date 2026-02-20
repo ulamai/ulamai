@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import os
 import re
+import subprocess
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,8 @@ from typing import Any, Optional
 
 from .base import LeanRunner
 from ..types import ProofState, TacticResult
+
+_PANTOGRAPH_BOOTSTRAP_ATTEMPTED = False
 
 
 @dataclass(frozen=True)
@@ -27,15 +31,7 @@ class LeanDojoRunner(LeanRunner):
         imports: Optional[list[str]] = None,
         timeout_s: Optional[float] = None,
     ) -> None:
-        try:
-            from pantograph import Server  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "Pantograph is not installed. Install LeanDojo-v2 and PyPantograph "
-                "(e.g., `pip install lean-dojo-v2` and `pip install PyPantograph`)."
-            ) from exc
-
-        self._Server = Server
+        self._Server = _load_pantograph_server()
         if timeout_s is None:
             timeout_s = _default_dojo_timeout()
         self._config = _LeanDojoConfig(project_path=project_path, imports=imports, timeout_s=timeout_s)
@@ -129,6 +125,77 @@ class LeanDojoRunner(LeanRunner):
         key = _state_key(goal_state)
         self._states[key] = goal_state
         return ProofState(key=key, pretty=str(goal_state))
+
+
+def _load_pantograph_server() -> Any:
+    try:
+        from pantograph import Server  # type: ignore
+        return Server
+    except ImportError as exc:
+        if _auto_bootstrap_pantograph():
+            try:
+                from pantograph import Server  # type: ignore
+                return Server
+            except ImportError:
+                pass
+        raise RuntimeError(_pantograph_missing_message()) from exc
+
+
+def _pantograph_missing_message() -> str:
+    return (
+        "Pantograph is not installed in this Python environment. "
+        "Run `ulam -lean` to install LeanDojo/Pantograph, or install manually with "
+        "`python3 -m pip install --user lean-dojo-v2 "
+        "git+https://github.com/stanford-centaur/PyPantograph`."
+    )
+
+
+def _auto_bootstrap_pantograph() -> bool:
+    global _PANTOGRAPH_BOOTSTRAP_ATTEMPTED
+    if _PANTOGRAPH_BOOTSTRAP_ATTEMPTED:
+        return False
+    _PANTOGRAPH_BOOTSTRAP_ATTEMPTED = True
+
+    enabled = os.environ.get("ULAM_AUTO_INSTALL_PANTOGRAPH", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return False
+
+    python = sys.executable or "python3"
+    cmd = [python, "-m", "pip", "install"]
+    in_venv = (
+        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        or bool(os.environ.get("VIRTUAL_ENV"))
+    )
+    if not in_venv:
+        cmd.append("--user")
+    cmd.extend(
+        [
+            "lean-dojo-v2",
+            "git+https://github.com/stanford-centaur/PyPantograph",
+        ]
+    )
+
+    print("[lean] Pantograph is missing; attempting one-time install...")
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except Exception as exc:
+        print(f"[lean] automatic Pantograph install failed: {exc}")
+        return False
+
+    if proc.returncode == 0:
+        print("[lean] Pantograph install completed.")
+        return True
+
+    output = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+    short = output[-400:] if output else f"exit code {proc.returncode}"
+    print(f"[lean] automatic Pantograph install failed: {short}")
+    return False
 
 
 def _state_key(goal_state: Any) -> str:

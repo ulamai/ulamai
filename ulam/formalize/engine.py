@@ -581,9 +581,11 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
     if not config.lean_project:
         return None
     try:
-        from pantograph import Server  # type: ignore
-    except ImportError:
-        return "Pantograph not installed."
+        from ..lean.dojo import _load_pantograph_server  # type: ignore
+
+        Server = _load_pantograph_server()
+    except RuntimeError as exc:
+        return str(exc)
     except Exception as exc:
         return str(exc) or repr(exc)
 
