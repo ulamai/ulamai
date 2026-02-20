@@ -14,7 +14,7 @@ class GeminiClient(LLMClient):
         self,
         api_key: str,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
-        model: str = "gemini-3-pro-preview",
+        model: str = "gemini-3.1-pro-preview",
         temperature: float = 0.2,
         timeout_s: float = 60.0,
     ) -> None:

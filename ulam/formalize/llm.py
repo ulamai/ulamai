@@ -440,7 +440,7 @@ def _call_gemini(config: dict, prompt: str) -> str:
     if not api_key:
         return ""
     base_url = gemini.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
-    model = gemini.get("model", "gemini-3-pro-preview")
+    model = gemini.get("model", "gemini-3.1-pro-preview")
     payload = {
         "model": model,
         "messages": [

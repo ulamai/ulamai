@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.10)
+## Status (v0.1.11)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.10 highlights:** deterministic `replay --execute --strict` with pinned run metadata + auto-indexed retrieval (`ulam index`) from local/mathlib declarations
+- **v0.1.11 highlights:** Gemini auth now auto-falls back to native CLI login, and Gemini 3.1 (`gemini-3.1-pro-preview`) is the default/first suggested model
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -360,11 +360,12 @@ Claude Code CLI provider (subscription):
 Gemini API:
 - `ULAM_GEMINI_API_KEY` (or `GEMINI_API_KEY`)
 - `ULAM_GEMINI_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta/openai`)
-- `ULAM_GEMINI_MODEL` (default `gemini-3-pro-preview`)
+- `ULAM_GEMINI_MODEL` (default `gemini-3.1-pro-preview`)
 
 Gemini CLI provider (subscription/login):
-- Run `ulam auth gemini`, complete OAuth in your browser (or paste the callback URL/code if auto-callback fails), then set `--llm gemini_cli` (no API key required).
-- If OAuth client discovery fails, set:
+- Run `ulam auth gemini` and complete OAuth in your browser (no API key required).
+- Ulam first uses its built-in browser+callback flow and automatically falls back to Gemini CLI native login.
+- If your environment is unusual and auto-discovery still fails, set:
   - `ULAM_GEMINI_OAUTH_CLIENT_ID`
   - `ULAM_GEMINI_OAUTH_CLIENT_SECRET`
   - or `ULAM_GEMINI_OAUTH2_JS` (path to Gemini CLI `oauth2.js`)

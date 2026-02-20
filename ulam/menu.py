@@ -152,7 +152,7 @@ def _configure_ollama(config: dict) -> None:
 def _configure_gemini(config: dict) -> None:
     section = config.setdefault("gemini", {})
     print("\nGemini auth:")
-    print("1. Gemini CLI OAuth login (browser callback + manual fallback)")
+    print("1. Gemini CLI OAuth login (automatic; native fallback)")
     print("2. Use API key")
     choice = _prompt("Auth method", default="1")
     default_model = _default_gemini_model(section)
@@ -755,7 +755,7 @@ def _build_args_from_config(
     anthropic_model = anthropic.get("model", "")
     if provider == "claude_cli":
         anthropic_model = anthropic.get("claude_model") or anthropic_model
-    gemini_model = gemini.get("model", "gemini-3-pro-preview")
+    gemini_model = gemini.get("model", "gemini-3.1-pro-preview")
     if provider == "gemini_cli":
         gemini_model = gemini.get("cli_model") or gemini_model or _default_gemini_model(gemini)
 
@@ -1237,14 +1237,16 @@ def _default_gemini_model(section: dict) -> str:
     env_model = os.environ.get("ULAM_GEMINI_MODEL", "")
     if env_model:
         return env_model
-    return "gemini-3-pro-preview"
+    return "gemini-3.1-pro-preview"
 
 
 def _gemini_model_suggestions(section: dict, default: str) -> list[str]:
     suggestions = [
+        "gemini-3.1-pro-preview",
         default,
         section.get("cli_model", ""),
         section.get("model", ""),
+        "gemini-3.1-flash-preview",
         "gemini-3-pro-preview",
         "gemini-3-pro",
         "gemini-3-flash-preview",

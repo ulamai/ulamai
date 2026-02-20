@@ -32,7 +32,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "gemini": {
         "api_key": "",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "model": "gemini-3-pro-preview",
+        "model": "gemini-3.1-pro-preview",
         "cli_model": "",
     },
     "embed": {
