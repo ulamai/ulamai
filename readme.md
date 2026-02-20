@@ -410,6 +410,7 @@ Menu config file:
 
 - **LLM‑only mode fails to typecheck:** make sure `lean`/`lake` is on PATH and the file is inside a Lean project (has `lakefile.lean` or `lean-toolchain`).
 - **LeanDojo mismatch errors:** run `ulam -lean` in your project folder or re-run `ulam lean-setup` to align the toolchain.
+- **Pantograph missing after Python/Homebrew upgrades:** run `ulam -lean` to reinstall LeanDojo/Pantograph. Ulam also attempts one-time auto-install on demand (disable with `ULAM_AUTO_INSTALL_PANTOGRAPH=0`).
 - **Codex/Claude/Gemini CLI hangs:** set `LLM request timeout` in Settings or keep it `0` and use heartbeat logs to verify it’s running.
 
 ---
