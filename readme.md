@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.11)
+## Status (v0.1.12)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.11 highlights:** Gemini auth now auto-falls back to native CLI login, and Gemini 3.1 (`gemini-3.1-pro-preview`) is the default/first suggested model
+- **v0.1.12 highlights:** Homebrew install is back to dedicated virtualenv mode; `ulam -lean` and Pantograph auto-install now retry with PEP 668-safe pip fallbacks
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
