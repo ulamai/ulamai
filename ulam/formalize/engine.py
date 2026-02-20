@@ -559,11 +559,11 @@ def _make_llm_client(config: FormalizationConfig):
         return GeminiClient(
             api_key=api_key,
             base_url=gemini_cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai"),
-            model=gemini_cfg.get("model", "gemini-3-pro-preview"),
+            model=gemini_cfg.get("model", "gemini-3.1-pro-preview"),
         )
     if provider == "gemini_cli":
         gemini_cfg = cfg.get("gemini", {})
-        model = gemini_cfg.get("cli_model") or gemini_cfg.get("model") or "gemini-3-pro-preview"
+        model = gemini_cfg.get("cli_model") or gemini_cfg.get("model") or "gemini-3.1-pro-preview"
         return GeminiCLIClient(model=model)
     raise RuntimeError("No LLM provider configured")
 

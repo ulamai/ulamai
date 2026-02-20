@@ -225,7 +225,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     prove.add_argument(
         "--gemini-model",
-        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3-pro-preview"),
+        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3.1-pro-preview"),
     )
 
     replay = sub.add_parser("replay", help="replay or summarize a run trace")
@@ -409,7 +409,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     bench.add_argument(
         "--gemini-model",
-        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3-pro-preview"),
+        default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3.1-pro-preview"),
     )
 
     index = sub.add_parser("index", help="build or inspect retrieval indices")
@@ -1745,7 +1745,7 @@ def run_auth(args: argparse.Namespace) -> None:
         return
     if args.provider == "gemini":
         print("Gemini auth options:")
-        print("1. Gemini CLI OAuth login (browser callback + manual fallback)")
+        print("1. Gemini CLI OAuth login (automatic; native fallback)")
         print("2. Use API key")
         choice = input("Auth method [1]: ").strip() or "1"
         if choice == "1":

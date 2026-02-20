@@ -6,6 +6,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -59,7 +60,30 @@ def run_gemini_login() -> None:
     if which("gemini") is None:
         raise RuntimeError("gemini CLI not found on PATH")
 
-    client = _load_oauth_client()
+    if has_gemini_oauth_credentials():
+        _cache_google_account_from_saved_creds()
+        print("Gemini OAuth credentials already exist; using current login.")
+        return
+
+    client: _GeminiOAuthClient | None = None
+    discovery_error: Exception | None = None
+    try:
+        client = _load_oauth_client()
+    except Exception as exc:
+        discovery_error = exc
+
+    if client is None:
+        if _run_gemini_native_login():
+            _cache_google_account_from_saved_creds()
+            return
+        message = (
+            "Gemini native login did not produce OAuth credentials "
+            f"(expected: {gemini_oauth_creds_path()})."
+        )
+        if discovery_error is not None:
+            raise RuntimeError(f"{discovery_error}\n{message}") from discovery_error
+        raise RuntimeError(message)
+
     state = _random_urlsafe(32)
     code_verifier = _random_urlsafe(64)
     code_challenge = _pkce_s256(code_verifier)
@@ -105,6 +129,7 @@ def run_gemini_login() -> None:
     tokens = _exchange_code_for_tokens(client, code, code_verifier, redirect_uri)
     _save_gemini_credentials(tokens)
     _cache_google_account_if_available(tokens.get("access_token", ""))
+    print("Gemini OAuth login completed.")
 
 
 def _build_auth_url(client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
@@ -345,6 +370,22 @@ def _cache_google_account_if_available(access_token: str) -> None:
     _cache_google_account(email.strip())
 
 
+def _cache_google_account_from_saved_creds() -> None:
+    path = gemini_oauth_creds_path()
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    access_token = str(payload.get("access_token", "")).strip()
+    if not access_token:
+        return
+    _cache_google_account_if_available(access_token)
+
+
 def _cache_google_account(email: str) -> None:
     path = Path.home() / ".gemini" / "google_accounts.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,6 +423,33 @@ def _load_oauth_client() -> _GeminiOAuthClient:
     )
 
 
+def _run_gemini_native_login() -> bool:
+    print(
+        "Could not auto-discover Gemini OAuth client credentials; "
+        "falling back to Gemini CLI native login."
+    )
+    env = os.environ.copy()
+    env.setdefault("OAUTH_CALLBACK_HOST", "localhost")
+    probe_cmd = ["gemini", "-p", "Reply with exactly: ok"]
+    try:
+        subprocess.run(probe_cmd, check=False, env=env)
+    except Exception:
+        pass
+    if has_gemini_oauth_credentials():
+        print("Gemini CLI native login completed.")
+        return True
+    if os.isatty(0) and os.isatty(1):
+        print("Launching interactive Gemini CLI login. Complete sign-in, then exit.")
+        try:
+            subprocess.run(["gemini"], check=False, env=env)
+        except Exception:
+            pass
+    if has_gemini_oauth_credentials():
+        print("Gemini CLI native login completed.")
+        return True
+    return False
+
+
 def _find_gemini_oauth2_js() -> Path | None:
     env_path = os.environ.get("ULAM_GEMINI_OAUTH2_JS", "").strip()
     if env_path:
@@ -392,8 +460,10 @@ def _find_gemini_oauth2_js() -> Path | None:
     candidates: list[Path] = []
     if exe:
         resolved = Path(exe).resolve()
+        package_root = _guess_gemini_package_root(resolved)
         candidates.extend(
             [
+                package_root / "node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
                 resolved.parent.parent
                 / "lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
                 resolved.parent.parent
@@ -401,16 +471,50 @@ def _find_gemini_oauth2_js() -> Path | None:
                 resolved.parent.parent / "lib/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
             ]
         )
+        for parent in list(resolved.parents)[:10]:
+            candidates.extend(
+                [
+                    parent / "node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
+                    parent
+                    / "node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
+                    parent
+                    / "lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
+                    parent
+                    / "libexec/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js",
+                ]
+            )
     candidates.extend(
         [
             Path("/opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"),
             Path("/usr/local/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"),
         ]
     )
+    for cellar in (
+        Path("/opt/homebrew/Cellar/gemini-cli"),
+        Path("/usr/local/Cellar/gemini-cli"),
+    ):
+        if cellar.exists():
+            candidates.extend(
+                cellar.glob(
+                    "*/libexec/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"
+                )
+            )
+    seen: set[str] = set()
     for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
         if candidate.exists():
             return candidate
     return None
+
+
+def _guess_gemini_package_root(resolved: Path) -> Path:
+    # Homebrew/npm typically resolve to .../@google/gemini-cli/dist/index.js.
+    if resolved.name == "index.js" and resolved.parent.name == "dist":
+        return resolved.parent.parent
+    return resolved.parent
 
 
 def _parse_oauth_client_from_js(path: Path) -> _GeminiOAuthClient | None:
