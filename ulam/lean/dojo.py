@@ -160,42 +160,84 @@ def _auto_bootstrap_pantograph() -> bool:
     if enabled in {"0", "false", "no", "off"}:
         return False
 
-    python = sys.executable or "python3"
-    cmd = [python, "-m", "pip", "install"]
+    print("[lean] Pantograph is missing; attempting one-time install...")
+    packages = [
+        "lean-dojo-v2",
+        "git+https://github.com/stanford-centaur/PyPantograph",
+    ]
+    ok, flags, output = _pip_install_with_fallback(packages)
+    if ok:
+        if flags:
+            print(f"[lean] Pantograph install completed with flags: {' '.join(flags)}")
+        else:
+            print("[lean] Pantograph install completed.")
+        return True
+    short = output[-400:] if output else "install failed"
+    print(f"[lean] automatic Pantograph install failed: {short}")
+    return False
+
+
+def _pip_install_with_fallback(packages: list[str]) -> tuple[bool, list[str], str]:
+    base = [sys.executable or "python3", "-m", "pip", "install"]
+    attempts = _pip_install_attempt_flags()
+    last_output = ""
+    for flags in attempts:
+        cmd = [*base, *flags, *packages]
+        try:
+            proc = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=600,
+            )
+        except Exception as exc:
+            last_output = str(exc)
+            continue
+        if proc.returncode == 0:
+            return True, flags, ""
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        last_output = output
+        if _is_externally_managed_pip_error(output):
+            continue
+        return False, flags, output
+    return False, attempts[-1], last_output
+
+
+def _pip_install_attempt_flags() -> list[list[str]]:
+    prefers_break = os.environ.get("ULAM_BREAK_SYSTEM_PACKAGES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     in_venv = (
         getattr(sys, "base_prefix", sys.prefix) != sys.prefix
         or bool(os.environ.get("VIRTUAL_ENV"))
     )
-    if not in_venv:
-        cmd.append("--user")
-    cmd.extend(
-        [
-            "lean-dojo-v2",
-            "git+https://github.com/stanford-centaur/PyPantograph",
-        ]
-    )
+    if in_venv:
+        if prefers_break:
+            return [[], ["--break-system-packages"]]
+        return [[], ["--break-system-packages"]]
+    default_order = [
+        [],
+        ["--user"],
+        ["--break-system-packages"],
+        ["--break-system-packages", "--user"],
+    ]
+    if not prefers_break:
+        return default_order
+    return [
+        ["--break-system-packages", "--user"],
+        ["--break-system-packages"],
+        ["--user"],
+        [],
+    ]
 
-    print("[lean] Pantograph is missing; attempting one-time install...")
-    try:
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=600,
-        )
-    except Exception as exc:
-        print(f"[lean] automatic Pantograph install failed: {exc}")
-        return False
 
-    if proc.returncode == 0:
-        print("[lean] Pantograph install completed.")
-        return True
-
-    output = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
-    short = output[-400:] if output else f"exit code {proc.returncode}"
-    print(f"[lean] automatic Pantograph install failed: {short}")
-    return False
+def _is_externally_managed_pip_error(output: str) -> bool:
+    text = output.lower()
+    return "externally-managed-environment" in text or "externally managed" in text
 
 
 def _state_key(goal_state: Any) -> str:

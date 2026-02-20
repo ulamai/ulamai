@@ -2166,7 +2166,7 @@ def _ensure_toolchain_installed(toolchain: str, env: dict) -> bool:
 
 
 def _pip_install(env: dict, args: argparse.Namespace, packages: list[str]) -> bool:
-    cmd = [
+    base = [
         sys.executable,
         "-m",
         "pip",
@@ -2175,9 +2175,72 @@ def _pip_install(env: dict, args: argparse.Namespace, packages: list[str]) -> bo
         str(args.pip_timeout),
         "--retries",
         str(args.pip_retries),
-        *packages,
     ]
-    return _run_cmd(cmd, env=env)
+    attempts = _pip_install_attempt_flags()
+    last_output = ""
+    for idx, flags in enumerate(attempts):
+        cmd = [*base, *flags, *packages]
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode == 0:
+            if idx > 0:
+                print(f"[pip] recovered by retrying with flags: {' '.join(flags)}")
+            return True
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        last_output = output
+        if _is_externally_managed_pip_error(output):
+            continue
+        print(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+        if output:
+            print(output)
+        return False
+
+    final_cmd = [*base, *attempts[-1], *packages]
+    print(f"Command failed: {' '.join(final_cmd)}")
+    if last_output:
+        print(last_output)
+    return False
+
+
+def _pip_install_attempt_flags() -> list[list[str]]:
+    prefers_break = os.environ.get("ULAM_BREAK_SYSTEM_PACKAGES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    in_venv = (
+        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        or bool(os.environ.get("VIRTUAL_ENV"))
+    )
+    if in_venv:
+        if prefers_break:
+            return [[], ["--break-system-packages"]]
+        return [[], ["--break-system-packages"]]
+    default_order = [
+        [],
+        ["--user"],
+        ["--break-system-packages"],
+        ["--break-system-packages", "--user"],
+    ]
+    if not prefers_break:
+        return default_order
+    return [
+        ["--break-system-packages", "--user"],
+        ["--break-system-packages"],
+        ["--user"],
+        [],
+    ]
+
+
+def _is_externally_managed_pip_error(output: str) -> bool:
+    text = output.lower()
+    return "externally-managed-environment" in text or "externally managed" in text
 
 
 def _is_lean_mismatch_error(exc: Exception) -> bool:
