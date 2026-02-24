@@ -136,13 +136,21 @@ Draft → Typecheck → Proof Search → Validate Equivalence
 - Optional debug logs: LLM prompts, retrieved premises, tactic failures.
 - `runs/formalize_*/`: per-round artifacts (Lean files, diffs, errors, equivalence reports).
 
-## Next Implementation Steps (Suggested)
+## Current Status (Implemented)
 
-1. Add a formalization **segmenter** (TeX → structured chunks).
-2. Add a **statement generator** + Lean typecheck loop.
-3. Add a **lemma proof loop** with LeanDojo.
-4. Add **equivalence checks** for informal vs formal statements.
-5. Add **recursive repair** for statement + proof co-evolution.
+- Formalization **segmenter** (TeX -> structured chunks) is implemented.
+- **Statement generation** + Lean typecheck/repair loops are implemented.
+- **Lemma proof loops** with LeanDojo/CLI backends are implemented.
+- Informal vs formal **equivalence checks** are implemented.
+- **Recursive statement/proof repair** loops are implemented.
+
+## Next Implementation Steps (Post-v0.1)
+
+1. Improve proof-state canonicalization and scoring heuristics.
+2. Improve retrieval ranking/formatting quality for injected premises.
+3. Expand regression-suite management and reporting for `ulam bench`.
+4. Add optional graph/MCTS-style search upgrades with stronger reuse.
+5. Build trace-to-dataset tooling for SFT evaluation loops.
 
 ## Non-Goals (For Now)
 
