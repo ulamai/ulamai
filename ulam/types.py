@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -51,3 +51,4 @@ class RunConfig:
     instruction: Optional[str] = None
     context: Optional[list[str]] = None
     verbose: bool = False
+    on_progress: Optional[Callable[[list[str]], None]] = None

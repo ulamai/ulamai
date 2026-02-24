@@ -157,6 +157,12 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--k", type=int, default=1, help="suggestions per state")
     prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
     prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
+    prove.add_argument(
+        "--typecheck-timeout",
+        type=float,
+        default=None,
+        help="Lean typecheck timeout in LLM mode (seconds)",
+    )
     prove.add_argument("--repair", type=int, default=2, help="repair attempts per failure")
     prove.add_argument(
         "--allow-axioms",
@@ -474,6 +480,7 @@ def run_prove(args: argparse.Namespace) -> None:
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
         verbose=bool(args.verbose),
+        on_progress=_proof_progress_callback(args.file, args.theorem, verbose=bool(args.verbose)),
     )
     _preflight_lean_alignment(args)
 
@@ -639,7 +646,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
         check_error = lean_cli_check(
             args.file,
             project_path=project,
-            timeout_s=max(30.0, float(args.timeout)),
+            timeout_s=_resolve_typecheck_timeout(args),
         )
         if check_error:
             error = check_error
@@ -771,6 +778,44 @@ class LemmaPlan:
 
 
 LEMMA_PLAN_MARKER = "ULAMAI_LEMMA_PLAN"
+ULAMAI_DRAFT_BEGIN = "-- ULAMAI_DRAFT_PROOF_BEGIN"
+ULAMAI_DRAFT_END = "-- ULAMAI_DRAFT_PROOF_END"
+
+_LEAN_IDENT_CHARS = "A-Za-z0-9_'"
+_DECL_NAME_PATTERN = re.compile(r"^\s*(?:theorem|lemma|example)\s+([A-Za-z_][A-Za-z0-9_']*)", re.M)
+_ANY_DECL_START_PATTERN = re.compile(r"^\s*(?:theorem|lemma|example)\s+[A-Za-z_][A-Za-z0-9_']*", re.M)
+_ANY_TOP_DECL_START_PATTERN = re.compile(
+    r"^\s*(?:theorem|lemma|example|def|abbrev|structure)\s+[A-Za-z_][A-Za-z0-9_']*",
+    re.M,
+)
+
+
+def _name_token_regex(name: str) -> str:
+    return rf"(?<![{_LEAN_IDENT_CHARS}]){re.escape(name)}(?![{_LEAN_IDENT_CHARS}])"
+
+
+def _decl_head_regex(name: str, kinds: str = "theorem|lemma|example") -> re.Pattern[str]:
+    return re.compile(rf"^\s*(?:{kinds})\s+{_name_token_regex(name)}", re.M)
+
+
+def _decl_span(text: str, name: str) -> tuple[int, int] | None:
+    pattern = _decl_head_regex(name)
+    match = pattern.search(text)
+    if not match:
+        return None
+    next_match = _ANY_DECL_START_PATTERN.search(text, match.end())
+    end = next_match.start() if next_match else len(text)
+    return match.start(), end
+
+
+def _top_decl_span(text: str, name: str) -> tuple[int, int] | None:
+    pattern = _decl_head_regex(name, kinds="theorem|lemma|example|def|abbrev|structure")
+    match = pattern.search(text)
+    if not match:
+        return None
+    next_match = _ANY_TOP_DECL_START_PATTERN.search(text, match.end())
+    end = next_match.start() if next_match else len(text)
+    return match.start(), end
 
 
 def _generate_lemma_plan(args: argparse.Namespace) -> LemmaPlan:
@@ -797,7 +842,7 @@ def _normalize_plan_code(code: str, theorem: str, statement: str, original: str 
         text = f"import Mathlib\n\n" f"theorem {theorem} : {statement} := by\n  sorry\n"
     if "import" not in text.splitlines()[0:5]:
         text = "import Mathlib\n\n" + text
-    if not re.search(rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b", text):
+    if not _file_has_decl(text, theorem):
         text = (
             text
             + "\n\n"
@@ -819,7 +864,7 @@ def _normalize_plan_code(code: str, theorem: str, statement: str, original: str 
 
 def _extract_decl_names(text: str) -> list[str]:
     names: list[str] = []
-    for match in re.finditer(r"\b(?:theorem|lemma|example)\s+([A-Za-z0-9_']+)\b", text):
+    for match in _DECL_NAME_PATTERN.finditer(text):
         names.append(match.group(1))
     return names
 
@@ -839,13 +884,10 @@ def _decl_has_placeholder(text: str, name: str) -> bool:
 
 
 def _decl_block(text: str, name: str) -> str:
-    pattern = re.compile(rf"^\s*(theorem|lemma|example)\s+{re.escape(name)}\b", re.M)
-    match = pattern.search(text)
-    if not match:
+    span = _decl_span(text, name)
+    if span is None:
         return ""
-    start = match.start()
-    next_match = pattern.search(text, match.end())
-    end = next_match.start() if next_match else len(text)
+    start, end = span
     return text[start:end]
 
 
@@ -937,10 +979,10 @@ def _insert_lemmas_before(file_path: Path, target_name: str, snippet: str) -> li
     if not kept_blocks:
         return []
 
-    match = re.search(rf"\b(theorem|lemma|example)\s+{re.escape(target_name)}\b", text)
-    if match is None:
+    span = _decl_span(text, target_name)
+    if span is None:
         return []
-    insert_at = match.start()
+    insert_at = span[0]
     insert_block = "\n".join(kept_blocks).rstrip() + "\n\n"
     new_text = text[:insert_at] + insert_block + text[insert_at:]
     try:
@@ -961,7 +1003,10 @@ def _strip_imports_from_snippet(snippet: str) -> str:
 
 
 def _split_decl_blocks(text: str) -> list[tuple[str, str]]:
-    pattern = re.compile(r"^\s*(theorem|lemma|example|def|abbrev|structure)\s+([A-Za-z0-9_']+)\b", re.M)
+    pattern = re.compile(
+        r"^\s*(theorem|lemma|example|def|abbrev|structure)\s+([A-Za-z_][A-Za-z0-9_']*)",
+        re.M,
+    )
     matches = list(pattern.finditer(text))
     if not matches:
         return []
@@ -976,13 +1021,10 @@ def _split_decl_blocks(text: str) -> list[tuple[str, str]]:
 
 
 def _remove_decl_by_name(text: str, name: str) -> str:
-    pattern = re.compile(rf"^\s*(theorem|lemma|example|def|abbrev|structure)\s+{re.escape(name)}\b", re.M)
-    match = pattern.search(text)
-    if not match:
+    span = _top_decl_span(text, name)
+    if span is None:
         return text
-    start = match.start()
-    next_match = pattern.search(text, match.end())
-    end = next_match.start() if next_match else len(text)
+    start, end = span
     return (text[:start] + text[end:]).strip()
 
 
@@ -1056,7 +1098,7 @@ def _cleanup_failed_lemmas(file_path: Path) -> None:
 def _file_has_decl(text: str, name: str) -> bool:
     if not text or not name:
         return False
-    return re.search(rf"\b(theorem|lemma|example)\s+{re.escape(name)}\b", text) is not None
+    return _decl_span(text, name) is not None
 
 
 def _suggest_proof_targets(file_path: Path, theorem: str, max_items: int = 20) -> None:
@@ -1115,6 +1157,7 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         instruction=args.instruction.strip() if args.instruction else None,
         context=context,
         verbose=bool(args.verbose),
+        on_progress=_proof_progress_callback(args.file, theorem, verbose=bool(args.verbose)),
     )
 
     def _run_once() -> SearchResult:
@@ -1281,6 +1324,21 @@ def _resolve_allow_axioms(args: argparse.Namespace, config: dict | None = None) 
     return bool(cfg.get("prove", {}).get("allow_axioms", True))
 
 
+def _resolve_typecheck_timeout(args: argparse.Namespace, config: dict | None = None) -> float:
+    explicit = getattr(args, "typecheck_timeout", None)
+    if explicit is not None:
+        try:
+            return max(5.0, float(explicit))
+        except Exception:
+            return 60.0
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("typecheck_timeout_s", 60)
+    try:
+        return max(5.0, float(raw))
+    except Exception:
+        return 60.0
+
+
 def run_replay(args: argparse.Namespace) -> None:
     if not args.trace.exists():
         print(f"Trace not found: {args.trace}")
@@ -1416,6 +1474,7 @@ def _trace_metadata_payload(
         "beam": int(getattr(args, "beam", 0)),
         "k": int(getattr(args, "k", 0)),
         "timeout_s": float(getattr(args, "timeout", 0.0)),
+        "typecheck_timeout_s": float(_resolve_typecheck_timeout(args)),
         "repair_attempts": int(getattr(args, "repair", 0)),
     }
 
@@ -2320,6 +2379,74 @@ def _attempt_statement_repair(args: argparse.Namespace, exc: Exception) -> bool:
     return True
 
 
+def _proof_progress_callback(file_path: Path, theorem: str, verbose: bool = False):
+    last_written: list[str] = []
+
+    def _callback(proof: list[str]) -> None:
+        nonlocal last_written
+        if not proof:
+            return
+        if proof == last_written:
+            return
+        if _write_draft_proof_to_file(file_path, theorem, proof):
+            last_written = list(proof)
+            if verbose:
+                print(f"[progress] updated draft proof for {theorem} ({len(proof)} steps)")
+
+    return _callback
+
+
+def _render_draft_block(indent: str, proof: list[str]) -> str:
+    lines = [f"{indent}{ULAMAI_DRAFT_BEGIN}"]
+    lines.extend(f"{indent}{line}" for line in proof)
+    lines.append(f"{indent}sorry")
+    lines.append(f"{indent}{ULAMAI_DRAFT_END}")
+    return "\n".join(lines)
+
+
+def _write_draft_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> bool:
+    if not proof:
+        return False
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    span = _decl_span(text, theorem)
+    if span is None:
+        return False
+    start, end = span
+    decl = text[start:end]
+    if ULAMAI_DRAFT_BEGIN in decl and ULAMAI_DRAFT_END in decl:
+        begin_idx = decl.find(ULAMAI_DRAFT_BEGIN)
+        end_idx = decl.find(ULAMAI_DRAFT_END, begin_idx)
+        if end_idx < 0:
+            return False
+        block_start = decl.rfind("\n", 0, begin_idx) + 1
+        block_end_line = decl.find("\n", end_idx)
+        block_end = len(decl) if block_end_line < 0 else (block_end_line + 1)
+        indent = decl[block_start:begin_idx]
+        replacement = _render_draft_block(indent, proof)
+        new_decl = decl[:block_start] + replacement + ("\n" if block_end_line >= 0 else "") + decl[block_end:]
+    else:
+        sorry_match = re.search(r"\bsorry\b", decl)
+        if sorry_match is None:
+            return False
+        sorry_start = sorry_match.start()
+        sorry_end = sorry_match.end()
+        line_start = decl.rfind("\n", 0, sorry_start) + 1
+        indent = decl[line_start:sorry_start]
+        replacement = _render_draft_block(indent, proof)
+        new_decl = decl[:line_start] + replacement + decl[sorry_end:]
+    new_text = text[:start] + new_decl + text[end:]
+    if new_text == text:
+        return False
+    try:
+        file_path.write_text(new_text, encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
 def _write_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> bool:
     if not proof:
         return False
@@ -2327,23 +2454,41 @@ def _write_proof_to_file(file_path: Path, theorem: str, proof: list[str]) -> boo
         text = file_path.read_text(encoding="utf-8")
     except Exception:
         return False
-    match = re.search(rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b", text)
-    if match is None:
+    span = _decl_span(text, theorem)
+    if span is None:
         return False
-    sorry_match = re.search(r"\bsorry\b", text[match.start() :])
-    if sorry_match is None:
-        return False
-    start = match.start() + sorry_match.start()
-    end = match.start() + sorry_match.end()
-    line_start = text.rfind("\n", 0, start) + 1
-    indent = text[line_start:start]
-    prefix = text[:line_start]
-    has_by = re.search(r":=\s*by\s*$", prefix) is not None or re.search(r"\bby\s*$", prefix) is not None
-    if has_by:
+    start, end = span
+    decl = text[start:end]
+    if ULAMAI_DRAFT_BEGIN in decl and ULAMAI_DRAFT_END in decl:
+        begin_idx = decl.find(ULAMAI_DRAFT_BEGIN)
+        end_idx = decl.find(ULAMAI_DRAFT_END, begin_idx)
+        if end_idx < 0:
+            return False
+        block_start = decl.rfind("\n", 0, begin_idx) + 1
+        block_end_line = decl.find("\n", end_idx)
+        block_end = len(decl) if block_end_line < 0 else (block_end_line + 1)
+        indent = decl[block_start:begin_idx]
         proof_block = "\n".join(f"{indent}{line}" for line in proof)
+        new_decl = decl[:block_start] + proof_block + ("\n" if block_end_line >= 0 else "") + decl[block_end:]
+        new_text = text[:start] + new_decl + text[end:]
     else:
-        proof_block = "by\n" + "\n".join(f"{indent}{line}" for line in proof)
-    new_text = prefix + proof_block + text[end:]
+        sorry_match = re.search(r"\bsorry\b", decl)
+        if sorry_match is None:
+            return False
+        sorry_start = sorry_match.start()
+        sorry_end = sorry_match.end()
+        line_start = decl.rfind("\n", 0, sorry_start) + 1
+        indent = decl[line_start:sorry_start]
+        prefix = decl[:line_start]
+        has_by = re.search(r":=\s*by\s*$", prefix) is not None or re.search(r"\bby\s*$", prefix) is not None
+        if has_by:
+            proof_block = "\n".join(f"{indent}{line}" for line in proof)
+        else:
+            proof_block = "by\n" + "\n".join(f"{indent}{line}" for line in proof)
+        new_decl = decl[:line_start] + proof_block + decl[sorry_end:]
+        new_text = text[:start] + new_decl + text[end:]
+    if new_text == text:
+        return False
     try:
         file_path.write_text(new_text, encoding="utf-8")
     except Exception:
@@ -2431,10 +2576,7 @@ def _extract_theorem_statement(file_path: Path, theorem: str) -> tuple[str, str]
     except Exception:
         return "", ""
     original = _extract_original_statement(text)
-    decl_match = re.search(
-        rf"\b(theorem|lemma|example)\s+{re.escape(theorem)}\b",
-        text,
-    )
+    decl_match = _decl_head_regex(theorem).search(text)
     if not decl_match:
         return "", original
     proof_match = re.search(r":=\s*by\b", text[decl_match.end():], re.S)

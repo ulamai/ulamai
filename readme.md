@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.12)
+## Status (v0.1.13)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.12 highlights:** Homebrew install is back to dedicated virtualenv mode; `ulam -lean` and Pantograph auto-install now retry with PEP 668-safe pip fallbacks
+- **v0.1.13 highlights:** configurable LLM typecheck timeout, improved Settings UX (single-setting edit + reset), apostrophe-safe theorem names, and tactic-mode live draft proof updates
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

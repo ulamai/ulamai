@@ -23,7 +23,7 @@ from .formalize.engine import FormalizationEngine
 from .formalize.segmentation import should_segment, run_segmented_formalize
 from .formalize.llm import FormalizationLLM
 from .formalize.types import FormalizationConfig
-from .config import load_config, save_config
+from .config import DEFAULT_CONFIG, load_config, save_config
 
 
 def run_menu() -> None:
@@ -172,6 +172,30 @@ def _configure_gemini(config: dict) -> None:
 
 
 def _configure_prover(config: dict) -> None:
+    while True:
+        print("\nProver settings:")
+        print("1. Edit one setting")
+        print("2. Edit all settings (guided)")
+        print("3. Reset prover settings to defaults")
+        print("4. Back")
+        choice = _prompt("Choice", default="1").strip()
+        if choice == "1":
+            _configure_prover_single(config)
+            continue
+        if choice == "2":
+            _configure_prover_all(config)
+            print("\nSaved prover settings.\n")
+            continue
+        if choice == "3":
+            _reset_prover_settings(config)
+            print("\nReset prover settings to defaults.\n")
+            continue
+        if choice == "4":
+            return
+        print("Invalid choice.")
+
+
+def _configure_prover_all(config: dict) -> None:
     prove = config.setdefault("prove", {})
     mode = _prompt("Default proof mode (tactic|lemma|llm)", default=prove.get("mode", "tactic")).strip().lower()
     if mode not in {"tactic", "lemma", "llm"}:
@@ -224,6 +248,15 @@ def _configure_prover(config: dict) -> None:
         prove["llm_rounds"] = max(1, int(llm_rounds_raw))
     except Exception:
         prove["llm_rounds"] = 4
+    typecheck_timeout_default = str(prove.get("typecheck_timeout_s", 60))
+    typecheck_timeout_raw = _prompt(
+        "LLM mode typecheck timeout (seconds)",
+        default=typecheck_timeout_default,
+    ).strip()
+    try:
+        prove["typecheck_timeout_s"] = max(5, int(float(typecheck_timeout_raw)))
+    except Exception:
+        prove["typecheck_timeout_s"] = 60
     llm_section = config.setdefault("llm", {})
     timeout_default = str(llm_section.get("timeout_s", 0))
     timeout_raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=timeout_default).strip()
@@ -314,7 +347,298 @@ def _configure_prover(config: dict) -> None:
         formalize["proof_repair"] = max(0, int(formalize_proof_repair_raw))
     except Exception:
         formalize["proof_repair"] = 2
-    print("\nSaved prover settings.\n")
+
+
+def _configure_prover_single(config: dict) -> None:
+    settings: list[tuple[str, str]] = [
+        ("prove.mode", "Default proof mode"),
+        ("prove.solver", "Default solver"),
+        ("prove.autop", "Enable autop tactics"),
+        ("prove.k", "LLM suggestions per state"),
+        ("prove.retriever_k", "Retrieved premises per state"),
+        ("prove.retriever_source", "Auto retriever source"),
+        ("prove.retriever_build", "Auto retriever index build"),
+        ("prove.retriever_index", "Auto retriever index path"),
+        ("prove.llm_rounds", "LLM-only max rounds"),
+        ("prove.typecheck_timeout_s", "LLM mode typecheck timeout"),
+        ("llm.timeout_s", "LLM request timeout"),
+        ("llm.heartbeat_s", "LLM heartbeat interval"),
+        ("prove.lemma_max", "Lemma max count"),
+        ("prove.lemma_depth", "Lemma max depth"),
+        ("prove.allow_axioms", "Allow axioms"),
+        ("lean.dojo_timeout_s", "LeanDojo server startup timeout"),
+        ("segmentation.chunk_words", "Segment chunk size"),
+        ("formalize.proof_backend", "Formalize proof mode"),
+        ("formalize.lean_backend", "Formalize typecheck backend"),
+        ("formalize.max_rounds", "Formalize max rounds"),
+        ("formalize.max_proof_rounds", "Formalize proof rounds"),
+        ("formalize.proof_repair", "Formalize proof repair attempts"),
+    ]
+    while True:
+        print("\nSelect setting to change:")
+        for idx, (key, label) in enumerate(settings, start=1):
+            value = _prover_setting_value(config, key)
+            print(f"{idx}. {label}: {value}")
+        print(f"{len(settings) + 1}. Back")
+        choice = _prompt("Setting", default=str(len(settings) + 1)).strip()
+        try:
+            index = int(choice)
+        except Exception:
+            print("Invalid choice.")
+            continue
+        if index == len(settings) + 1:
+            return
+        if index < 1 or index > len(settings):
+            print("Invalid choice.")
+            continue
+        key = settings[index - 1][0]
+        _update_prover_setting(config, key)
+
+
+def _prover_setting_value(config: dict, key: str) -> str:
+    prove = config.setdefault("prove", {})
+    llm = config.setdefault("llm", {})
+    lean = config.setdefault("lean", {})
+    segmentation = config.setdefault("segmentation", {})
+    formalize = config.setdefault("formalize", {})
+    if key == "prove.mode":
+        return str(prove.get("mode", "tactic"))
+    if key == "prove.solver":
+        return str(prove.get("solver", "script"))
+    if key == "prove.autop":
+        return "on" if bool(prove.get("autop", True)) else "off"
+    if key == "prove.k":
+        return str(int(prove.get("k", 1)))
+    if key == "prove.retriever_k":
+        return str(int(prove.get("retriever_k", 8)))
+    if key == "prove.retriever_source":
+        return str(prove.get("retriever_source", "local"))
+    if key == "prove.retriever_build":
+        return str(prove.get("retriever_build", "auto"))
+    if key == "prove.retriever_index":
+        return str(prove.get("retriever_index", ""))
+    if key == "prove.llm_rounds":
+        return str(int(prove.get("llm_rounds", 4)))
+    if key == "prove.typecheck_timeout_s":
+        return str(int(prove.get("typecheck_timeout_s", 60)))
+    if key == "llm.timeout_s":
+        return str(int(llm.get("timeout_s", 0)))
+    if key == "llm.heartbeat_s":
+        return str(int(llm.get("heartbeat_s", 60)))
+    if key == "prove.lemma_max":
+        return str(int(prove.get("lemma_max", 60)))
+    if key == "prove.lemma_depth":
+        return str(int(prove.get("lemma_depth", 60)))
+    if key == "prove.allow_axioms":
+        return "on" if bool(prove.get("allow_axioms", True)) else "off"
+    if key == "lean.dojo_timeout_s":
+        return str(int(lean.get("dojo_timeout_s", 180)))
+    if key == "segmentation.chunk_words":
+        return str(int(segmentation.get("chunk_words", 1000)))
+    if key == "formalize.proof_backend":
+        return str(formalize.get("proof_backend", "inherit"))
+    if key == "formalize.lean_backend":
+        return str(formalize.get("lean_backend", "dojo"))
+    if key == "formalize.max_rounds":
+        return str(int(formalize.get("max_rounds", 5)))
+    if key == "formalize.max_proof_rounds":
+        return str(int(formalize.get("max_proof_rounds", 1)))
+    if key == "formalize.proof_repair":
+        return str(int(formalize.get("proof_repair", 2)))
+    return "(unknown)"
+
+
+def _update_prover_setting(config: dict, key: str) -> None:
+    prove = config.setdefault("prove", {})
+    llm = config.setdefault("llm", {})
+    lean = config.setdefault("lean", {})
+    segmentation = config.setdefault("segmentation", {})
+    formalize = config.setdefault("formalize", {})
+    if key == "prove.mode":
+        mode = _prompt("Default proof mode (tactic|lemma|llm)", default=str(prove.get("mode", "tactic"))).strip().lower()
+        if mode not in {"tactic", "lemma", "llm"}:
+            mode = "tactic"
+        prove["mode"] = mode
+        return
+    if key == "prove.solver":
+        solver = _prompt(
+            "Default solver (auto|search|script|portfolio)",
+            default=str(prove.get("solver", "script")),
+        ).strip().lower()
+        if solver not in {"auto", "search", "script", "portfolio"}:
+            solver = "auto"
+        prove["solver"] = solver
+        return
+    if key == "prove.autop":
+        autop_default = "y" if prove.get("autop", True) else "n"
+        autop_choice = _prompt("Enable autop tactics (Y/n)", default=autop_default).strip().lower()
+        prove["autop"] = autop_choice not in {"n", "no", "false", "0"}
+        return
+    if key == "prove.k":
+        raw = _prompt("Number of LLM suggestions per state", default=str(prove.get("k", 1))).strip()
+        try:
+            prove["k"] = max(1, int(raw))
+        except Exception:
+            prove["k"] = 1
+        return
+    if key == "prove.retriever_k":
+        raw = _prompt("Retrieved premises per state", default=str(prove.get("retriever_k", 8))).strip()
+        try:
+            prove["retriever_k"] = max(1, int(raw))
+        except Exception:
+            prove["retriever_k"] = 8
+        return
+    if key == "prove.retriever_source":
+        source = _prompt(
+            "Auto retriever source (local|mathlib|both)",
+            default=str(prove.get("retriever_source", "local")),
+        ).strip().lower()
+        if source not in {"local", "mathlib", "both"}:
+            source = "local"
+        prove["retriever_source"] = source
+        return
+    if key == "prove.retriever_build":
+        build = _prompt(
+            "Auto retriever index build (auto|always|never)",
+            default=str(prove.get("retriever_build", "auto")),
+        ).strip().lower()
+        if build not in {"auto", "always", "never"}:
+            build = "auto"
+        prove["retriever_build"] = build
+        return
+    if key == "prove.retriever_index":
+        prove["retriever_index"] = _prompt(
+            "Auto retriever index path (blank = default)",
+            default=str(prove.get("retriever_index", "")),
+        ).strip()
+        return
+    if key == "prove.llm_rounds":
+        raw = _prompt("LLM-only max rounds", default=str(prove.get("llm_rounds", 4))).strip()
+        try:
+            prove["llm_rounds"] = max(1, int(raw))
+        except Exception:
+            prove["llm_rounds"] = 4
+        return
+    if key == "prove.typecheck_timeout_s":
+        raw = _prompt("LLM mode typecheck timeout (seconds)", default=str(prove.get("typecheck_timeout_s", 60))).strip()
+        try:
+            prove["typecheck_timeout_s"] = max(5, int(float(raw)))
+        except Exception:
+            prove["typecheck_timeout_s"] = 60
+        return
+    if key == "llm.timeout_s":
+        raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=str(llm.get("timeout_s", 0))).strip()
+        try:
+            llm["timeout_s"] = max(0, int(float(raw)))
+        except Exception:
+            llm["timeout_s"] = 0
+        return
+    if key == "llm.heartbeat_s":
+        raw = _prompt("LLM heartbeat interval (seconds, 0 = off)", default=str(llm.get("heartbeat_s", 60))).strip()
+        try:
+            llm["heartbeat_s"] = max(0, int(float(raw)))
+        except Exception:
+            llm["heartbeat_s"] = 60
+        return
+    if key == "prove.lemma_max":
+        raw = _prompt("Lemma max count", default=str(prove.get("lemma_max", 60))).strip()
+        try:
+            prove["lemma_max"] = max(1, int(raw))
+        except Exception:
+            prove["lemma_max"] = 60
+        return
+    if key == "prove.lemma_depth":
+        raw = _prompt("Lemma max depth", default=str(prove.get("lemma_depth", 60))).strip()
+        try:
+            prove["lemma_depth"] = max(1, int(raw))
+        except Exception:
+            prove["lemma_depth"] = 60
+        return
+    if key == "prove.allow_axioms":
+        allow_default = "y" if prove.get("allow_axioms", True) else "n"
+        allow_raw = _prompt("Allow axioms (Y/n)", default=allow_default).strip().lower()
+        prove["allow_axioms"] = allow_raw in {"y", "yes", "true", "1"}
+        return
+    if key == "lean.dojo_timeout_s":
+        raw = _prompt("LeanDojo server startup timeout (seconds)", default=str(lean.get("dojo_timeout_s", 180))).strip()
+        try:
+            lean["dojo_timeout_s"] = max(30, int(float(raw)))
+        except Exception:
+            lean["dojo_timeout_s"] = 180
+        return
+    if key == "segmentation.chunk_words":
+        raw = _prompt("Segment chunk size (words)", default=str(segmentation.get("chunk_words", 1000))).strip()
+        try:
+            segmentation["chunk_words"] = max(200, int(raw))
+        except Exception:
+            segmentation["chunk_words"] = 1000
+        return
+    if key == "formalize.proof_backend":
+        mode = _prompt(
+            "Formalize proof mode (inherit|tactic|lemma|llm)",
+            default=str(formalize.get("proof_backend", "inherit")),
+        ).strip().lower()
+        if mode not in {"inherit", "tactic", "lemma", "llm"}:
+            mode = "inherit"
+        formalize["proof_backend"] = mode
+        return
+    if key == "formalize.lean_backend":
+        backend = _prompt(
+            "Formalize typecheck backend (dojo|cli)",
+            default=str(formalize.get("lean_backend", "dojo")),
+        ).strip().lower()
+        if backend not in {"dojo", "cli"}:
+            backend = "dojo"
+        formalize["lean_backend"] = backend
+        return
+    if key == "formalize.max_rounds":
+        raw = _prompt("Formalize max rounds", default=str(formalize.get("max_rounds", 5))).strip()
+        try:
+            formalize["max_rounds"] = max(1, int(raw))
+        except Exception:
+            formalize["max_rounds"] = 5
+        formalize["max_repairs"] = formalize["max_rounds"]
+        return
+    if key == "formalize.max_proof_rounds":
+        raw = _prompt("Formalize proof rounds", default=str(formalize.get("max_proof_rounds", 1))).strip()
+        try:
+            formalize["max_proof_rounds"] = max(1, int(raw))
+        except Exception:
+            formalize["max_proof_rounds"] = 1
+        return
+    if key == "formalize.proof_repair":
+        raw = _prompt("Formalize proof repair attempts", default=str(formalize.get("proof_repair", 2))).strip()
+        try:
+            formalize["proof_repair"] = max(0, int(raw))
+        except Exception:
+            formalize["proof_repair"] = 2
+        return
+
+
+def _reset_prover_settings(config: dict) -> None:
+    prove_defaults = DEFAULT_CONFIG.get("prove", {})
+    llm_defaults = DEFAULT_CONFIG.get("llm", {})
+    lean_defaults = DEFAULT_CONFIG.get("lean", {})
+    formalize_defaults = DEFAULT_CONFIG.get("formalize", {})
+    segmentation_defaults = DEFAULT_CONFIG.get("segmentation", {"chunk_words": 1000})
+    prove = config.setdefault("prove", {})
+    prove.clear()
+    prove.update(json.loads(json.dumps(prove_defaults)))
+    llm = config.setdefault("llm", {})
+    llm["timeout_s"] = int(llm_defaults.get("timeout_s", 0))
+    llm["heartbeat_s"] = int(llm_defaults.get("heartbeat_s", 60))
+    lean = config.setdefault("lean", {})
+    lean["dojo_timeout_s"] = int(lean_defaults.get("dojo_timeout_s", 180))
+    segmentation = config.setdefault("segmentation", {})
+    segmentation["chunk_words"] = int(segmentation_defaults.get("chunk_words", 1000))
+    formalize = config.setdefault("formalize", {})
+    formalize["proof_backend"] = str(formalize_defaults.get("proof_backend", "inherit"))
+    formalize["lean_backend"] = str(formalize_defaults.get("lean_backend", "dojo"))
+    formalize["max_rounds"] = int(formalize_defaults.get("max_rounds", 5))
+    formalize["max_repairs"] = int(formalize_defaults.get("max_repairs", formalize["max_rounds"]))
+    formalize["max_equivalence_repairs"] = int(formalize_defaults.get("max_equivalence_repairs", 2))
+    formalize["max_proof_rounds"] = int(formalize_defaults.get("max_proof_rounds", 1))
+    formalize["proof_repair"] = int(formalize_defaults.get("proof_repair", 2))
 
 
 def _menu_prove(config: dict) -> None:
@@ -777,6 +1101,7 @@ def _build_args_from_config(
         retriever_k=int(prove.get("retriever_k", 8)),
         llm_rounds=int(prove.get("llm_rounds", 4)),
         timeout=5.0,
+        typecheck_timeout=float(prove.get("typecheck_timeout_s", 60)),
         repair=2,
         seed=0,
         trace=Path("run.jsonl"),
@@ -1246,7 +1571,6 @@ def _gemini_model_suggestions(section: dict, default: str) -> list[str]:
         default,
         section.get("cli_model", ""),
         section.get("model", ""),
-        "gemini-3.1-flash-preview",
         "gemini-3-pro-preview",
         "gemini-3-pro",
         "gemini-3-flash-preview",

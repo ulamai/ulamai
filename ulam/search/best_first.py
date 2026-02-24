@@ -46,6 +46,7 @@ def best_first_search(
     best_seen: dict[str, int] = {initial_state.key: initial_score}
     step_cache: dict[tuple[str, str], TacticResult] = {}
     steps = 0
+    best_progress: list[str] = []
 
     while frontier and steps < config.max_steps:
         node = heapq.heappop(frontier)
@@ -91,9 +92,14 @@ def best_first_search(
             )
             _log(config, _format_result(tactic, result, cached))
             if result.ok and result.is_solved:
-                return SearchResult(True, node.proof + [tactic], steps, None)
+                final_proof = node.proof + [tactic]
+                _emit_progress(config, final_proof)
+                return SearchResult(True, final_proof, steps, None)
             if result.ok and result.new_state is not None:
                 new_proof = node.proof + [tactic]
+                if len(new_proof) > len(best_progress):
+                    best_progress = new_proof
+                    _emit_progress(config, new_proof)
                 score = _node_score(len(new_proof), result.new_state)
                 prev = best_seen.get(result.new_state.key)
                 if prev is None or score < prev:
@@ -121,9 +127,14 @@ def best_first_search(
                 )
                 steps += repaired.steps_used
                 if repaired.solved:
-                    return SearchResult(True, node.proof + [repaired.tactic], steps, None)
+                    final_proof = node.proof + [repaired.tactic]
+                    _emit_progress(config, final_proof)
+                    return SearchResult(True, final_proof, steps, None)
                 if repaired.new_state is not None:
                     new_proof = node.proof + [repaired.tactic]
+                    if len(new_proof) > len(best_progress):
+                        best_progress = new_proof
+                        _emit_progress(config, new_proof)
                     score = _node_score(len(new_proof), repaired.new_state)
                     prev = best_seen.get(repaired.new_state.key)
                     if prev is None or score < prev:
@@ -271,9 +282,11 @@ def scripted_search(
             _log(config, _format_result(tactic, result, cached=False))
             if result.ok and result.is_solved:
                 proof.append(tactic)
+                _emit_progress(config, proof)
                 return SearchResult(True, proof, steps, None)
             if result.ok and result.new_state is not None:
                 proof.append(tactic)
+                _emit_progress(config, proof)
                 state = result.new_state
                 last_error = None
                 last_tactic = None
@@ -305,9 +318,11 @@ def scripted_search(
                 _log(config, _format_result(tactic, result, cached=False))
                 if result.ok and result.is_solved:
                     proof.append(tactic)
+                    _emit_progress(config, proof)
                     return SearchResult(True, proof, steps, None)
                 if result.ok and result.new_state is not None:
                     proof.append(tactic)
+                    _emit_progress(config, proof)
                     state = result.new_state
                     last_error = None
                     last_tactic = None
@@ -359,6 +374,16 @@ def _cap_frontier(frontier: list[_Node], beam_width: int) -> None:
 def _log(config: RunConfig, message: str) -> None:
     if config.verbose:
         print(message)
+
+
+def _emit_progress(config: RunConfig, proof: list[str]) -> None:
+    callback = config.on_progress
+    if callback is None:
+        return
+    try:
+        callback(list(proof))
+    except Exception:
+        return
 
 
 def _summarize_state(pretty: str, max_chars: int = 200) -> str:
