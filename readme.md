@@ -466,12 +466,12 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 
 ## Roadmap
 
-### v0.1 — Real LeanDojo wiring
-- Wire LeanDojo-v2 runner (proof-state execution)
+### v0.1 — Core baseline (shipped in v0.1.x)
+- LeanDojo-v2 runner for proof-state execution
 - Embedding-based retrieval (mathlib + local repo)
 - Step cache `(state_key, tactic) -> result`
-- Deterministic replay with pinned toolchain + mathlib commit
-- Minimal regression suite
+- Deterministic replay baseline with pinned metadata + strict execute/alignment checks (hardening ongoing)
+- Minimal regression suite (`ulam bench`)
 
 ### v0.2 — “Feels powerful” baseline
 - Better state canonicalization (stable hashing)
