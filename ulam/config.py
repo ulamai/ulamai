@@ -42,7 +42,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cache": ".ulam/embeddings.json",
     },
     "prove": {
+        "mode": "tactic",
+        "solver": "script",
+        "autop": True,
+        "k": 1,
+        "llm_rounds": 4,
+        "lemma_max": 60,
+        "lemma_depth": 60,
         "allow_axioms": True,
+        "typecheck_timeout_s": 60,
         "retriever_k": 8,
         "retriever_source": "local",
         "retriever_build": "auto",
@@ -56,6 +64,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_equivalence_repairs": 2,
         "max_proof_rounds": 1,
         "proof_repair": 2,
+    },
+    "segmentation": {
+        "chunk_words": 1000,
     },
     "lean": {
         "project": "",
