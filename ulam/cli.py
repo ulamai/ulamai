@@ -300,6 +300,24 @@ def main(argv: list[str] | None = None) -> None:
         help="typecheck backend (dojo uses Pantograph, cli uses lake/lean)",
     )
     formalize.add_argument("--no-equivalence", action="store_true", help="skip equivalence checks")
+    formalize.add_argument(
+        "--llm-check",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="run semantic integrity LLM check on generated Lean (default: enabled)",
+    )
+    formalize.add_argument(
+        "--llm-check-timing",
+        choices=["end", "mid+end"],
+        default=None,
+        help="when to run semantic integrity check",
+    )
+    formalize.add_argument(
+        "--llm-check-repairs",
+        type=int,
+        default=None,
+        help="max semantic integrity repair attempts",
+    )
     formalize.add_argument("--artifacts-dir", type=Path, default=None)
     formalize.add_argument("--verbose", action="store_true")
 
@@ -1337,6 +1355,40 @@ def _resolve_typecheck_timeout(args: argparse.Namespace, config: dict | None = N
         return max(5.0, float(raw))
     except Exception:
         return 60.0
+
+
+def _resolve_formalize_llm_check(args: argparse.Namespace, config: dict | None = None) -> bool:
+    explicit = getattr(args, "llm_check", None)
+    if explicit is not None:
+        return bool(explicit)
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("formalize", {}).get("llm_check", True))
+
+
+def _resolve_formalize_llm_check_timing(args: argparse.Namespace, config: dict | None = None) -> str:
+    explicit = str(getattr(args, "llm_check_timing", "") or "").strip().lower()
+    if explicit in {"end", "mid+end"}:
+        return explicit
+    cfg = config if config is not None else load_config()
+    raw = str(cfg.get("formalize", {}).get("llm_check_timing", "end")).strip().lower()
+    if raw in {"end", "mid+end"}:
+        return raw
+    return "end"
+
+
+def _resolve_formalize_llm_check_repairs(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "llm_check_repairs", None)
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except Exception:
+            return 2
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("llm_check_repairs", 2)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 2
 
 
 def run_replay(args: argparse.Namespace) -> None:
@@ -2915,6 +2967,9 @@ def run_formalize(args: argparse.Namespace) -> None:
     max_repairs = max_rounds if args.max_repairs is None else max(0, int(args.max_repairs))
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     allow_axioms = _resolve_allow_axioms(args, config)
+    llm_check = _resolve_formalize_llm_check(args, config)
+    llm_check_timing = _resolve_formalize_llm_check_timing(args, config)
+    llm_check_repairs = _resolve_formalize_llm_check_repairs(args, config)
     cfg = FormalizationConfig(
         tex_path=tex_path,
         output_path=output_path,
@@ -2940,6 +2995,9 @@ def run_formalize(args: argparse.Namespace) -> None:
         resume_path=None,
         artifact_dir=args.artifacts_dir,
         equivalence_checks=not args.no_equivalence,
+        llm_check=llm_check,
+        llm_check_timing=llm_check_timing,
+        llm_check_repairs=llm_check_repairs,
     )
     llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
     if args.segment:

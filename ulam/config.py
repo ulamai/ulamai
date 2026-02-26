@@ -64,6 +64,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_equivalence_repairs": 2,
         "max_proof_rounds": 1,
         "proof_repair": 2,
+        "llm_check": True,
+        "llm_check_timing": "end",
+        "llm_check_repairs": 2,
     },
     "segmentation": {
         "chunk_words": 1000,

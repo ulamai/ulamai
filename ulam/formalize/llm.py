@@ -89,6 +89,37 @@ class FormalizationLLM:
         )
         return self._call(prompt)
 
+    def semantic_check(
+        self,
+        tex: str,
+        lean_code: str,
+        deterministic_issues: list[dict],
+        context: str,
+        stage: str = "end",
+    ) -> dict:
+        prompt = _build_semantic_check_prompt(
+            tex, lean_code, deterministic_issues, context, stage=stage
+        )
+        raw = self._call(prompt)
+        return _parse_semantic_check(raw)
+
+    def semantic_repair(
+        self,
+        lean_code: str,
+        tex: str,
+        deterministic_issues: list[dict],
+        audit: dict,
+        context: str,
+    ) -> str:
+        prompt = _build_semantic_repair_prompt(
+            lean_code,
+            tex,
+            deterministic_issues,
+            audit,
+            context,
+        )
+        return self._call(prompt)
+
     def _call(self, prompt: str) -> str:
         if self._provider == "openai":
             return _call_openai(self._config, prompt)
@@ -230,9 +261,10 @@ def _build_statement_repair_prompt(lean_code: str, name: str, tex_statement: str
     prompt = (
         "You are a Lean 4 formalization assistant. Output Lean code only.\n"
         "Update the statement of the declaration below to match the informal statement.\n"
-        "- Preserve existing proofs where possible.\n"
-        "- If the proof no longer matches, replace with `by sorry`.\n"
-        "- Do not change unrelated declarations.\n\n"
+        "- Edit ONLY the named declaration.\n"
+        "- Do NOT change any unrelated declaration (statement or proof).\n"
+        "- If the target proof no longer matches, `by sorry` is allowed only for the target declaration.\n"
+        "- Keep theorem/lemma names unchanged.\n\n"
         f"Declaration name: {name}\n\n"
         "Informal statement:\n"
         f"{tex_statement}\n\n"
@@ -322,6 +354,84 @@ def _build_summary_prompt(
     if context:
         prompt += "Context files:\n" + context + "\n\n"
     prompt += "Return a brief summary and 3-7 next-step suggestions."
+    return prompt
+
+
+def _truncate_block(text: str, max_chars: int) -> str:
+    content = (text or "").strip()
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars] + "\n-- (truncated)"
+
+
+def _build_semantic_check_prompt(
+    tex: str,
+    lean_code: str,
+    deterministic_issues: list[dict],
+    context: str,
+    stage: str = "end",
+) -> str:
+    issues = deterministic_issues[:32]
+    issue_json = json.dumps(issues, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are auditing semantic integrity of a Lean formalization.\n"
+        "Goal: detect whether the Lean file preserves the intended theorem(s) from LaTeX,\n"
+        "or if it was made trivially true by weakening definitions/statements.\n"
+        "Focus on cheats such as:\n"
+        "- introducing `axiom`/`constant` (including `private axiom` / `private constant`) to bypass proofs,\n"
+        "- redefining hard concepts to `True`/`False` or constants,\n"
+        "- replacing counting/probability objects by trivial identities/constants,\n"
+        "- changing theorem statements away from intended meaning.\n\n"
+        f"Audit stage: {stage}\n\n"
+        "Deterministic findings (pre-check):\n"
+        f"{issue_json}\n\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "verdict": "pass|fail|unknown",\n'
+        '  "summary": "short text",\n'
+        '  "issues": [{"kind":"...", "severity":"low|medium|high", "evidence":"..."}],\n'
+        '  "should_repair": true|false\n'
+        "}\n\n"
+        "LaTeX source:\n"
+        f"{_truncate_block(tex, 18000)}\n\n"
+        "Lean file:\n"
+        f"{_truncate_block(lean_code, 26000)}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 6000) + "\n\n"
+    return prompt
+
+
+def _build_semantic_repair_prompt(
+    lean_code: str,
+    tex: str,
+    deterministic_issues: list[dict],
+    audit: dict,
+    context: str,
+) -> str:
+    audit_json = json.dumps(audit, ensure_ascii=True, indent=2)
+    deterministic_json = json.dumps(deterministic_issues[:32], ensure_ascii=True, indent=2)
+    prompt = (
+        "You are a Lean 4 formalization assistant. Output Lean code only.\n"
+        "Repair semantic integrity issues in this Lean file.\n"
+        "Constraints:\n"
+        "- Preserve intended meaning of the original LaTeX theorem(s).\n"
+        "- Do NOT trivialize definitions (e.g., Prop := True/False, constant stubs).\n"
+        "- Keep theorem names stable.\n"
+        "- Avoid introducing `axiom` or `constant` unless mathematically unavoidable.\n"
+        "- Keep already-correct parts when possible.\n\n"
+        "Semantic audit result:\n"
+        f"{audit_json}\n\n"
+        "Deterministic findings:\n"
+        f"{deterministic_json}\n\n"
+        "LaTeX source:\n"
+        f"{_truncate_block(tex, 14000)}\n\n"
+        "Current Lean file:\n"
+        f"{_truncate_block(lean_code, 26000)}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 6000) + "\n\n"
+    prompt += "Return ONLY the corrected Lean file."
     return prompt
 
 
@@ -584,6 +694,58 @@ def _parse_equivalence(raw: str) -> dict:
         elif "match" in lowered and "no" in lowered:
             match = "no"
         return {"match": match, "reason": reason, "raw": text[:400]}
+
+
+def _parse_semantic_check(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "verdict": "unknown",
+            "summary": "empty response",
+            "issues": [],
+            "should_repair": True,
+        }
+    text = raw.strip()
+    try:
+        payload = json.loads(_extract_json(text))
+    except Exception:
+        lowered = text.lower()
+        verdict = "unknown"
+        if "verdict" in lowered and "pass" in lowered:
+            verdict = "pass"
+        elif "verdict" in lowered and "fail" in lowered:
+            verdict = "fail"
+        return {
+            "verdict": verdict,
+            "summary": "unparsed response",
+            "issues": [],
+            "should_repair": verdict != "pass",
+            "raw": text[:600],
+        }
+    if not isinstance(payload, dict):
+        return {
+            "verdict": "unknown",
+            "summary": "invalid payload",
+            "issues": [],
+            "should_repair": True,
+        }
+    verdict = str(payload.get("verdict", "unknown")).strip().lower()
+    if verdict not in {"pass", "fail", "unknown"}:
+        verdict = "unknown"
+    issues = payload.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+    summary = str(payload.get("summary", "")).strip()
+    should_repair = payload.get("should_repair", verdict != "pass")
+    if isinstance(should_repair, str):
+        should_repair = should_repair.strip().lower() in {"1", "true", "yes", "y"}
+    else:
+        should_repair = bool(should_repair)
+    return {
+        "verdict": verdict,
+        "summary": summary or ("ok" if verdict == "pass" else "issues found"),
+        "issues": issues[:32],
+        "should_repair": should_repair,
+    }
 
 
 def _extract_json(text: str) -> str:

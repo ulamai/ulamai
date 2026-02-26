@@ -83,6 +83,9 @@ def run_segmented_formalize(
             resume_path=seg_lean if seg_lean.exists() else None,
             artifact_dir=segments_dir / f"segment_{entry['index']:03d}",
             equivalence_checks=config.equivalence_checks,
+            llm_check=config.llm_check,
+            llm_check_timing=config.llm_check_timing,
+            llm_check_repairs=config.llm_check_repairs,
         )
         engine = FormalizationEngine(seg_cfg, llm)
         result = engine.run()
