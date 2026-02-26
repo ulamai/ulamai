@@ -347,6 +347,24 @@ def _configure_prover_all(config: dict) -> None:
         formalize["proof_repair"] = max(0, int(formalize_proof_repair_raw))
     except Exception:
         formalize["proof_repair"] = 2
+    llm_check_default = "y" if formalize.get("llm_check", True) else "n"
+    llm_check_raw = _prompt("Formalize LLM check (Y/n)", default=llm_check_default).strip().lower()
+    formalize["llm_check"] = llm_check_raw in {"y", "yes", "true", "1"}
+    llm_check_timing_raw = _prompt(
+        "Formalize LLM check timing (end|mid+end)",
+        default=str(formalize.get("llm_check_timing", "end")),
+    ).strip().lower()
+    if llm_check_timing_raw not in {"end", "mid+end"}:
+        llm_check_timing_raw = "end"
+    formalize["llm_check_timing"] = llm_check_timing_raw
+    llm_check_repairs_raw = _prompt(
+        "Formalize LLM check repair attempts",
+        default=str(formalize.get("llm_check_repairs", 2)),
+    ).strip()
+    try:
+        formalize["llm_check_repairs"] = max(0, int(llm_check_repairs_raw))
+    except Exception:
+        formalize["llm_check_repairs"] = 2
 
 
 def _configure_prover_single(config: dict) -> None:
@@ -373,6 +391,9 @@ def _configure_prover_single(config: dict) -> None:
         ("formalize.max_rounds", "Formalize max rounds"),
         ("formalize.max_proof_rounds", "Formalize proof rounds"),
         ("formalize.proof_repair", "Formalize proof repair attempts"),
+        ("formalize.llm_check", "Formalize LLM check"),
+        ("formalize.llm_check_timing", "Formalize LLM check timing"),
+        ("formalize.llm_check_repairs", "Formalize LLM check repair attempts"),
     ]
     while True:
         print("\nSelect setting to change:")
@@ -445,6 +466,12 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(int(formalize.get("max_proof_rounds", 1)))
     if key == "formalize.proof_repair":
         return str(int(formalize.get("proof_repair", 2)))
+    if key == "formalize.llm_check":
+        return "on" if bool(formalize.get("llm_check", True)) else "off"
+    if key == "formalize.llm_check_timing":
+        return str(formalize.get("llm_check_timing", "end"))
+    if key == "formalize.llm_check_repairs":
+        return str(int(formalize.get("llm_check_repairs", 2)))
     return "(unknown)"
 
 
@@ -613,6 +640,30 @@ def _update_prover_setting(config: dict, key: str) -> None:
         except Exception:
             formalize["proof_repair"] = 2
         return
+    if key == "formalize.llm_check":
+        check_default = "y" if formalize.get("llm_check", True) else "n"
+        check_raw = _prompt("Formalize LLM check (Y/n)", default=check_default).strip().lower()
+        formalize["llm_check"] = check_raw in {"y", "yes", "true", "1"}
+        return
+    if key == "formalize.llm_check_timing":
+        raw = _prompt(
+            "Formalize LLM check timing (end|mid+end)",
+            default=str(formalize.get("llm_check_timing", "end")),
+        ).strip().lower()
+        if raw not in {"end", "mid+end"}:
+            raw = "end"
+        formalize["llm_check_timing"] = raw
+        return
+    if key == "formalize.llm_check_repairs":
+        raw = _prompt(
+            "Formalize LLM check repair attempts",
+            default=str(formalize.get("llm_check_repairs", 2)),
+        ).strip()
+        try:
+            formalize["llm_check_repairs"] = max(0, int(raw))
+        except Exception:
+            formalize["llm_check_repairs"] = 2
+        return
 
 
 def _reset_prover_settings(config: dict) -> None:
@@ -639,6 +690,12 @@ def _reset_prover_settings(config: dict) -> None:
     formalize["max_equivalence_repairs"] = int(formalize_defaults.get("max_equivalence_repairs", 2))
     formalize["max_proof_rounds"] = int(formalize_defaults.get("max_proof_rounds", 1))
     formalize["proof_repair"] = int(formalize_defaults.get("proof_repair", 2))
+    formalize["llm_check"] = bool(formalize_defaults.get("llm_check", True))
+    timing = str(formalize_defaults.get("llm_check_timing", "end")).strip().lower()
+    if timing not in {"end", "mid+end"}:
+        timing = "end"
+    formalize["llm_check_timing"] = timing
+    formalize["llm_check_repairs"] = int(formalize_defaults.get("llm_check_repairs", 2))
 
 
 def _menu_prove(config: dict) -> None:
@@ -787,6 +844,14 @@ def _menu_formalize(config: dict) -> None:
         proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
     except Exception:
         proof_repair = 2
+    llm_check = bool(formalize_cfg.get("llm_check", True))
+    llm_check_timing = str(formalize_cfg.get("llm_check_timing", "end")).strip().lower()
+    if llm_check_timing not in {"end", "mid+end"}:
+        llm_check_timing = "end"
+    try:
+        llm_check_repairs = max(0, int(formalize_cfg.get("llm_check_repairs", 2)))
+    except Exception:
+        llm_check_repairs = 2
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_file,
@@ -813,6 +878,9 @@ def _menu_formalize(config: dict) -> None:
         resume_path=None,
         artifact_dir=None,
         equivalence_checks=True,
+        llm_check=llm_check,
+        llm_check_timing=llm_check_timing,
+        llm_check_repairs=llm_check_repairs,
     )
 
     chunk_words = int(config.get("segmentation", {}).get("chunk_words", 1000))
@@ -891,6 +959,14 @@ def _menu_formalize_resume(config: dict) -> None:
             proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
         except Exception:
             proof_repair = 2
+        llm_check = bool(formalize_cfg.get("llm_check", True))
+        llm_check_timing = str(formalize_cfg.get("llm_check_timing", "end")).strip().lower()
+        if llm_check_timing not in {"end", "mid+end"}:
+            llm_check_timing = "end"
+        try:
+            llm_check_repairs = max(0, int(formalize_cfg.get("llm_check_repairs", 2)))
+        except Exception:
+            llm_check_repairs = 2
         dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
         cfg = FormalizationConfig(
             tex_path=tex_path,
@@ -917,6 +993,9 @@ def _menu_formalize_resume(config: dict) -> None:
             resume_path=None,
             artifact_dir=artifact_dir,
             equivalence_checks=True,
+            llm_check=llm_check,
+            llm_check_timing=llm_check_timing,
+            llm_check_repairs=llm_check_repairs,
         )
         llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
         max_words = int(
@@ -978,6 +1057,22 @@ def _menu_formalize_resume(config: dict) -> None:
         default_proof_repair = max(0, int(formalize_cfg.get("proof_repair", 2)))
     except Exception:
         default_proof_repair = 2
+    llm_check = bool(formalize_cfg.get("llm_check", True))
+    llm_check_timing = str(formalize_cfg.get("llm_check_timing", "end")).strip().lower()
+    if llm_check_timing not in {"end", "mid+end"}:
+        llm_check_timing = "end"
+    try:
+        llm_check_repairs = max(0, int(formalize_cfg.get("llm_check_repairs", 2)))
+    except Exception:
+        llm_check_repairs = 2
+    snapshot_llm_check = bool(snapshot.get("llm_check", llm_check))
+    snapshot_llm_check_timing = str(snapshot.get("llm_check_timing", llm_check_timing)).strip().lower()
+    if snapshot_llm_check_timing not in {"end", "mid+end"}:
+        snapshot_llm_check_timing = "end"
+    try:
+        snapshot_llm_check_repairs = max(0, int(snapshot.get("llm_check_repairs", llm_check_repairs)))
+    except Exception:
+        snapshot_llm_check_repairs = llm_check_repairs
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_path,
@@ -1004,8 +1099,11 @@ def _menu_formalize_resume(config: dict) -> None:
         proof_backend=proof_backend,
         lean_backend=lean_backend,
         resume_path=resume_path,
-        artifact_dir=None,
+        artifact_dir=artifact_dir,
         equivalence_checks=bool(snapshot.get("equivalence_checks", True)),
+        llm_check=snapshot_llm_check,
+        llm_check_timing=snapshot_llm_check_timing,
+        llm_check_repairs=snapshot_llm_check_repairs,
     )
     llm = FormalizationLLM(config.get("llm_provider", "openai"), config)
     engine = FormalizationEngine(cfg, llm)

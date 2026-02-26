@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.13)
+## Status (v0.1.14)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.13 highlights:** configurable LLM typecheck timeout, improved Settings UX (single-setting edit + reset), apostrophe-safe theorem names, and tactic-mode live draft proof updates
+- **v0.1.14 highlights:** strict semantic LLM-check pipeline for formalize (mid/end/final checks), resume-safe locked declaration guards, equivalence-repair retries with rejection feedback + memory, and artifact reuse across resume runs
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -150,6 +150,9 @@ ulam formalize examples/Formalize.tex --out examples/Formalize.lean
 
 Formalization options:
 - `--no-equivalence` to skip statement equivalence checks.
+- `--llm-check/--no-llm-check` to enable or disable semantic integrity checks.
+- `--llm-check-timing end|mid+end` to choose when semantic checks run.
+- `--llm-check-repairs N` to set semantic repair attempts.
 - `--artifacts-dir` to store per-round artifacts (defaults to `runs/formalize_YYYYMMDD_HHMMSS`).
 - `--proof-backend` (`dojo|llm`) to choose proof backend.
 - `--lean-backend` (`dojo|cli`) to choose typecheck backend.

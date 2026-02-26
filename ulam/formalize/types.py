@@ -38,6 +38,9 @@ class FormalizationConfig:
     resume_path: Optional[Path] = None
     artifact_dir: Optional[Path] = None
     equivalence_checks: bool = True
+    llm_check: bool = True
+    llm_check_timing: str = "end"
+    llm_check_repairs: int = 2
 
 
 @dataclass(frozen=True)
