@@ -516,6 +516,8 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Full implementation plan: `docs/benchmark_pipeline.md`
 
 ### v0.2 — “Feels powerful” baseline
+- Optional Lean LSP backend track for interactive goal/diagnostic loops in LLM/formalize mode (`Dojo` remains default for tactic search until parity gate).
+- Define parity gate for any LSP promotion: runner `start/apply` semantics, replay/cache stability, and non-regression on internal + miniF2F slice.
 - Better state canonicalization (stable hashing)
 - Better scoring heuristic / lightweight value model (non-RL)
 - More robust retrieval formatting (names + one-line statements)

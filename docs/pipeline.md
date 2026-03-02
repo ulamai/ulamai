@@ -11,7 +11,7 @@ This document describes the end-to-end pipeline for proof search and autoformali
 ## Core Components
 
 - **LLM policy**: Proposes tactic steps or Lean code fragments.
-- **LeanDojo runner**: Executes tactics and returns proof states.
+- **Lean backend**: LeanDojo for tactic stepping (current default), Lean CLI for batch checks, and optional Lean LSP track for interactive diagnostics/goal queries.
 - **Retriever**: Fetches relevant mathlib/local premises.
 - **Search engine**: Best-first / beam with transposition table.
 - **Caches**: Step cache and state cache to avoid duplicate Lean calls.
@@ -28,7 +28,7 @@ This document describes the end-to-end pipeline for proof search and autoformali
 
 ### 2. Initialize
 
-- LeanDojo loads the file and returns the target proof state.
+- Selected Lean backend loads the file and returns the target proof state.
 - A root search node is created for this state.
 
 ### 3. Iterate (Search Loop)
@@ -37,7 +37,7 @@ For each proof state in the frontier:
 
 1. Retrieve premises (top-k).
 2. Prompt the LLM for k candidate tactics.
-3. Execute each tactic in Lean via LeanDojo.
+3. Execute each tactic in Lean via the selected backend.
 4. Update caches and log results.
 5. If solved, emit the proof and stop.
 6. If not solved, enqueue the new state (beam capped).
@@ -81,7 +81,7 @@ This loop continues until the **file typechecks** with `sorry` proofs.
 
 For each lemma with `sorry`:
 
-1. Open its goal in LeanDojo.
+1. Open its goal in the selected Lean backend.
 2. Use the proof-search pipeline to fill steps.
 3. If proof fails, attempt:
    - Retrieval of similar lemmas.
@@ -144,13 +144,29 @@ Draft → Typecheck → Proof Search → Validate Equivalence
 - Informal vs formal **equivalence checks** are implemented.
 - **Recursive statement/proof repair** loops are implemented.
 
+## Optional Lean LSP Track (Planned, Additive)
+
+Goal: add `lean-lsp` as an optional backend without disrupting existing LeanDojo search reliability.
+
+Scope boundary:
+- Phase 1: use Lean LSP for `prove --prove-mode llm` and formalize edit/typecheck loops.
+- Phase 2: evaluate Lean LSP as a tactic backend only after parity checks.
+- LeanDojo remains default backend for tactic search/bench until parity is proven.
+
+Parity criteria (before promoting beyond optional):
+- Supports runner-style `start/apply/close` semantics at theorem scope.
+- Produces stable enough proof-state keys for cache/replay usefulness.
+- No regression on internal suite and miniF2F slice under fixed budgets.
+- Comparable failure-mode clarity (errors/timeouts/diagnostics) to current Dojo path.
+
 ## Next Implementation Steps (Post-v0.1)
 
-1. Improve proof-state canonicalization and scoring heuristics.
-2. Improve retrieval ranking/formatting quality for injected premises.
-3. Expand regression-suite management and reporting for `ulam bench`.
-4. Add optional graph/MCTS-style search upgrades with stronger reuse.
-5. Build trace-to-dataset tooling for SFT evaluation loops.
+1. Add optional Lean LSP backend track (LLM/formalize first, no default switch).
+2. Improve proof-state canonicalization and scoring heuristics.
+3. Improve retrieval ranking/formatting quality for injected premises.
+4. Expand regression-suite management and reporting for `ulam bench`.
+5. Add optional graph/MCTS-style search upgrades with stronger reuse.
+6. Build trace-to-dataset tooling for SFT evaluation loops.
 
 ## Non-Goals (For Now)
 
