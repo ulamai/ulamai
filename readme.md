@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.14)
+## Status (v0.1.15)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.14 highlights:** strict semantic LLM-check pipeline for formalize (mid/end/final checks), resume-safe locked declaration guards, equivalence-repair retries with rejection feedback + memory, and artifact reuse across resume runs
+- **v0.1.15 highlights:** benchmark mini-pipeline shipped (suite validation/comparison/campaign runner), new `bench-make-minif2f` suite builder for apples-to-apples evaluations, and improved benchmark report/metadata flow for reproducible model comparisons
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -218,6 +218,37 @@ Run the regression suite (mock by default):
 
 ```bash
 python3 -m ulam bench --suite bench/regression.jsonl
+```
+
+Run the suite with machine-readable reports:
+
+```bash
+python3 -m ulam bench --suite bench/regression.jsonl --report-json runs/bench/latest.json --report-markdown runs/bench/latest.md
+```
+
+Validate a benchmark suite before running:
+
+```bash
+python3 -m ulam bench-validate --suite bench/suites/internal_regression.jsonl
+```
+
+Build a miniF2F suite from a local checkout:
+
+```bash
+python3 -m ulam bench-make-minif2f --root /path/to/miniF2F --split valid --out bench/suites/minif2f_valid.jsonl
+python3 -m ulam bench-validate --suite bench/suites/minif2f_valid.jsonl
+```
+
+Compare two benchmark reports:
+
+```bash
+python3 -m ulam bench-compare --a runs/bench/a.json --b runs/bench/b.json --out-markdown runs/bench/compare.md
+```
+
+Run a reproducible benchmark campaign (timestamped artifacts + env snapshot):
+
+```bash
+scripts/run_bench_campaign.sh --suite bench/suites/internal_regression.jsonl -- --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
 ```
 
 Build a retrieval index from local project + mathlib declarations:
@@ -475,6 +506,14 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Step cache `(state_key, tactic) -> result`
 - Deterministic replay baseline with pinned metadata + strict execute/alignment checks (hardening ongoing)
 - Minimal regression suite (`ulam bench`)
+
+### Next Version Mini-Pipeline (benchmark-ready gate)
+- Status: Phase 1-4 implemented (bench reports, suite validation/registry, anti-cheat metrics, comparison/campaign tooling).
+- Harden `ulam bench` with machine-readable reports and reproducible metadata.
+- Package/validate benchmark suites (`miniF2F`, internal regression, optional PutnamBench sample).
+- Add anti-cheat benchmark metrics (semantic pass/fail, deterministic issue counts, regression rejections).
+- Add run-comparison tooling for model-vs-model and config-vs-config analysis.
+- Full implementation plan: `docs/benchmark_pipeline.md`
 
 ### v0.2 — “Feels powerful” baseline
 - Better state canonicalization (stable hashing)

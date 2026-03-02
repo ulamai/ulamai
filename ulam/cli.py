@@ -4,12 +4,14 @@ import argparse
 import statistics
 import hashlib
 import json
+import random
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import fnmatch
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -50,7 +52,7 @@ from .retrieve import (
     load_index_premises,
     load_index_stats,
 )
-from .search import best_first_search, scripted_search
+from .search import SearchResult, best_first_search, scripted_search
 from .state import state_hash
 from .trace import TraceLogger
 from .types import RunConfig
@@ -396,6 +398,18 @@ def main(argv: list[str] | None = None) -> None:
     bench.add_argument("--no-autop", action="store_true", help="disable autop fallback tactics")
     bench.add_argument("--seed", type=int, default=0)
     bench.add_argument("--trace-dir", type=Path, default=Path("bench_traces"))
+    bench.add_argument(
+        "--report-json",
+        type=Path,
+        default=None,
+        help="write structured benchmark report to JSON",
+    )
+    bench.add_argument(
+        "--report-markdown",
+        type=Path,
+        default=None,
+        help="write benchmark summary report to Markdown",
+    )
     bench.add_argument("--verbose", action="store_true", help="print search/LLM logs")
 
     bench.add_argument("--openai-key", default=os.environ.get("ULAM_OPENAI_API_KEY", ""))
@@ -436,6 +450,100 @@ def main(argv: list[str] | None = None) -> None:
         default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3.1-pro-preview"),
     )
 
+    bench_validate = sub.add_parser("bench-validate", help="validate a benchmark suite jsonl")
+    bench_validate.add_argument("--suite", type=Path, required=True, help="jsonl suite path")
+    bench_validate.add_argument(
+        "--no-theorem-check",
+        action="store_true",
+        help="skip theorem declaration existence check",
+    )
+    bench_validate.add_argument(
+        "--max-errors",
+        type=int,
+        default=25,
+        help="maximum number of validation errors to print",
+    )
+    bench_compare = sub.add_parser("bench-compare", help="compare two benchmark report JSON files")
+    bench_compare.add_argument("--a", type=Path, required=True, help="baseline report JSON path")
+    bench_compare.add_argument("--b", type=Path, required=True, help="candidate report JSON path")
+    bench_compare.add_argument(
+        "--out-json",
+        type=Path,
+        default=None,
+        help="optional path to write comparison JSON",
+    )
+    bench_compare.add_argument(
+        "--out-markdown",
+        type=Path,
+        default=None,
+        help="optional path to write comparison Markdown",
+    )
+    bench_make_minif2f = sub.add_parser(
+        "bench-make-minif2f",
+        help="build a miniF2F benchmark suite JSONL from a local checkout",
+    )
+    bench_make_minif2f.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="miniF2F checkout root directory",
+    )
+    bench_make_minif2f.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="output suite JSONL path",
+    )
+    bench_make_minif2f.add_argument(
+        "--split",
+        choices=["all", "valid", "test"],
+        default="all",
+        help="optional split filter by path segment",
+    )
+    bench_make_minif2f.add_argument(
+        "--glob",
+        default="**/*.lean",
+        help="glob pattern under --root for candidate Lean files",
+    )
+    bench_make_minif2f.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="exclude path pattern(s) relative to --root (repeatable)",
+    )
+    bench_make_minif2f.add_argument(
+        "--require-sorry",
+        action="store_true",
+        help="only include declarations from files containing `sorry`/`admit`",
+    )
+    bench_make_minif2f.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="shuffle selected entries before writing",
+    )
+    bench_make_minif2f.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="seed used with --shuffle",
+    )
+    bench_make_minif2f.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="maximum number of entries to write (0 means all)",
+    )
+    bench_make_minif2f.add_argument(
+        "--dataset",
+        default="minif2f",
+        help="dataset label stored in each suite row",
+    )
+    bench_make_minif2f.add_argument(
+        "--allow-duplicate-theorems",
+        action="store_true",
+        help="allow same theorem name multiple times across files",
+    )
+
     index = sub.add_parser("index", help="build or inspect retrieval indices")
     index_sub = index.add_subparsers(dest="index_command", required=True)
     index_build = index_sub.add_parser("build", help="build premise index from Lean sources")
@@ -471,6 +579,15 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "bench":
         run_bench(args)
+        return
+    if args.command == "bench-validate":
+        run_bench_validate(args)
+        return
+    if args.command == "bench-compare":
+        run_bench_compare(args)
+        return
+    if args.command == "bench-make-minif2f":
+        run_bench_make_minif2f(args)
         return
     if args.command == "index":
         run_index(args)
@@ -3026,25 +3143,30 @@ def run_bench(args: argparse.Namespace) -> None:
         print(f"Suite not found: {args.suite}")
         sys.exit(1)
 
-    cases = []
-    with args.suite.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            payload = json.loads(line)
-            file_path = Path(payload["file"])
-            theorem = payload["theorem"]
-            premises = Path(payload["premises"]) if payload.get("premises") else None
-            cases.append((file_path, theorem, premises))
+    suite_path = args.suite.expanduser().resolve()
+    try:
+        cases = _load_bench_cases(suite_path)
+    except Exception as exc:
+        print(f"Failed to load suite: {exc}")
+        sys.exit(1)
+    if not cases:
+        print(f"Suite has no cases: {suite_path}")
+        return
 
     llm = _make_llm(args)
+    started_at_epoch = time.time()
+    started_perf = time.perf_counter()
     solved = 0
     results: list[dict[str, object]] = []
     error_kinds: Counter[str] = Counter()
     step_counts: list[int] = []
     durations_s: list[float] = []
-    for idx, (file_path, theorem, premises) in enumerate(cases, start=1):
+    for idx, case in enumerate(cases, start=1):
+        file_path = case["file_path"]
+        theorem = case["theorem"]
+        premises = case["premises"]
+        semantic_report = case.get("semantic_report")
+        artifact_dir = case.get("artifact_dir")
         case_args = argparse.Namespace(**vars(args))
         case_args.premises = premises if premises is not None else args.premises
         context = _read_context_files(case_args.context)
@@ -3080,28 +3202,54 @@ def run_bench(args: argparse.Namespace) -> None:
                 theorem=theorem,
             ),
         )
-        runner = _make_runner(case_args)
-        retriever = _make_retriever(case_args)
-        trace = TraceLogger(trace_path)
+        runner = None
+        trace = None
+        result = SearchResult(False, [], 0, "unknown failure")
         start = time.perf_counter()
         try:
+            runner = _make_runner(case_args)
+            retriever = _make_retriever(case_args)
+            trace = TraceLogger(trace_path)
             result = _run_with_solver(solver, runner, llm, retriever, trace, config)
+        except Exception as exc:
+            result = SearchResult(False, [], 0, f"uncaught exception: {exc}")
         finally:
-            trace.close()
-            runner.close()
+            if trace is not None:
+                trace.close()
+            if runner is not None:
+                runner.close()
         duration_s = time.perf_counter() - start
         durations_s.append(duration_s)
         step_counts.append(result.steps)
         kind = _bench_error_kind(result.error)
         if kind:
             error_kinds[kind] += 1
+        error_text = ""
+        if result.error:
+            error_text = str(result.error).strip()
+        semantic = _collect_case_semantic_metrics(
+            semantic_report=semantic_report if isinstance(semantic_report, Path) else None,
+            artifact_dir=artifact_dir if isinstance(artifact_dir, Path) else None,
+        )
         results.append(
             {
+                "index": idx,
                 "theorem": theorem,
+                "file": str(file_path),
+                "premises": str(premises) if premises else "",
                 "solved": result.solved,
                 "steps": result.steps,
                 "duration_s": duration_s,
                 "error_kind": kind,
+                "error": error_text,
+                "trace_path": str(trace_path) if trace_path else "",
+                "semantic_available": bool(semantic.get("available", False)),
+                "semantic_source": str(semantic.get("source", "") or ""),
+                "semantic_verdict": str(semantic.get("verdict", "unknown")),
+                "deterministic_issues_high": int(semantic.get("high", 0) or 0),
+                "deterministic_issues_medium": int(semantic.get("medium", 0) or 0),
+                "deterministic_issues_low": int(semantic.get("low", 0) or 0),
+                "regression_rejections": int(semantic.get("regression_rejections", 0) or 0),
             }
         )
         if result.solved:
@@ -3122,6 +3270,938 @@ def run_bench(args: argparse.Namespace) -> None:
     if error_kinds:
         summary = ", ".join(f"{name}={count}" for name, count in error_kinds.most_common(5))
         print(f"Top failure kinds: {summary}")
+
+    finished_at_epoch = time.time()
+    summary_payload = _build_bench_summary(
+        results=results,
+        solved=solved,
+        step_counts=step_counts,
+        durations_s=durations_s,
+        error_kinds=error_kinds,
+    )
+    semantic_available = int(summary_payload.get("semantic_available_cases", 0) or 0)
+    if semantic_available:
+        sem_pass = int(summary_payload.get("semantic_pass_cases", 0) or 0)
+        sem_fail = int(summary_payload.get("semantic_fail_cases", 0) or 0)
+        sem_unknown = int(summary_payload.get("semantic_unknown_cases", 0) or 0)
+        print(
+            f"Semantic verdicts: pass={sem_pass}, fail={sem_fail}, unknown={sem_unknown} "
+            f"(available={semantic_available})"
+        )
+        print(f"Semantic pass rate: {float(summary_payload.get('semantic_pass_rate_percent', 0.0)):.1f}%")
+    print(
+        "Regression rejection rate: "
+        f"{float(summary_payload.get('regression_rejection_rate_percent', 0.0)):.1f}% "
+        f"({int(summary_payload.get('cases_with_regression_rejections', 0) or 0)}/{len(results)} cases)"
+    )
+    report_payload = {
+        "schema": 1,
+        "metadata": _build_bench_metadata(
+            args=args,
+            suite_path=suite_path,
+            cases=cases,
+            started_at_epoch=started_at_epoch,
+            finished_at_epoch=finished_at_epoch,
+            total_runtime_s=(time.perf_counter() - started_perf),
+        ),
+        "summary": summary_payload,
+        "cases": results,
+    }
+    _write_bench_reports(
+        args=args,
+        report_payload=report_payload,
+    )
+
+
+def _load_bench_cases(suite_path: Path) -> list[dict[str, object]]:
+    cases: list[dict[str, object]] = []
+    with suite_path.open("r", encoding="utf-8") as fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception as exc:
+                raise RuntimeError(f"Invalid JSON in suite at line {line_no}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Suite line {line_no} must be a JSON object.")
+            file_raw = str(payload.get("file", "")).strip()
+            theorem = str(payload.get("theorem", "")).strip()
+            if not file_raw:
+                raise RuntimeError(f"Suite line {line_no} is missing required field `file`.")
+            if not theorem:
+                raise RuntimeError(f"Suite line {line_no} is missing required field `theorem`.")
+            premises_raw = str(payload.get("premises", "")).strip()
+            semantic_report_raw = str(payload.get("semantic_report", "")).strip()
+            artifact_dir_raw = str(payload.get("artifact_dir", "")).strip()
+            cases.append(
+                {
+                    "line": line_no,
+                    "file_path": _resolve_suite_path_entry(suite_path, file_raw),
+                    "theorem": theorem,
+                    "premises": _resolve_suite_path_entry(suite_path, premises_raw)
+                    if premises_raw
+                    else None,
+                    "semantic_report": _resolve_suite_path_entry(suite_path, semantic_report_raw)
+                    if semantic_report_raw
+                    else None,
+                    "artifact_dir": _resolve_suite_path_entry(suite_path, artifact_dir_raw)
+                    if artifact_dir_raw
+                    else None,
+                }
+            )
+    return cases
+
+
+def _resolve_suite_path_entry(suite_path: Path, entry: str) -> Path:
+    path = Path(entry).expanduser()
+    if path.is_absolute():
+        return path
+    base_relative = (suite_path.parent / path).resolve()
+    if base_relative.exists():
+        return base_relative
+    return path
+
+
+def _collect_case_semantic_metrics(
+    *,
+    semantic_report: Path | None,
+    artifact_dir: Path | None,
+) -> dict[str, object]:
+    source = None
+    report = None
+    if semantic_report is not None:
+        report_path = _resolve_case_path(semantic_report)
+        report = _load_json_object(report_path)
+        if report is not None:
+            source = report_path
+    artifact = _resolve_case_path(artifact_dir) if artifact_dir is not None else None
+    if report is None and artifact is not None:
+        inferred = _infer_semantic_report_from_artifact_dir(artifact)
+        if inferred is not None:
+            candidate = _load_json_object(inferred)
+            if candidate is not None:
+                report = candidate
+                source = inferred
+
+    verdict = "unknown"
+    high = 0
+    medium = 0
+    low = 0
+    if isinstance(report, dict):
+        verdict = _normalize_semantic_verdict(report.get("verdict"))
+        high, medium, low = _count_semantic_issue_severity(report)
+
+    regression_rejections = 0
+    if artifact is not None:
+        regression_rejections = _count_regression_rejections(artifact)
+
+    return {
+        "available": isinstance(report, dict),
+        "source": str(source) if source is not None else "",
+        "verdict": verdict,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "regression_rejections": regression_rejections,
+    }
+
+
+def _normalize_semantic_verdict(value: object) -> str:
+    verdict = str(value or "unknown").strip().lower()
+    if verdict not in {"pass", "fail", "unknown"}:
+        return "unknown"
+    return verdict
+
+
+def _count_semantic_issue_severity(report: dict) -> tuple[int, int, int]:
+    high = 0
+    medium = 0
+    low = 0
+    issues = report.get("deterministic_issues", [])
+    if not isinstance(issues, list):
+        issues = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity", "")).strip().lower()
+        if severity == "high":
+            high += 1
+        elif severity == "medium":
+            medium += 1
+        else:
+            low += 1
+    return high, medium, low
+
+
+def _infer_semantic_report_from_artifact_dir(artifact_dir: Path) -> Path | None:
+    if not artifact_dir.exists() or not artifact_dir.is_dir():
+        return None
+    final_report = artifact_dir / "llm_check_final.json"
+    if final_report.exists():
+        return final_report
+    round_reports = sorted(artifact_dir.glob("round_*/llm_check_end.json"), reverse=True)
+    if round_reports:
+        return round_reports[0]
+    round_mid_reports = sorted(artifact_dir.glob("round_*/llm_check_mid.json"), reverse=True)
+    if round_mid_reports:
+        return round_mid_reports[0]
+    return None
+
+
+def _load_json_object(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _count_regression_rejections(artifact_dir: Path) -> int:
+    payload = _load_json_object(artifact_dir / "rejection_memory.json")
+    if not isinstance(payload, dict):
+        return 0
+    count = 0
+    for reasons in payload.values():
+        if not isinstance(reasons, list):
+            continue
+        for reason in reasons:
+            text = str(reason).strip().lower()
+            if not text:
+                continue
+            if (
+                "regression" in text
+                or "previously proven declaration" in text
+                or "locked declaration" in text
+            ):
+                count += 1
+    return count
+
+
+def run_bench_make_minif2f(args: argparse.Namespace) -> None:
+    root = args.root.expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        print(f"miniF2F root not found: {root}")
+        sys.exit(1)
+
+    out_path = args.out.expanduser().resolve()
+    split = str(args.split or "all").strip().lower()
+    glob_pattern = str(args.glob or "**/*.lean").strip() or "**/*.lean"
+    dataset = str(args.dataset or "minif2f").strip() or "minif2f"
+    require_sorry = bool(getattr(args, "require_sorry", False))
+    allow_duplicate_theorems = bool(getattr(args, "allow_duplicate_theorems", False))
+    do_shuffle = bool(getattr(args, "shuffle", False))
+    seed = int(getattr(args, "seed", 0))
+    limit = max(0, int(getattr(args, "limit", 0)))
+
+    default_excludes = [
+        ".lake/**",
+        "**/.lake/**",
+        "build/**",
+        "**/build/**",
+        ".git/**",
+        "**/.git/**",
+        "lake-packages/**",
+        "**/lake-packages/**",
+    ]
+    user_excludes = [str(item).strip() for item in list(getattr(args, "exclude", [])) if str(item).strip()]
+    excludes = default_excludes + user_excludes
+
+    candidate_files = sorted(path for path in root.glob(glob_pattern) if path.is_file() and path.suffix == ".lean")
+    if not candidate_files:
+        print(f"No Lean files matched --glob `{glob_pattern}` under {root}")
+        sys.exit(1)
+
+    total_files = 0
+    used_files = 0
+    skipped_excluded = 0
+    skipped_split = 0
+    skipped_no_sorry = 0
+    skipped_no_decl = 0
+    duplicate_theorem_skips = 0
+    entries: list[dict[str, object]] = []
+    seen_theorems: set[str] = set()
+
+    for file_path in candidate_files:
+        total_files += 1
+        rel = file_path.relative_to(root)
+        rel_posix = rel.as_posix()
+        if _bench_path_is_excluded(rel_posix, excludes):
+            skipped_excluded += 1
+            continue
+        if not _bench_split_match(rel, split):
+            skipped_split += 1
+            continue
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if require_sorry and re.search(r"\b(sorry|admit)\b", text) is None:
+            skipped_no_sorry += 1
+            continue
+        decl_names = _extract_decl_names(text)
+        if not decl_names:
+            skipped_no_decl += 1
+            continue
+        unique_decl_names = list(dict.fromkeys(decl_names))
+        file_used = False
+        suite_file = _suite_entry_path_for_output(out_path, file_path)
+        for theorem in unique_decl_names:
+            if not allow_duplicate_theorems and theorem in seen_theorems:
+                duplicate_theorem_skips += 1
+                continue
+            seen_theorems.add(theorem)
+            entries.append(
+                {
+                    "file": suite_file,
+                    "theorem": theorem,
+                    "dataset": dataset,
+                    "split": split,
+                    "source_relpath": rel_posix,
+                }
+            )
+            file_used = True
+        if file_used:
+            used_files += 1
+
+    if do_shuffle and entries:
+        random.Random(seed).shuffle(entries)
+    if limit > 0:
+        entries = entries[:limit]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in entries:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"Wrote miniF2F suite: {out_path}")
+    print(f"Cases: {len(entries)}")
+    print(f"Files scanned: {total_files}")
+    print(f"Files with included declarations: {used_files}")
+    if skipped_excluded:
+        print(f"Skipped by exclude patterns: {skipped_excluded}")
+    if skipped_split:
+        print(f"Skipped by split filter `{split}`: {skipped_split}")
+    if skipped_no_sorry:
+        print(f"Skipped (missing sorry/admit): {skipped_no_sorry}")
+    if skipped_no_decl:
+        print(f"Skipped (no theorem/lemma/example declarations): {skipped_no_decl}")
+    if duplicate_theorem_skips:
+        print(f"Skipped duplicate theorem names: {duplicate_theorem_skips}")
+    print(f"Next: ulam bench-validate --suite {out_path}")
+
+
+def _bench_path_is_excluded(rel_posix: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        pat = pattern.strip()
+        if not pat:
+            continue
+        if fnmatch.fnmatch(rel_posix, pat):
+            return True
+    return False
+
+
+def _bench_split_match(rel_path: Path, split: str) -> bool:
+    if split == "all":
+        return True
+    if split not in {"valid", "test"}:
+        return True
+    aliases = {
+        "valid": {"valid", "validation"},
+        "test": {"test", "testing"},
+    }
+    wanted = aliases.get(split, {split})
+    for raw_part in rel_path.parts:
+        part = raw_part.lower()
+        if part in wanted:
+            return True
+        if "." in part and part.rsplit(".", 1)[0] in wanted:
+            return True
+    return False
+
+
+def _suite_entry_path_for_output(out_path: Path, target: Path) -> str:
+    base = out_path.parent.resolve()
+    resolved_target = target.resolve()
+    try:
+        rel = resolved_target.relative_to(base)
+        return rel.as_posix()
+    except Exception:
+        return str(resolved_target)
+
+
+def run_bench_validate(args: argparse.Namespace) -> None:
+    suite_path = args.suite.expanduser().resolve()
+    if not suite_path.exists():
+        print(f"Suite not found: {suite_path}")
+        sys.exit(1)
+    try:
+        cases = _load_bench_cases(suite_path)
+    except Exception as exc:
+        print(f"Failed to load suite: {exc}")
+        sys.exit(1)
+    if not cases:
+        print(f"Suite valid: 0 cases ({suite_path})")
+        return
+
+    max_errors = max(1, int(getattr(args, "max_errors", 25)))
+    check_theorem = not bool(getattr(args, "no_theorem_check", False))
+    errors: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    duplicate_pairs = 0
+    decl_cache: dict[Path, set[str]] = {}
+    unique_files: set[str] = set()
+
+    for idx, case in enumerate(cases, start=1):
+        line = int(case.get("line", idx))
+        theorem = str(case.get("theorem", "")).strip()
+        file_path = case.get("file_path")
+        premises_path = case.get("premises")
+        if not isinstance(file_path, Path):
+            errors.append(f"line {line}: invalid `file` path.")
+            if len(errors) >= max_errors:
+                break
+            continue
+        resolved_file = _resolve_case_path(file_path)
+        unique_files.add(str(resolved_file))
+        key = (str(resolved_file), theorem)
+        if key in seen_pairs:
+            duplicate_pairs += 1
+        else:
+            seen_pairs.add(key)
+
+        if not resolved_file.exists():
+            errors.append(f"line {line}: file not found: {resolved_file}")
+            if len(errors) >= max_errors:
+                break
+            continue
+
+        if premises_path:
+            if not isinstance(premises_path, Path):
+                errors.append(f"line {line}: invalid `premises` path.")
+                if len(errors) >= max_errors:
+                    break
+            else:
+                resolved_premises = _resolve_case_path(premises_path)
+                if not resolved_premises.exists():
+                    errors.append(f"line {line}: premises file not found: {resolved_premises}")
+                    if len(errors) >= max_errors:
+                        break
+        semantic_report_path = case.get("semantic_report")
+        if semantic_report_path:
+            if not isinstance(semantic_report_path, Path):
+                errors.append(f"line {line}: invalid `semantic_report` path.")
+                if len(errors) >= max_errors:
+                    break
+            else:
+                resolved_semantic = _resolve_case_path(semantic_report_path)
+                if not resolved_semantic.exists():
+                    errors.append(f"line {line}: semantic report not found: {resolved_semantic}")
+                    if len(errors) >= max_errors:
+                        break
+        artifact_dir_path = case.get("artifact_dir")
+        if artifact_dir_path:
+            if not isinstance(artifact_dir_path, Path):
+                errors.append(f"line {line}: invalid `artifact_dir` path.")
+                if len(errors) >= max_errors:
+                    break
+            else:
+                resolved_artifact = _resolve_case_path(artifact_dir_path)
+                if not resolved_artifact.exists():
+                    errors.append(f"line {line}: artifact_dir not found: {resolved_artifact}")
+                    if len(errors) >= max_errors:
+                        break
+                elif not resolved_artifact.is_dir():
+                    errors.append(f"line {line}: artifact_dir is not a directory: {resolved_artifact}")
+                    if len(errors) >= max_errors:
+                        break
+
+        if not check_theorem:
+            continue
+        declarations = _load_decl_names_for_file(resolved_file, decl_cache)
+        if declarations is None:
+            errors.append(f"line {line}: failed reading Lean file: {resolved_file}")
+            if len(errors) >= max_errors:
+                break
+            continue
+        if theorem not in declarations:
+            preview = ", ".join(sorted(declarations)[:8])
+            suffix = " ..." if len(declarations) > 8 else ""
+            errors.append(
+                f"line {line}: theorem `{theorem}` not found in {resolved_file}. "
+                f"Declarations: {preview}{suffix}"
+            )
+            if len(errors) >= max_errors:
+                break
+
+    if errors:
+        print(f"Suite validation failed: {suite_path}")
+        for msg in errors[:max_errors]:
+            print(f"- {msg}")
+        if len(errors) > max_errors:
+            print(f"... and {len(errors) - max_errors} more error(s)")
+        sys.exit(1)
+
+    print(f"Suite validation OK: {suite_path}")
+    print(f"Cases: {len(cases)}")
+    print(f"Unique files: {len(unique_files)}")
+    if duplicate_pairs:
+        print(f"Duplicate (file,theorem) entries: {duplicate_pairs}")
+    if check_theorem:
+        print("Theorem check: enabled")
+    else:
+        print("Theorem check: skipped")
+
+
+def _resolve_case_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    return (Path.cwd() / expanded).resolve()
+
+
+def _load_decl_names_for_file(path: Path, cache: dict[Path, set[str]]) -> set[str] | None:
+    if path in cache:
+        return cache[path]
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    names = set(_extract_decl_names(text))
+    cache[path] = names
+    return names
+
+
+def run_bench_compare(args: argparse.Namespace) -> None:
+    path_a = args.a.expanduser().resolve()
+    path_b = args.b.expanduser().resolve()
+    report_a = _load_json_object(path_a)
+    report_b = _load_json_object(path_b)
+    if report_a is None:
+        print(f"Could not read report JSON: {path_a}")
+        sys.exit(1)
+    if report_b is None:
+        print(f"Could not read report JSON: {path_b}")
+        sys.exit(1)
+
+    metrics_a = _extract_bench_report_metrics(report_a)
+    metrics_b = _extract_bench_report_metrics(report_b)
+    meta_a = report_a.get("metadata", {}) if isinstance(report_a.get("metadata"), dict) else {}
+    meta_b = report_b.get("metadata", {}) if isinstance(report_b.get("metadata"), dict) else {}
+    label_a = _report_label(meta_a)
+    label_b = _report_label(meta_b)
+
+    delta = _bench_metrics_delta(metrics_a, metrics_b)
+    payload = {
+        "schema": 1,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "report_a": str(path_a),
+        "report_b": str(path_b),
+        "label_a": label_a,
+        "label_b": label_b,
+        "metrics_a": metrics_a,
+        "metrics_b": metrics_b,
+        "delta": delta,
+    }
+
+    print(f"Benchmark comparison: A={path_a} ({label_a}) vs B={path_b} ({label_b})")
+    _print_metric_delta("Solved", metrics_a["solved"], metrics_b["solved"], as_percent=False)
+    _print_metric_delta("Success rate", metrics_a["success_rate_percent"], metrics_b["success_rate_percent"], as_percent=True)
+    _print_metric_delta(
+        "Semantic pass rate",
+        metrics_a["semantic_pass_rate_percent"],
+        metrics_b["semantic_pass_rate_percent"],
+        as_percent=True,
+    )
+    _print_metric_delta(
+        "Semantic fail rate",
+        metrics_a["semantic_fail_rate_percent"],
+        metrics_b["semantic_fail_rate_percent"],
+        as_percent=True,
+    )
+    _print_metric_delta(
+        "Median time (s)",
+        metrics_a["median_duration_s"],
+        metrics_b["median_duration_s"],
+        as_percent=False,
+    )
+    _print_metric_delta(
+        "Regression rejection rate",
+        metrics_a["regression_rejection_rate_percent"],
+        metrics_b["regression_rejection_rate_percent"],
+        as_percent=True,
+    )
+
+    if args.out_json:
+        out_json = Path(args.out_json).expanduser().resolve()
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"Comparison JSON: {out_json}")
+    if args.out_markdown:
+        out_md = Path(args.out_markdown).expanduser().resolve()
+        out_md.parent.mkdir(parents=True, exist_ok=True)
+        out_md.write_text(_render_bench_compare_markdown(payload) + "\n", encoding="utf-8")
+        print(f"Comparison Markdown: {out_md}")
+
+
+def _report_label(metadata: dict) -> str:
+    llm_backend = str(metadata.get("llm_backend", "")).strip()
+    llm_model = str(metadata.get("llm_model", "")).strip()
+    if llm_backend and llm_model:
+        return f"{llm_backend}:{llm_model}"
+    if llm_backend:
+        return llm_backend
+    return "unknown"
+
+
+def _extract_bench_report_metrics(report: dict) -> dict[str, float]:
+    summary = report.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    return {
+        "total": float(int(summary.get("total", 0) or 0)),
+        "solved": float(int(summary.get("solved", 0) or 0)),
+        "success_rate_percent": float(summary.get("success_rate_percent", 0.0) or 0.0),
+        "semantic_pass_rate_percent": float(summary.get("semantic_pass_rate_percent", 0.0) or 0.0),
+        "semantic_fail_rate_percent": float(summary.get("semantic_fail_rate_percent", 0.0) or 0.0),
+        "median_duration_s": float(summary.get("median_duration_s", 0.0) or 0.0),
+        "median_steps": float(summary.get("median_steps", 0.0) or 0.0),
+        "regression_rejection_rate_percent": float(
+            summary.get("regression_rejection_rate_percent", 0.0) or 0.0
+        ),
+    }
+
+
+def _bench_metrics_delta(metrics_a: dict[str, float], metrics_b: dict[str, float]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, a_val in metrics_a.items():
+        b_val = float(metrics_b.get(key, 0.0) or 0.0)
+        out[key] = b_val - float(a_val)
+    return out
+
+
+def _format_delta(delta: float, suffix: str = "") -> str:
+    sign = "+" if delta >= 0 else ""
+    if suffix:
+        return f"{sign}{delta:.2f}{suffix}"
+    return f"{sign}{delta:.2f}"
+
+
+def _print_metric_delta(name: str, a_value: float, b_value: float, *, as_percent: bool) -> None:
+    delta = b_value - a_value
+    if as_percent:
+        print(f"- {name}: {a_value:.2f}% -> {b_value:.2f}% ({_format_delta(delta, '%')})")
+        return
+    print(f"- {name}: {a_value:.2f} -> {b_value:.2f} ({_format_delta(delta)})")
+
+
+def _render_bench_compare_markdown(payload: dict) -> str:
+    metrics_a = payload.get("metrics_a", {})
+    metrics_b = payload.get("metrics_b", {})
+    delta = payload.get("delta", {})
+    if not isinstance(metrics_a, dict):
+        metrics_a = {}
+    if not isinstance(metrics_b, dict):
+        metrics_b = {}
+    if not isinstance(delta, dict):
+        delta = {}
+    lines = [
+        "# Ulam Bench Comparison",
+        "",
+        f"- Report A: {payload.get('report_a', '')}",
+        f"- Report B: {payload.get('report_b', '')}",
+        f"- Label A: {payload.get('label_a', '')}",
+        f"- Label B: {payload.get('label_b', '')}",
+        "",
+        "| Metric | A | B | Delta (B-A) |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    ordered = [
+        ("solved", "Solved"),
+        ("total", "Total"),
+        ("success_rate_percent", "Success rate (%)"),
+        ("semantic_pass_rate_percent", "Semantic pass rate (%)"),
+        ("semantic_fail_rate_percent", "Semantic fail rate (%)"),
+        ("median_duration_s", "Median duration (s)"),
+        ("median_steps", "Median steps"),
+        ("regression_rejection_rate_percent", "Regression rejection rate (%)"),
+    ]
+    for key, label in ordered:
+        a_val = float(metrics_a.get(key, 0.0) or 0.0)
+        b_val = float(metrics_b.get(key, 0.0) or 0.0)
+        d_val = float(delta.get(key, 0.0) or 0.0)
+        lines.append(f"| {label} | {a_val:.2f} | {b_val:.2f} | {_format_delta(d_val)} |")
+    return "\n".join(lines).rstrip()
+
+
+def _build_bench_summary(
+    *,
+    results: list[dict[str, object]],
+    solved: int,
+    step_counts: list[int],
+    durations_s: list[float],
+    error_kinds: Counter[str],
+) -> dict[str, object]:
+    total = len(results)
+    success_rate = (100.0 * solved / total) if total else 0.0
+    semantic_available = 0
+    semantic_pass = 0
+    semantic_fail = 0
+    semantic_unknown = 0
+    deterministic_high_total = 0
+    deterministic_medium_total = 0
+    deterministic_low_total = 0
+    regression_cases = 0
+    regression_total = 0
+    for case in results:
+        if not isinstance(case, dict):
+            continue
+        deterministic_high_total += int(case.get("deterministic_issues_high", 0) or 0)
+        deterministic_medium_total += int(case.get("deterministic_issues_medium", 0) or 0)
+        deterministic_low_total += int(case.get("deterministic_issues_low", 0) or 0)
+        regressions = int(case.get("regression_rejections", 0) or 0)
+        if regressions > 0:
+            regression_cases += 1
+        regression_total += regressions
+        if not bool(case.get("semantic_available", False)):
+            continue
+        semantic_available += 1
+        verdict = _normalize_semantic_verdict(case.get("semantic_verdict"))
+        if verdict == "pass":
+            semantic_pass += 1
+        elif verdict == "fail":
+            semantic_fail += 1
+        else:
+            semantic_unknown += 1
+    semantic_pass_rate = (100.0 * semantic_pass / semantic_available) if semantic_available else 0.0
+    semantic_fail_rate = (100.0 * semantic_fail / semantic_available) if semantic_available else 0.0
+    regression_rate = (100.0 * regression_cases / total) if total else 0.0
+    return {
+        "total": total,
+        "solved": solved,
+        "failed": max(0, total - solved),
+        "success_rate_percent": success_rate,
+        "median_steps": statistics.median(step_counts) if step_counts else 0.0,
+        "median_duration_s": statistics.median(durations_s) if durations_s else 0.0,
+        "mean_duration_s": (sum(durations_s) / len(durations_s)) if durations_s else 0.0,
+        "error_kinds": dict(error_kinds.most_common()),
+        "semantic_available_cases": semantic_available,
+        "semantic_pass_cases": semantic_pass,
+        "semantic_fail_cases": semantic_fail,
+        "semantic_unknown_cases": semantic_unknown,
+        "semantic_pass_rate_percent": semantic_pass_rate,
+        "semantic_fail_rate_percent": semantic_fail_rate,
+        "deterministic_issues_high_total": deterministic_high_total,
+        "deterministic_issues_medium_total": deterministic_medium_total,
+        "deterministic_issues_low_total": deterministic_low_total,
+        "cases_with_regression_rejections": regression_cases,
+        "regression_rejections_total": regression_total,
+        "regression_rejection_rate_percent": regression_rate,
+    }
+
+
+def _build_bench_metadata(
+    *,
+    args: argparse.Namespace,
+    suite_path: Path,
+    cases: list[dict[str, object]],
+    started_at_epoch: float,
+    finished_at_epoch: float,
+    total_runtime_s: float,
+) -> dict[str, object]:
+    lean_project = _resolve_bench_lean_project(args, cases)
+    lean_toolchain = _read_toolchain_file(lean_project / "lean-toolchain") if lean_project else ""
+    mathlib_rev = _mathlib_rev_from_manifest(lean_project) if lean_project else ""
+    mathlib_commit = _mathlib_commit_from_checkout(lean_project) if lean_project else ""
+    repo_root = Path(__file__).resolve().parents[1]
+    started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at_epoch))
+    finished_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished_at_epoch))
+    return {
+        "run_started_utc": started_utc,
+        "run_finished_utc": finished_utc,
+        "run_duration_s": total_runtime_s,
+        "ulam_version": __version__,
+        "ulam_git_commit": _git_rev_parse(repo_root),
+        "suite_path": str(suite_path),
+        "suite_sha256": _sha256_file(suite_path),
+        "suite_cases": len(cases),
+        "llm_backend": str(getattr(args, "llm", "")),
+        "llm_model": _resolve_bench_model(args),
+        "lean_backend": str(getattr(args, "lean", "")),
+        "lean_project": str(lean_project) if lean_project else "",
+        "lean_imports": list(getattr(args, "lean_import", []) or []),
+        "lean_toolchain": lean_toolchain or "",
+        "mathlib_rev": mathlib_rev or "",
+        "mathlib_commit": mathlib_commit or "",
+        "solver": str(getattr(args, "solver", "")),
+        "retriever": str(getattr(args, "retriever", "")),
+        "retriever_source": str(getattr(args, "retriever_source", "")),
+        "retriever_index": str(getattr(args, "retriever_index", "") or ""),
+        "trace_dir": str(getattr(args, "trace_dir", "") or ""),
+        "seed": int(getattr(args, "seed", 0)),
+        "max_steps": int(getattr(args, "max_steps", 0)),
+        "beam": int(getattr(args, "beam", 0)),
+        "k": int(getattr(args, "k", 0)),
+        "timeout_s": float(getattr(args, "timeout", 0.0)),
+        "repair_attempts": int(getattr(args, "repair", 0)),
+        "autop": _autop_enabled(args),
+        "instruction": str(getattr(args, "instruction", "") or ""),
+    }
+
+
+def _resolve_bench_model(args: argparse.Namespace) -> str:
+    backend = str(getattr(args, "llm", ""))
+    if backend in {"openai", "codex_cli"}:
+        return str(getattr(args, "openai_model", "") or "")
+    if backend in {"anthropic", "claude_cli"}:
+        return str(getattr(args, "anthropic_model", "") or "")
+    if backend in {"gemini", "gemini_cli"}:
+        return str(getattr(args, "gemini_model", "") or "")
+    if backend == "ollama":
+        return str(getattr(args, "ollama_model", "") or "")
+    return backend or "unknown"
+
+
+def _resolve_bench_lean_project(
+    args: argparse.Namespace,
+    cases: list[dict[str, object]],
+) -> Path | None:
+    explicit = getattr(args, "lean_project", None)
+    if isinstance(explicit, Path):
+        return explicit.expanduser().resolve()
+    for case in cases:
+        file_path = case.get("file_path")
+        if not isinstance(file_path, Path):
+            continue
+        file_abs = file_path.expanduser().resolve()
+        project = _find_lean_project_for_file(file_abs)
+        if project is not None:
+            return project.expanduser().resolve()
+    return None
+
+
+def _git_rev_parse(path: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _write_bench_reports(*, args: argparse.Namespace, report_payload: dict[str, object]) -> None:
+    if args.report_json:
+        report_json_path = Path(args.report_json).expanduser().resolve()
+        report_json_path.parent.mkdir(parents=True, exist_ok=True)
+        report_json_path.write_text(
+            json.dumps(report_payload, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Report JSON: {report_json_path}")
+    if args.report_markdown:
+        report_md_path = Path(args.report_markdown).expanduser().resolve()
+        report_md_path.parent.mkdir(parents=True, exist_ok=True)
+        report_md_path.write_text(
+            _render_bench_markdown(report_payload) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Report Markdown: {report_md_path}")
+
+
+def _render_bench_markdown(report_payload: dict[str, object]) -> str:
+    metadata = report_payload.get("metadata", {})
+    summary = report_payload.get("summary", {})
+    cases = report_payload.get("cases", [])
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    if not isinstance(cases, list):
+        cases = []
+
+    lines: list[str] = [
+        "# Ulam Bench Report",
+        "",
+        "## Summary",
+        f"- Total: {summary.get('total', 0)}",
+        f"- Solved: {summary.get('solved', 0)}",
+        f"- Failed: {summary.get('failed', 0)}",
+        f"- Success rate: {float(summary.get('success_rate_percent', 0.0)):.1f}%",
+        f"- Median steps: {float(summary.get('median_steps', 0.0)):.1f}",
+        f"- Median time: {float(summary.get('median_duration_s', 0.0)):.2f}s",
+        f"- Mean time: {float(summary.get('mean_duration_s', 0.0)):.2f}s",
+        "",
+        "## Anti-Cheat Metrics",
+        f"- Semantic available: {summary.get('semantic_available_cases', 0)}",
+        f"- Semantic pass: {summary.get('semantic_pass_cases', 0)}",
+        f"- Semantic fail: {summary.get('semantic_fail_cases', 0)}",
+        f"- Semantic unknown: {summary.get('semantic_unknown_cases', 0)}",
+        f"- Semantic pass rate: {float(summary.get('semantic_pass_rate_percent', 0.0)):.1f}%",
+        f"- Semantic fail rate: {float(summary.get('semantic_fail_rate_percent', 0.0)):.1f}%",
+        f"- Deterministic issues (high/medium/low): "
+        f"{summary.get('deterministic_issues_high_total', 0)}/"
+        f"{summary.get('deterministic_issues_medium_total', 0)}/"
+        f"{summary.get('deterministic_issues_low_total', 0)}",
+        f"- Regression rejections: {summary.get('regression_rejections_total', 0)}",
+        f"- Regression rejection rate: {float(summary.get('regression_rejection_rate_percent', 0.0)):.1f}%",
+        "",
+        "## Run Metadata",
+        f"- Started (UTC): {metadata.get('run_started_utc', '')}",
+        f"- Finished (UTC): {metadata.get('run_finished_utc', '')}",
+        f"- Duration: {float(metadata.get('run_duration_s', 0.0)):.2f}s",
+        f"- Ulam version: {metadata.get('ulam_version', '')}",
+        f"- Ulam commit: {metadata.get('ulam_git_commit', '')}",
+        f"- Suite: {metadata.get('suite_path', '')}",
+        f"- Suite SHA256: {metadata.get('suite_sha256', '')}",
+        f"- LLM: {metadata.get('llm_backend', '')} ({metadata.get('llm_model', '')})",
+        f"- Lean backend: {metadata.get('lean_backend', '')}",
+        f"- Lean project: {metadata.get('lean_project', '')}",
+        f"- Lean toolchain: {metadata.get('lean_toolchain', '')}",
+        f"- Mathlib commit: {metadata.get('mathlib_commit', '')}",
+        f"- Solver: {metadata.get('solver', '')}",
+        f"- Retriever: {metadata.get('retriever', '')}/{metadata.get('retriever_source', '')}",
+        "",
+    ]
+
+    error_kinds = summary.get("error_kinds", {})
+    if isinstance(error_kinds, dict) and error_kinds:
+        lines.append("## Top Failure Kinds")
+        for name, count in error_kinds.items():
+            lines.append(f"- {name}: {count}")
+        lines.append("")
+
+    failed_cases = [case for case in cases if isinstance(case, dict) and not bool(case.get("solved", False))]
+    if failed_cases:
+        lines.extend(
+            [
+                "## Failed Cases",
+                "",
+                "| # | Theorem | Steps | Time (s) | Error Kind |",
+                "| --- | --- | ---: | ---: | --- |",
+            ]
+        )
+        for case in failed_cases[:25]:
+            theorem = str(case.get("theorem", "")).replace("|", "\\|")
+            lines.append(
+                "| "
+                + f"{case.get('index', '')} | {theorem} | {case.get('steps', 0)} | "
+                + f"{float(case.get('duration_s', 0.0)):.2f} | {case.get('error_kind', '')} |"
+            )
+        if len(failed_cases) > 25:
+            lines.append(f"| ... | ({len(failed_cases) - 25} more) |  |  |  |")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _read_context_files(paths: list[Path], max_chars: int = 8000) -> list[str]:
