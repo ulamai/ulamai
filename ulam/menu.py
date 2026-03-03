@@ -248,6 +248,19 @@ def _configure_prover_all(config: dict) -> None:
         prove["llm_rounds"] = max(1, int(llm_rounds_raw))
     except Exception:
         prove["llm_rounds"] = 4
+    allow_helpers_default = "y" if prove.get("llm_allow_helper_lemmas", True) else "n"
+    allow_helpers_raw = _prompt(
+        "LLM mode allow helper lemmas (Y/n)",
+        default=allow_helpers_default,
+    ).strip().lower()
+    prove["llm_allow_helper_lemmas"] = allow_helpers_raw not in {"n", "no", "false", "0"}
+    edit_scope_raw = _prompt(
+        "LLM mode edit scope (full|errors_only)",
+        default=str(prove.get("llm_edit_scope", "full")),
+    ).strip().lower()
+    if edit_scope_raw not in {"full", "errors_only"}:
+        edit_scope_raw = "full"
+    prove["llm_edit_scope"] = edit_scope_raw
     typecheck_timeout_default = str(prove.get("typecheck_timeout_s", 60))
     typecheck_timeout_raw = _prompt(
         "LLM mode typecheck timeout (seconds)",
@@ -347,6 +360,14 @@ def _configure_prover_all(config: dict) -> None:
         formalize["proof_repair"] = max(0, int(formalize_proof_repair_raw))
     except Exception:
         formalize["proof_repair"] = 2
+    formalize_typecheck_timeout_raw = _prompt(
+        "Formalize typecheck timeout (seconds)",
+        default=str(formalize.get("typecheck_timeout_s", 60)),
+    ).strip()
+    try:
+        formalize["typecheck_timeout_s"] = max(5, int(float(formalize_typecheck_timeout_raw)))
+    except Exception:
+        formalize["typecheck_timeout_s"] = 60
     llm_check_default = "y" if formalize.get("llm_check", True) else "n"
     llm_check_raw = _prompt("Formalize LLM check (Y/n)", default=llm_check_default).strip().lower()
     formalize["llm_check"] = llm_check_raw in {"y", "yes", "true", "1"}
@@ -378,6 +399,8 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.retriever_build", "Auto retriever index build"),
         ("prove.retriever_index", "Auto retriever index path"),
         ("prove.llm_rounds", "LLM-only max rounds"),
+        ("prove.llm_allow_helper_lemmas", "LLM mode allow helper lemmas"),
+        ("prove.llm_edit_scope", "LLM mode edit scope"),
         ("prove.typecheck_timeout_s", "LLM mode typecheck timeout"),
         ("llm.timeout_s", "LLM request timeout"),
         ("llm.heartbeat_s", "LLM heartbeat interval"),
@@ -391,6 +414,7 @@ def _configure_prover_single(config: dict) -> None:
         ("formalize.max_rounds", "Formalize max rounds"),
         ("formalize.max_proof_rounds", "Formalize proof rounds"),
         ("formalize.proof_repair", "Formalize proof repair attempts"),
+        ("formalize.typecheck_timeout_s", "Formalize typecheck timeout"),
         ("formalize.llm_check", "Formalize LLM check"),
         ("formalize.llm_check_timing", "Formalize LLM check timing"),
         ("formalize.llm_check_repairs", "Formalize LLM check repair attempts"),
@@ -440,6 +464,10 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(prove.get("retriever_index", ""))
     if key == "prove.llm_rounds":
         return str(int(prove.get("llm_rounds", 4)))
+    if key == "prove.llm_allow_helper_lemmas":
+        return "on" if bool(prove.get("llm_allow_helper_lemmas", True)) else "off"
+    if key == "prove.llm_edit_scope":
+        return str(prove.get("llm_edit_scope", "full"))
     if key == "prove.typecheck_timeout_s":
         return str(int(prove.get("typecheck_timeout_s", 60)))
     if key == "llm.timeout_s":
@@ -466,6 +494,8 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(int(formalize.get("max_proof_rounds", 1)))
     if key == "formalize.proof_repair":
         return str(int(formalize.get("proof_repair", 2)))
+    if key == "formalize.typecheck_timeout_s":
+        return str(int(formalize.get("typecheck_timeout_s", 60)))
     if key == "formalize.llm_check":
         return "on" if bool(formalize.get("llm_check", True)) else "off"
     if key == "formalize.llm_check_timing":
@@ -545,6 +575,17 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["llm_rounds"] = max(1, int(raw))
         except Exception:
             prove["llm_rounds"] = 4
+        return
+    if key == "prove.llm_allow_helper_lemmas":
+        allow_default = "y" if prove.get("llm_allow_helper_lemmas", True) else "n"
+        allow_raw = _prompt("LLM mode allow helper lemmas (Y/n)", default=allow_default).strip().lower()
+        prove["llm_allow_helper_lemmas"] = allow_raw not in {"n", "no", "false", "0"}
+        return
+    if key == "prove.llm_edit_scope":
+        raw = _prompt("LLM mode edit scope (full|errors_only)", default=str(prove.get("llm_edit_scope", "full"))).strip().lower()
+        if raw not in {"full", "errors_only"}:
+            raw = "full"
+        prove["llm_edit_scope"] = raw
         return
     if key == "prove.typecheck_timeout_s":
         raw = _prompt("LLM mode typecheck timeout (seconds)", default=str(prove.get("typecheck_timeout_s", 60))).strip()
@@ -640,6 +681,16 @@ def _update_prover_setting(config: dict, key: str) -> None:
         except Exception:
             formalize["proof_repair"] = 2
         return
+    if key == "formalize.typecheck_timeout_s":
+        raw = _prompt(
+            "Formalize typecheck timeout (seconds)",
+            default=str(formalize.get("typecheck_timeout_s", 60)),
+        ).strip()
+        try:
+            formalize["typecheck_timeout_s"] = max(5, int(float(raw)))
+        except Exception:
+            formalize["typecheck_timeout_s"] = 60
+        return
     if key == "formalize.llm_check":
         check_default = "y" if formalize.get("llm_check", True) else "n"
         check_raw = _prompt("Formalize LLM check (Y/n)", default=check_default).strip().lower()
@@ -690,6 +741,7 @@ def _reset_prover_settings(config: dict) -> None:
     formalize["max_equivalence_repairs"] = int(formalize_defaults.get("max_equivalence_repairs", 2))
     formalize["max_proof_rounds"] = int(formalize_defaults.get("max_proof_rounds", 1))
     formalize["proof_repair"] = int(formalize_defaults.get("proof_repair", 2))
+    formalize["typecheck_timeout_s"] = int(formalize_defaults.get("typecheck_timeout_s", 60))
     formalize["llm_check"] = bool(formalize_defaults.get("llm_check", True))
     timing = str(formalize_defaults.get("llm_check_timing", "end")).strip().lower()
     if timing not in {"end", "mid+end"}:
@@ -703,6 +755,11 @@ def _menu_prove(config: dict) -> None:
     print("Optional: provide a Lean file path to run immediately, or leave blank to auto-generate from text.")
     _print_lean_file_suggestions()
     file_path = _prompt("Lean file path (optional)", default="").strip()
+    if not file_path:
+        only_file = _single_lean_file_in_cwd()
+        if only_file is not None:
+            file_path = only_file
+            print(f"[default] using only Lean file in current directory: {file_path}")
     theorem = ""
     extra_paths = _prompt("Additional context files (.lean/.tex), comma-separated", default="")
     context_files = _parse_paths(extra_paths)
@@ -852,6 +909,10 @@ def _menu_formalize(config: dict) -> None:
         llm_check_repairs = max(0, int(formalize_cfg.get("llm_check_repairs", 2)))
     except Exception:
         llm_check_repairs = 2
+    try:
+        typecheck_timeout_s = max(5.0, float(formalize_cfg.get("typecheck_timeout_s", 60)))
+    except Exception:
+        typecheck_timeout_s = 60.0
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_file,
@@ -866,6 +927,7 @@ def _menu_formalize(config: dict) -> None:
         proof_k=int(config.get("prove", {}).get("k", 1)),
         proof_timeout_s=5.0,
         proof_repair=proof_repair,
+        typecheck_timeout_s=typecheck_timeout_s,
         dojo_timeout_s=dojo_timeout_s,
         lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
         lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
@@ -967,6 +1029,10 @@ def _menu_formalize_resume(config: dict) -> None:
             llm_check_repairs = max(0, int(formalize_cfg.get("llm_check_repairs", 2)))
         except Exception:
             llm_check_repairs = 2
+        try:
+            typecheck_timeout_s = max(5.0, float(formalize_cfg.get("typecheck_timeout_s", 60)))
+        except Exception:
+            typecheck_timeout_s = 60.0
         dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
         cfg = FormalizationConfig(
             tex_path=tex_path,
@@ -981,6 +1047,7 @@ def _menu_formalize_resume(config: dict) -> None:
             proof_k=int(config.get("prove", {}).get("k", 1)),
             proof_timeout_s=5.0,
             proof_repair=proof_repair,
+            typecheck_timeout_s=typecheck_timeout_s,
             dojo_timeout_s=dojo_timeout_s,
             lemma_max=int(config.get("prove", {}).get("lemma_max", 60)),
             lemma_depth=int(config.get("prove", {}).get("lemma_depth", 60)),
@@ -1073,6 +1140,13 @@ def _menu_formalize_resume(config: dict) -> None:
         snapshot_llm_check_repairs = max(0, int(snapshot.get("llm_check_repairs", llm_check_repairs)))
     except Exception:
         snapshot_llm_check_repairs = llm_check_repairs
+    try:
+        snapshot_typecheck_timeout_s = max(
+            5.0,
+            float(snapshot.get("typecheck_timeout_s", formalize_cfg.get("typecheck_timeout_s", 60))),
+        )
+    except Exception:
+        snapshot_typecheck_timeout_s = 60.0
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     cfg = FormalizationConfig(
         tex_path=tex_path,
@@ -1087,6 +1161,7 @@ def _menu_formalize_resume(config: dict) -> None:
         proof_k=int(snapshot.get("proof_k", 8)),
         proof_timeout_s=float(snapshot.get("proof_timeout_s", 5.0)),
         proof_repair=default_proof_repair,
+        typecheck_timeout_s=snapshot_typecheck_timeout_s,
         dojo_timeout_s=float(snapshot.get("dojo_timeout_s", dojo_timeout_s)),
         lemma_max=int(snapshot.get("lemma_max", config.get("prove", {}).get("lemma_max", 60))),
         lemma_depth=int(snapshot.get("lemma_depth", config.get("prove", {}).get("lemma_depth", 60))),
@@ -1198,6 +1273,8 @@ def _build_args_from_config(
         k=int(prove.get("k", 1)),
         retriever_k=int(prove.get("retriever_k", 8)),
         llm_rounds=int(prove.get("llm_rounds", 4)),
+        llm_allow_helper_lemmas=bool(prove.get("llm_allow_helper_lemmas", True)),
+        llm_edit_scope=str(prove.get("llm_edit_scope", "full")),
         timeout=5.0,
         typecheck_timeout=float(prove.get("typecheck_timeout_s", 60)),
         repair=2,
@@ -1299,6 +1376,20 @@ def _print_lean_file_suggestions(max_items: int = 5) -> None:
         except Exception:
             pass
         print(f"  - {rel}")
+
+
+def _single_lean_file_in_cwd() -> str | None:
+    cwd = Path.cwd()
+    try:
+        candidates = sorted(cwd.glob("*.lean"))
+    except Exception:
+        return None
+    if len(candidates) != 1:
+        return None
+    try:
+        return str(candidates[0].relative_to(cwd))
+    except Exception:
+        return str(candidates[0])
 
 
 def _save_task(kind: str, payload: dict) -> None:

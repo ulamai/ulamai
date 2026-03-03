@@ -26,6 +26,7 @@ class FormalizationConfig:
     proof_k: int
     proof_timeout_s: float
     proof_repair: int
+    typecheck_timeout_s: float
     dojo_timeout_s: float
     lemma_max: int
     lemma_depth: int

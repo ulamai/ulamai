@@ -36,8 +36,19 @@ class FormalizationLLM:
         tex_snippet: str,
         context: str,
         error: str | None = None,
+        allow_helper_lemmas: bool = True,
+        edit_scope: str = "full",
     ) -> str:
-        prompt = _build_proof_prompt(lean_code, name, instruction, tex_snippet, context, error)
+        prompt = _build_proof_prompt(
+            lean_code,
+            name,
+            instruction,
+            tex_snippet,
+            context,
+            error,
+            allow_helper_lemmas=allow_helper_lemmas,
+            edit_scope=edit_scope,
+        )
         return self._call(prompt)
 
     def equivalence_check(self, tex_statement: str, lean_statement: str) -> dict:
@@ -216,16 +227,28 @@ def _build_proof_prompt(
     tex_snippet: str,
     context: str,
     error: str | None,
+    allow_helper_lemmas: bool = True,
+    edit_scope: str = "full",
 ) -> str:
     prompt = (
         "You are a Lean 4 assistant. Output Lean code only.\n"
         f"Task: complete the proof of `{name}` in the Lean file below.\n"
         "- Preserve other declarations and imports.\n"
-        "- You may add helper lemmas before the target declaration if needed.\n"
         "- Do NOT use `sorry` or `admit` in the proof of the target.\n\n"
         "Lean file:\n"
         f"{lean_code}\n\n"
     )
+    if allow_helper_lemmas:
+        prompt += "- You may add helper lemmas before the target declaration if needed.\n"
+    else:
+        prompt += (
+            "- Do NOT add/remove/rename declarations.\n"
+            f"- Only edit the proof body of `{name}`.\n"
+        )
+    if edit_scope == "errors_only":
+        prompt += (
+            "- Edit scope is errors-only: declarations without `sorry`/`admit` must remain unchanged.\n"
+        )
     if instruction:
         prompt += "User guidance:\n" + instruction.strip() + "\n\n"
     if tex_snippet:

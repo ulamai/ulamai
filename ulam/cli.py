@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import statistics
 import hashlib
 import json
@@ -158,6 +159,18 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--beam", type=int, default=4)
     prove.add_argument("--k", type=int, default=1, help="suggestions per state")
     prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
+    prove.add_argument(
+        "--llm-allow-helper-lemmas",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow LLM mode to add helper declarations outside target theorem",
+    )
+    prove.add_argument(
+        "--llm-edit-scope",
+        choices=["full", "errors_only"],
+        default=None,
+        help="LLM mode edit scope (full or lock declarations without placeholders)",
+    )
     prove.add_argument("--timeout", type=float, default=5.0, help="tactic timeout (seconds)")
     prove.add_argument(
         "--typecheck-timeout",
@@ -270,6 +283,12 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--proof-k", type=int, default=1)
     formalize.add_argument("--proof-timeout", type=float, default=5.0)
     formalize.add_argument("--proof-repair", type=int, default=2)
+    formalize.add_argument(
+        "--typecheck-timeout",
+        type=float,
+        default=None,
+        help="Lean typecheck timeout in formalize mode (seconds)",
+    )
     formalize.add_argument(
         "--allow-axioms",
         action=argparse.BooleanOptionalAction,
@@ -720,6 +739,8 @@ def run_prove(args: argparse.Namespace) -> None:
 
 def run_prove_llm(args: argparse.Namespace) -> bool:
     allow_axioms = _resolve_allow_axioms(args)
+    allow_helper_lemmas = _resolve_llm_allow_helper_lemmas(args)
+    edit_scope = _resolve_llm_edit_scope(args)
     try:
         text = args.file.read_text(encoding="utf-8")
     except Exception as exc:
@@ -748,6 +769,17 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
     for round_idx in range(1, max_rounds + 1):
         print(f"[llm] round {round_idx}/{max_rounds}")
         tex_snippet = _extract_tex_snippet(text, args.theorem)
+        round_context = context
+        goal_context = _maybe_query_goal_state_context(
+            text=text,
+            file_path=args.file,
+            theorem=args.theorem,
+            lean_project=project,
+            lean_imports=list(getattr(args, "lean_import", []) or []),
+        )
+        if goal_context:
+            round_context = _append_context_block(round_context, "Current Lean goal state", goal_context)
+            print("[llm] attached current Lean goal state context.")
         print("[llm] requesting proof update...")
         try:
             updated = llm.prove(
@@ -755,8 +787,10 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
                 name=args.theorem,
                 instruction=instruction,
                 tex_snippet=tex_snippet,
-                context=context,
+                context=round_context,
                 error=error,
+                allow_helper_lemmas=allow_helper_lemmas,
+                edit_scope=edit_scope,
             )
         except Exception as exc:
             print(f"[llm] error: {exc}")
@@ -765,6 +799,21 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             print("LLM returned empty output.")
             break
         updated = _normalize_llm_output(updated)
+        scope_error = _llm_scope_guard_error(
+            before=text,
+            after=updated,
+            theorem=args.theorem,
+            allow_helper_lemmas=allow_helper_lemmas,
+            edit_scope=edit_scope,
+        )
+        if scope_error:
+            error = scope_error
+            print(f"[scope] {scope_error}")
+            count = _record_error_count(error_counts, scope_error)
+            if count >= 3:
+                print("[stagnation] same scope error repeated multiple rounds; stopping.")
+                break
+            continue
         if updated.strip() == text.strip():
             print("[stagnation] LLM returned no effective code changes.")
             break
@@ -806,6 +855,53 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
 
     print("Failed to solve with LLM-only mode.")
     return False
+
+
+def _append_context_block(base: str, title: str, body: str) -> str:
+    snippet = (body or "").strip()
+    if not snippet:
+        return base
+    if len(snippet) > 3000:
+        snippet = snippet[:3000].rstrip() + "\n-- (truncated)"
+    block = f"{title}:\n{snippet}"
+    if not base.strip():
+        return block
+    return base.rstrip() + "\n\n" + block
+
+
+def _maybe_query_goal_state_context(
+    text: str,
+    file_path: Path,
+    theorem: str,
+    lean_project: Path | None,
+    lean_imports: list[str],
+) -> str | None:
+    if lean_project is None:
+        return None
+    if not _decl_has_placeholder(text, theorem):
+        return None
+    if importlib.util.find_spec("pantograph") is None:
+        return None
+    try:
+        from .lean.dojo import LeanDojoRunner
+    except Exception:
+        return None
+    runner = None
+    try:
+        runner = LeanDojoRunner(project_path=lean_project, imports=lean_imports or None)
+        state = runner.start(file_path, theorem)
+        pretty = (state.pretty or "").strip()
+        if not pretty:
+            return None
+        return pretty
+    except Exception:
+        return None
+    finally:
+        if runner is not None:
+            try:
+                runner.close()
+            except Exception:
+                pass
 
 
 def run_prove_lemma_first(args: argparse.Namespace) -> None:
@@ -918,6 +1014,10 @@ ULAMAI_DRAFT_END = "-- ULAMAI_DRAFT_PROOF_END"
 
 _LEAN_IDENT_CHARS = "A-Za-z0-9_'"
 _DECL_NAME_PATTERN = re.compile(r"^\s*(?:theorem|lemma|example)\s+([A-Za-z_][A-Za-z0-9_']*)", re.M)
+_TOP_DECL_NAME_PATTERN = re.compile(
+    r"^\s*(?:theorem|lemma|example|def|abbrev|structure)\s+([A-Za-z_][A-Za-z0-9_']*)",
+    re.M,
+)
 _ANY_DECL_START_PATTERN = re.compile(r"^\s*(?:theorem|lemma|example)\s+[A-Za-z_][A-Za-z0-9_']*", re.M)
 _ANY_TOP_DECL_START_PATTERN = re.compile(
     r"^\s*(?:theorem|lemma|example|def|abbrev|structure)\s+[A-Za-z_][A-Za-z0-9_']*",
@@ -1024,6 +1124,55 @@ def _decl_block(text: str, name: str) -> str:
         return ""
     start, end = span
     return text[start:end]
+
+
+def _top_decl_blocks(text: str) -> dict[str, str]:
+    blocks: dict[str, str] = {}
+    for match in _TOP_DECL_NAME_PATTERN.finditer(text):
+        name = match.group(1)
+        span = _top_decl_span(text, name)
+        if span is None:
+            continue
+        start, end = span
+        blocks[name] = text[start:end]
+    return blocks
+
+
+def _llm_scope_guard_error(
+    before: str,
+    after: str,
+    theorem: str,
+    allow_helper_lemmas: bool,
+    edit_scope: str,
+) -> str | None:
+    before_blocks = _top_decl_blocks(before)
+    after_blocks = _top_decl_blocks(after)
+    theorem = theorem.strip()
+    if theorem and theorem not in after_blocks:
+        return f"target declaration `{theorem}` disappeared from file."
+
+    before_names = set(before_blocks)
+    after_names = set(after_blocks)
+    if not allow_helper_lemmas:
+        if before_names != after_names:
+            return "helper declarations are disabled in LLM mode; keep declaration set unchanged."
+        for name in before_names:
+            if name == theorem:
+                continue
+            if before_blocks.get(name) != after_blocks.get(name):
+                return f"helper declarations are disabled; declaration `{name}` was modified."
+
+    if edit_scope == "errors_only":
+        locked = {
+            name
+            for name, block in before_blocks.items()
+            if name != theorem and re.search(r"\b(sorry|admit)\b", block) is None
+        }
+        for name in sorted(locked):
+            if before_blocks.get(name) != after_blocks.get(name):
+                return f"errors-only scope: declaration `{name}` has no placeholders and must not change."
+
+    return None
 
 
 def _count_decl_names(file_path: Path) -> int:
@@ -1468,6 +1617,48 @@ def _resolve_typecheck_timeout(args: argparse.Namespace, config: dict | None = N
             return 60.0
     cfg = config if config is not None else load_config()
     raw = cfg.get("prove", {}).get("typecheck_timeout_s", 60)
+    try:
+        return max(5.0, float(raw))
+    except Exception:
+        return 60.0
+
+
+def _resolve_llm_allow_helper_lemmas(
+    args: argparse.Namespace,
+    config: dict | None = None,
+) -> bool:
+    explicit = getattr(args, "llm_allow_helper_lemmas", None)
+    if explicit is not None:
+        return bool(explicit)
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("prove", {}).get("llm_allow_helper_lemmas", True))
+
+
+def _resolve_llm_edit_scope(
+    args: argparse.Namespace,
+    config: dict | None = None,
+) -> str:
+    explicit = str(getattr(args, "llm_edit_scope", "") or "").strip().lower()
+    if explicit in {"full", "errors_only"}:
+        return explicit
+    cfg = config if config is not None else load_config()
+    raw = str(cfg.get("prove", {}).get("llm_edit_scope", "full")).strip().lower()
+    if raw in {"full", "errors_only"}:
+        return raw
+    return "full"
+
+
+def _resolve_formalize_typecheck_timeout(
+    args: argparse.Namespace, config: dict | None = None
+) -> float:
+    explicit = getattr(args, "typecheck_timeout", None)
+    if explicit is not None:
+        try:
+            return max(5.0, float(explicit))
+        except Exception:
+            return 60.0
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("typecheck_timeout_s", 60)
     try:
         return max(5.0, float(raw))
     except Exception:
@@ -3083,6 +3274,7 @@ def run_formalize(args: argparse.Namespace) -> None:
     max_rounds = max(1, int(args.max_rounds))
     max_repairs = max_rounds if args.max_repairs is None else max(0, int(args.max_repairs))
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
+    typecheck_timeout_s = _resolve_formalize_typecheck_timeout(args, config)
     allow_axioms = _resolve_allow_axioms(args, config)
     llm_check = _resolve_formalize_llm_check(args, config)
     llm_check_timing = _resolve_formalize_llm_check_timing(args, config)
@@ -3100,6 +3292,7 @@ def run_formalize(args: argparse.Namespace) -> None:
         proof_k=args.proof_k,
         proof_timeout_s=args.proof_timeout,
         proof_repair=args.proof_repair,
+        typecheck_timeout_s=typecheck_timeout_s,
         dojo_timeout_s=dojo_timeout_s,
         lemma_max=60,
         lemma_depth=60,
@@ -4361,18 +4554,98 @@ def _llm_config_from_args(args: argparse.Namespace) -> dict:
 
 
 def _normalize_llm_output(text: str) -> str:
-    lines = []
-    in_fence = False
-    for line in text.splitlines():
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            lines.append(line)
-        else:
-            lines.append(line)
-    cleaned = "\n".join(lines).strip()
+    cleaned = _extract_probable_lean_code(text)
+    cleaned = _strip_known_llm_noise_lines(cleaned)
     return cleaned + "\n" if cleaned else ""
+
+
+def _extract_probable_lean_code(text: str) -> str:
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = _extract_code_fence_blocks(raw)
+    if blocks:
+        lean_blocks = [body for lang, body in blocks if "lean" in lang]
+        if lean_blocks:
+            candidate = max(lean_blocks, key=_lean_likeness_score)
+            return candidate.strip()
+        candidate = max((body for _, body in blocks), key=_lean_likeness_score)
+        if _lean_likeness_score(candidate) > 0:
+            return candidate.strip()
+
+    lines = raw.splitlines()
+    start = 0
+    while start < len(lines):
+        line = lines[start].strip()
+        if not line:
+            start += 1
+            continue
+        if _looks_like_lean_line(line):
+            break
+        start += 1
+    candidate = "\n".join(lines[start:]).strip() if start < len(lines) else raw.strip()
+    if _lean_likeness_score(candidate) <= 0:
+        return raw.strip()
+    return candidate
+
+
+def _extract_code_fence_blocks(text: str) -> list[tuple[str, str]]:
+    blocks: list[tuple[str, str]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("```"):
+            i += 1
+            continue
+        lang = line[3:].strip().lower()
+        i += 1
+        body: list[str] = []
+        while i < len(lines) and not lines[i].strip().startswith("```"):
+            body.append(lines[i])
+            i += 1
+        blocks.append((lang, "\n".join(body)))
+        if i < len(lines):
+            i += 1
+    return blocks
+
+
+def _lean_likeness_score(text: str) -> int:
+    score = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _looks_like_lean_line(stripped):
+            score += 2
+        elif stripped.startswith("--") or stripped.startswith("/-") or stripped.startswith("-/"):
+            score += 1
+        else:
+            score -= 1
+    return score
+
+
+def _looks_like_lean_line(line: str) -> bool:
+    pattern = (
+        r"^(import\s+\S+|open\s+\S+|namespace\b|section\b|end\b|"
+        r"variable\b|variables\b|theorem\b|lemma\b|example\b|def\b|abbrev\b|"
+        r"inductive\b|structure\b|class\b|instance\b|axiom\b|constant\b|"
+        r"set_option\b|attribute\b|noncomputable\b|private\b|protected\b|"
+        r"local\b|macro\b|syntax\b|notation\b|infix[lr]?\b|prefix\b|postfix\b|"
+        r"@[A-Za-z_]|#(check|eval|print|reduce|guard)\b)"
+    )
+    return re.match(pattern, line) is not None
+
+
+def _strip_known_llm_noise_lines(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower() in {
+            "data collection is disabled.",
+            "data collection is disabled",
+        }:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _axiom_guardrail_error(text: str, allow_axioms: bool) -> str | None:

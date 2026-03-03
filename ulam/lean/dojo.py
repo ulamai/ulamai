@@ -96,7 +96,19 @@ class LeanDojoRunner(LeanRunner):
                 error="Proof state expired or unknown.",
                 is_solved=False,
             )
-        _ = timeout_s
+        server_timeout_prev: Any = None
+        timeout_overridden = False
+        try:
+            timeout_val = float(timeout_s)
+        except Exception:
+            timeout_val = 0.0
+        if timeout_val > 0 and hasattr(self._server, "timeout"):
+            try:
+                server_timeout_prev = getattr(self._server, "timeout")
+                setattr(self._server, "timeout", max(1.0, timeout_val))
+                timeout_overridden = True
+            except Exception:
+                timeout_overridden = False
         try:
             if _goal_tactic_uses_index(self._server):
                 new_state = self._server.goal_tactic(goal_state, 0, tactic)
@@ -109,6 +121,12 @@ class LeanDojoRunner(LeanRunner):
                 error=str(exc),
                 is_solved=False,
             )
+        finally:
+            if timeout_overridden:
+                try:
+                    setattr(self._server, "timeout", server_timeout_prev)
+                except Exception:
+                    pass
         if _is_solved(new_state):
             return TacticResult(ok=True, new_state=None, error=None, is_solved=True)
         return TacticResult(ok=True, new_state=self._wrap_state(new_state), error=None, is_solved=False)

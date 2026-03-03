@@ -85,6 +85,7 @@ def best_first_search(
                 elapsed_ms = 0
             else:
                 start = time.perf_counter()
+                _log(config, f"[try] {tactic}")
                 result = runner.apply(node.state, tactic, config.timeout_s)
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
                 step_cache[cache_key] = result
@@ -222,6 +223,7 @@ def _attempt_repair(
             if steps_used >= step_budget:
                 continue
             start = time.perf_counter()
+            _log(config, f"[repair-try] {tactic}")
             result = runner.apply(state, tactic, config.timeout_s)
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             step_cache[cache_key] = result
@@ -323,6 +325,7 @@ def scripted_search(
                 _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
                 continue
             start = time.perf_counter()
+            _log(config, f"[try] {tactic}")
             result = runner.apply(state, tactic, config.timeout_s)
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             steps += 1
@@ -362,6 +365,7 @@ def scripted_search(
                     _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
                     continue
                 start = time.perf_counter()
+                _log(config, f"[autop-try] {tactic}")
                 result = runner.apply(state, tactic, config.timeout_s)
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
                 steps += 1

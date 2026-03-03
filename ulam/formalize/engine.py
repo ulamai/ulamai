@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -977,12 +978,28 @@ def _make_llm_client(config: FormalizationConfig):
 
 
 def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
+    project_path = config.lean_project or _find_lean_project(config.output_path)
     if config.lean_backend == "cli":
         from ..lean.cli_check import lean_cli_check
 
         try:
-            project_path = config.lean_project or _find_lean_project(config.output_path)
-            return lean_cli_check(config.output_path, project_path=project_path, timeout_s=60.0)
+            error = lean_cli_check(
+                config.output_path,
+                project_path=project_path,
+                timeout_s=config.typecheck_timeout_s,
+            )
+            if (
+                error
+                and project_path is not None
+                and _looks_like_missing_olean_error(error)
+                and _attempt_project_rebuild(project_path, timeout_s=config.typecheck_timeout_s)
+            ):
+                return lean_cli_check(
+                    config.output_path,
+                    project_path=project_path,
+                    timeout_s=config.typecheck_timeout_s,
+                )
+            return error
         except Exception as exc:
             return str(exc) or repr(exc)
 
@@ -1001,29 +1018,46 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
 
     server = None
     project_path = config.lean_project or _find_project_root(config.output_path)
-    try:
-        parsed_imports, body = _split_imports_for_typecheck(lean_code)
-        imports = _merge_imports(config.lean_imports, parsed_imports)
-        server = _create_server(Server, project_path, imports, timeout_s=config.dojo_timeout_s)
-        server.load_sorry(body)
-        return None
-    except Exception as exc:  # pragma: no cover
-        return _augment_lean_error(
-            str(exc) or repr(exc),
-            output_path=config.output_path,
-            project_path=project_path,
-        )
-    finally:
-        if server is not None:
-            try:
-                server.close()
-            except Exception:
-                pass
+    for attempt in range(2):
+        server = None
+        try:
+            parsed_imports, body = _split_imports_for_typecheck(lean_code)
+            imports = _merge_imports(config.lean_imports, parsed_imports)
+            server = _create_server(Server, project_path, imports, timeout_s=config.dojo_timeout_s)
+            server.load_sorry(body)
+            return None
+        except Exception as exc:  # pragma: no cover
+            message = _augment_lean_error(
+                str(exc) or repr(exc),
+                output_path=config.output_path,
+                project_path=project_path,
+                timeout_s=config.typecheck_timeout_s,
+            )
+            if (
+                attempt == 0
+                and project_path is not None
+                and _looks_like_missing_olean_error(message)
+                and _attempt_project_rebuild(project_path, timeout_s=config.typecheck_timeout_s)
+            ):
+                continue
+            return message
+        finally:
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+    return "Lean typecheck failed"
 
 
-def _augment_lean_error(error: str, output_path: Path, project_path: Path | None) -> str:
+def _augment_lean_error(
+    error: str,
+    output_path: Path,
+    project_path: Path | None,
+    timeout_s: float = 60.0,
+) -> str:
     base = _normalize_lean_error_message(error)
-    detail = _lean_cli_diagnostic(output_path, project_path)
+    detail = _lean_cli_diagnostic(output_path, project_path, timeout_s=timeout_s)
     if not detail:
         return base
     normalized = detail.strip()
@@ -1032,11 +1066,15 @@ def _augment_lean_error(error: str, output_path: Path, project_path: Path | None
     return f"{base}\n\nLean CLI diagnostic:\n{detail}"
 
 
-def _lean_cli_diagnostic(output_path: Path, project_path: Path | None) -> str | None:
+def _lean_cli_diagnostic(
+    output_path: Path,
+    project_path: Path | None,
+    timeout_s: float = 60.0,
+) -> str | None:
     try:
         from ..lean.cli_check import lean_cli_check
 
-        return lean_cli_check(output_path, project_path=project_path, timeout_s=60.0)
+        return lean_cli_check(output_path, project_path=project_path, timeout_s=timeout_s)
     except Exception:
         return None
 
@@ -1058,6 +1096,33 @@ def _normalize_lean_error_message(error: str) -> str:
                     return f"{desc}\n(error: {code})"
                 return desc
     return text
+
+
+def _looks_like_missing_olean_error(error: str) -> bool:
+    text = (error or "").lower()
+    if "object file" in text and "does not exist" in text:
+        return True
+    if "module" in text and "does not exist" in text:
+        return True
+    if ".olean" in text and "does not exist" in text:
+        return True
+    return False
+
+
+def _attempt_project_rebuild(project_path: Path, timeout_s: float = 60.0) -> bool:
+    try:
+        cmd = ["lake", "build"]
+        effective_timeout = max(120.0, timeout_s * 3.0)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(project_path),
+            text=True,
+            capture_output=True,
+            timeout=effective_timeout,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
 
 
 def _error_preview(error: str, max_lines: int = 10, max_chars: int = 900) -> str:
@@ -1139,16 +1204,99 @@ def _replace_sorry(text: str, name: str, proof_lines: list[str]) -> str:
 
 
 def _normalize_lean_output(text: str) -> str:
-    lines = []
-    in_fence = False
-    for line in text.splitlines():
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        lines.append(line)
-    cleaned = "\n".join(lines).strip()
+    cleaned = _extract_probable_lean_code(text)
+    cleaned = _strip_known_llm_noise_lines(cleaned)
     cleaned = _normalize_imports(cleaned)
     return cleaned.strip() + "\n"
+
+
+def _extract_probable_lean_code(text: str) -> str:
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = _extract_code_fence_blocks(raw)
+    if blocks:
+        lean_blocks = [body for lang, body in blocks if "lean" in lang]
+        if lean_blocks:
+            candidate = max(lean_blocks, key=_lean_likeness_score)
+            return candidate.strip()
+        candidate = max((body for _, body in blocks), key=_lean_likeness_score)
+        if _lean_likeness_score(candidate) > 0:
+            return candidate.strip()
+
+    lines = raw.splitlines()
+    start = 0
+    while start < len(lines):
+        line = lines[start].strip()
+        if not line:
+            start += 1
+            continue
+        if _looks_like_lean_line(line):
+            break
+        start += 1
+    candidate = "\n".join(lines[start:]).strip() if start < len(lines) else raw.strip()
+    if _lean_likeness_score(candidate) <= 0:
+        return raw.strip()
+    return candidate
+
+
+def _extract_code_fence_blocks(text: str) -> list[tuple[str, str]]:
+    blocks: list[tuple[str, str]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("```"):
+            i += 1
+            continue
+        lang = line[3:].strip().lower()
+        i += 1
+        body: list[str] = []
+        while i < len(lines) and not lines[i].strip().startswith("```"):
+            body.append(lines[i])
+            i += 1
+        blocks.append((lang, "\n".join(body)))
+        if i < len(lines):
+            i += 1
+    return blocks
+
+
+def _lean_likeness_score(text: str) -> int:
+    score = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _looks_like_lean_line(stripped):
+            score += 2
+        elif stripped.startswith("--") or stripped.startswith("/-") or stripped.startswith("-/"):
+            score += 1
+        else:
+            score -= 1
+    return score
+
+
+def _looks_like_lean_line(line: str) -> bool:
+    pattern = (
+        r"^(import\s+\S+|open\s+\S+|namespace\b|section\b|end\b|"
+        r"variable\b|variables\b|theorem\b|lemma\b|example\b|def\b|abbrev\b|"
+        r"inductive\b|structure\b|class\b|instance\b|axiom\b|constant\b|"
+        r"set_option\b|attribute\b|noncomputable\b|private\b|protected\b|"
+        r"local\b|macro\b|syntax\b|notation\b|infix[lr]?\b|prefix\b|postfix\b|"
+        r"@[A-Za-z_]|#(check|eval|print|reduce|guard)\b)"
+    )
+    return re.match(pattern, line) is not None
+
+
+def _strip_known_llm_noise_lines(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower() in {
+            "data collection is disabled.",
+            "data collection is disabled",
+        }:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _normalize_imports(text: str) -> str:
@@ -1516,6 +1664,7 @@ def _config_snapshot(config: FormalizationConfig) -> dict:
         "proof_k": config.proof_k,
         "proof_timeout_s": config.proof_timeout_s,
         "proof_repair": config.proof_repair,
+        "typecheck_timeout_s": config.typecheck_timeout_s,
         "dojo_timeout_s": config.dojo_timeout_s,
         "lemma_max": config.lemma_max,
         "lemma_depth": config.lemma_depth,

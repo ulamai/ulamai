@@ -71,6 +71,7 @@ def run_segmented_formalize(
             proof_k=config.proof_k,
             proof_timeout_s=config.proof_timeout_s,
             proof_repair=config.proof_repair,
+            typecheck_timeout_s=config.typecheck_timeout_s,
             dojo_timeout_s=config.dojo_timeout_s,
             lemma_max=config.lemma_max,
             lemma_depth=config.lemma_depth,
