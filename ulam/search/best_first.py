@@ -44,9 +44,13 @@ def best_first_search(
     initial_score = _node_score(0, initial_state)
     heapq.heappush(frontier, _Node(score=initial_score, state=initial_state, proof=[]))
     best_seen: dict[str, int] = {initial_state.key: initial_score}
+    best_seen_hash: dict[str, int] = {state_hash(initial_state.pretty): initial_score}
     step_cache: dict[tuple[str, str], TacticResult] = {}
+    tactic_head_attempts: dict[tuple[str, str], int] = {}
+    repair_error_attempts: dict[tuple[str, str], int] = {}
     steps = 0
     best_progress: list[str] = []
+    search_instruction = _search_instruction(config.instruction, config.theorem)
 
     while frontier and steps < config.max_steps:
         node = heapq.heappop(frontier)
@@ -59,17 +63,21 @@ def best_first_search(
             node.state,
             retrieved,
             config.suggestions_per_state,
-            instruction=config.instruction,
+            instruction=search_instruction,
             context=config.context,
             mode=mode,
         )
         if config.autop:
             suggestions = _merge_suggestions(suggestions, _autop_tactics())
+        suggestions = _sanitize_suggestions(suggestions, theorem=config.theorem)
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
         for tactic in suggestions:
             if steps >= config.max_steps:
                 break
+            if not _consume_state_tactic_budget(tactic_head_attempts, node.state.key, tactic):
+                _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
+                continue
             cache_key = (node.state.key, tactic)
             cached = cache_key in step_cache
             if cached:
@@ -102,8 +110,11 @@ def best_first_search(
                     _emit_progress(config, new_proof)
                 score = _node_score(len(new_proof), result.new_state)
                 prev = best_seen.get(result.new_state.key)
-                if prev is None or score < prev:
+                state_h = state_hash(result.new_state.pretty)
+                prev_h = best_seen_hash.get(state_h)
+                if (prev is None or score < prev) and (prev_h is None or score < prev_h):
                     best_seen[result.new_state.key] = score
+                    best_seen_hash[state_h] = score
                     heapq.heappush(frontier, _Node(score=score, state=result.new_state, proof=new_proof))
                     _cap_frontier(frontier, config.beam_width)
                 continue
@@ -111,6 +122,12 @@ def best_first_search(
             if not result.ok and config.repair_attempts > 0:
                 if steps >= config.max_steps:
                     break
+                error_kind = _error_kind(result.error) or "other"
+                if not _allow_repair_for_error_kind(
+                    repair_error_attempts, node.state.key, error_kind
+                ):
+                    _log(config, f"[repair] skipped repeated error kind: {error_kind}")
+                    continue
                 _log(config, f"[repair] tactic failed: {tactic}")
                 repaired = _attempt_repair(
                     runner=runner,
@@ -118,11 +135,14 @@ def best_first_search(
                     retriever=retriever,
                     trace=trace,
                     step_cache=step_cache,
+                    tactic_head_attempts=tactic_head_attempts,
                     state=node.state,
+                    theorem=config.theorem,
                     failed_tactic=tactic,
                     error=result.error or "unknown error",
                     config=config,
                     mode=mode,
+                    instruction=search_instruction,
                     step_budget=max(0, config.max_steps - steps),
                 )
                 steps += repaired.steps_used
@@ -137,8 +157,11 @@ def best_first_search(
                         _emit_progress(config, new_proof)
                     score = _node_score(len(new_proof), repaired.new_state)
                     prev = best_seen.get(repaired.new_state.key)
-                    if prev is None or score < prev:
+                    state_h = state_hash(repaired.new_state.pretty)
+                    prev_h = best_seen_hash.get(state_h)
+                    if (prev is None or score < prev) and (prev_h is None or score < prev_h):
                         best_seen[repaired.new_state.key] = score
+                        best_seen_hash[state_h] = score
                         heapq.heappush(frontier, _Node(score=score, state=repaired.new_state, proof=new_proof))
                         _cap_frontier(frontier, config.beam_width)
 
@@ -159,11 +182,14 @@ def _attempt_repair(
     retriever: Retriever,
     trace: TraceLogger,
     step_cache: dict[tuple[str, str], TacticResult],
+    tactic_head_attempts: dict[tuple[str, str], int],
     state: ProofState,
+    theorem: str,
     failed_tactic: str,
     error: str,
     config: RunConfig,
     mode: str = "tactic",
+    instruction: str | None = None,
     step_budget: int = 0,
 ) -> _RepairResult:
     retrieved = retriever.retrieve(state, k=config.retriever_k)
@@ -173,12 +199,20 @@ def _attempt_repair(
         failed_tactic,
         error,
         config.repair_attempts,
-        instruction=config.instruction,
+        instruction=instruction,
         context=config.context,
         mode=mode,
     )
+    suggestions = _sanitize_suggestions(
+        suggestions,
+        theorem=theorem,
+        reject={failed_tactic},
+    )
     steps_used = 0
     for tactic in suggestions:
+        if not _consume_state_tactic_budget(tactic_head_attempts, state.key, tactic):
+            _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
+            continue
         cache_key = (state.key, tactic)
         cached = cache_key in step_cache
         if cached:
@@ -226,6 +260,9 @@ def scripted_search(
     last_error: str | None = None
     last_tactic: str | None = None
     repair_budget = config.repair_attempts
+    search_instruction = _search_instruction(config.instruction, config.theorem)
+    tactic_head_attempts: dict[tuple[str, str], int] = {}
+    repair_error_attempts: dict[tuple[str, str], int] = {}
 
     while steps < config.max_steps:
         _log(config, f"[state] {state.key} {_summarize_state(state.pretty)}")
@@ -233,32 +270,48 @@ def scripted_search(
         if retrieved:
             _log(config, f"[retriever] {len(retrieved)} premises")
         if last_error and repair_budget > 0:
-            _log(config, "[repair] requesting script")
-            suggestions = llm.repair(
-                state,
-                retrieved,
-                last_tactic or "",
-                last_error,
-                config.suggestions_per_state,
-                instruction=config.instruction,
-                context=config.context,
-                mode="script",
-            )
-            repair_budget -= 1
+            error_kind = _error_kind(last_error) or "other"
+            if _allow_repair_for_error_kind(repair_error_attempts, state.key, error_kind):
+                _log(config, "[repair] requesting script")
+                suggestions = llm.repair(
+                    state,
+                    retrieved,
+                    last_tactic or "",
+                    last_error,
+                    config.suggestions_per_state,
+                    instruction=search_instruction,
+                    context=config.context,
+                    mode="script",
+                )
+                repair_budget -= 1
+            else:
+                _log(config, f"[repair] skipped repeated error kind: {error_kind}")
+                suggestions = []
         else:
             _log(config, f"[llm] requesting script ({config.suggestions_per_state} lines)")
             suggestions = llm.propose(
                 state,
                 retrieved,
                 config.suggestions_per_state,
-                instruction=config.instruction,
+                instruction=search_instruction,
                 context=config.context,
                 mode="script",
             )
             repair_budget = config.repair_attempts
 
+        suggestions = _sanitize_suggestions(
+            suggestions,
+            theorem=config.theorem,
+            reject={last_tactic} if last_tactic else None,
+        )
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
+        elif not (last_error and repair_budget <= 0):
+            # No usable script lines from this pass; continue to fallback / next loop.
+            if config.autop:
+                _log(config, "[policy] no valid script suggestions after filtering")
+            else:
+                return SearchResult(False, proof, steps, "LLM returned no tactics")
         else:
             return SearchResult(False, proof, steps, "LLM returned no tactics")
 
@@ -266,6 +319,9 @@ def scripted_search(
         for tactic in suggestions:
             if steps >= config.max_steps:
                 break
+            if not _consume_state_tactic_budget(tactic_head_attempts, state.key, tactic):
+                _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
+                continue
             start = time.perf_counter()
             result = runner.apply(state, tactic, config.timeout_s)
             elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -302,6 +358,9 @@ def scripted_search(
             for tactic in _autop_tactics():
                 if steps >= config.max_steps:
                     break
+                if not _consume_state_tactic_budget(tactic_head_attempts, state.key, tactic):
+                    _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
+                    continue
                 start = time.perf_counter()
                 result = runner.apply(state, tactic, config.timeout_s)
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -407,11 +466,11 @@ def _format_result(tactic: str, result: TacticResult, cached: bool) -> str:
 
 def _autop_tactics() -> list[str]:
     return [
-        "aesop",
         "simp",
         "ring_nf",
         "linarith",
         "nlinarith",
+        "aesop",
     ]
 
 
@@ -461,3 +520,143 @@ def _error_kind(error: str | None) -> str | None:
     if re.search(r"unexpected token|parse error", text):
         return "parse_error"
     return "other"
+
+
+_EXPENSIVE_TACTIC_STATE_LIMITS: dict[str, int] = {
+    "aesop": 1,
+    "nlinarith": 2,
+    "linarith": 3,
+}
+
+_REPAIR_ERROR_KIND_LIMITS: dict[str, int] = {
+    "unknown_identifier": 1,
+    "parse_error": 1,
+    "timeout": 1,
+    "rewrite_failed": 2,
+    "unsolved_goals": 2,
+    "type_mismatch": 3,
+    "other": 2,
+}
+
+_BLOCKED_TACTIC_HEADS: set[str] = {
+    "admit",
+    "exact?",
+    "apply?",
+    "library_search",
+    "simp?",
+    "aesop?",
+}
+
+
+def _search_instruction(instruction: str | None, theorem: str) -> str:
+    theorem = theorem.strip()
+    extra = (
+        "Do not reference the theorem currently being proved by its name"
+        f" (`{theorem}`) in tactics. It is not available as a premise."
+    )
+    base = instruction.strip() if instruction else ""
+    if base:
+        return base + "\n\n" + extra
+    return extra
+
+
+def _sanitize_suggestions(
+    suggestions: list[str],
+    theorem: str,
+    reject: set[str] | None = None,
+) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    blocked = {item.strip() for item in (reject or set()) if item.strip()}
+    theorem_name = theorem.strip()
+    for raw in suggestions:
+        tactic = (raw or "").strip()
+        if not tactic:
+            continue
+        if _is_disallowed_tactic(tactic):
+            continue
+        if tactic in seen or tactic in blocked:
+            continue
+        if theorem_name and _contains_lean_identifier(tactic, theorem_name):
+            continue
+        seen.add(tactic)
+        cleaned.append(tactic)
+    return cleaned
+
+
+def _contains_lean_identifier(text: str, name: str) -> bool:
+    if not name:
+        return False
+    start = 0
+    while True:
+        idx = text.find(name, start)
+        if idx < 0:
+            return False
+        left = text[idx - 1] if idx > 0 else ""
+        right_idx = idx + len(name)
+        right = text[right_idx] if right_idx < len(text) else ""
+        if not _is_ident_char(left) and not _is_ident_char(right):
+            return True
+        start = idx + 1
+
+
+def _is_ident_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch in {"_", "'"})
+
+
+def _consume_state_tactic_budget(
+    counter: dict[tuple[str, str], int],
+    state_key: str,
+    tactic: str,
+) -> bool:
+    head = _tactic_head(tactic)
+    if not head:
+        return True
+    limit = _EXPENSIVE_TACTIC_STATE_LIMITS.get(head)
+    if limit is None:
+        return True
+    key = (state_key, head)
+    used = counter.get(key, 0)
+    if used >= limit:
+        return False
+    counter[key] = used + 1
+    return True
+
+
+def _tactic_head(tactic: str) -> str:
+    match = re.match(r"\s*([A-Za-z_][A-Za-z0-9_']*)", tactic or "")
+    if not match:
+        return ""
+    return match.group(1).lower()
+
+
+def _is_disallowed_tactic(tactic: str) -> bool:
+    stripped = tactic.strip()
+    lower = stripped.lower()
+    if not stripped:
+        return True
+    if lower in {"sorry", "by sorry", "admit", "by admit"}:
+        return True
+    if lower.startswith("set_option "):
+        return True
+    head = _tactic_head(stripped)
+    if head in _BLOCKED_TACTIC_HEADS:
+        return True
+    if "exact?" in lower or "apply?" in lower or "simp?" in lower:
+        return True
+    return False
+
+
+def _allow_repair_for_error_kind(
+    counter: dict[tuple[str, str], int],
+    state_key: str,
+    error_kind: str,
+) -> bool:
+    kind = (error_kind or "other").strip().lower() or "other"
+    limit = _REPAIR_ERROR_KIND_LIMITS.get(kind, _REPAIR_ERROR_KIND_LIMITS["other"])
+    key = (state_key, kind)
+    used = counter.get(key, 0)
+    if used >= limit:
+        return False
+    counter[key] = used + 1
+    return True
