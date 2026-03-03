@@ -3588,8 +3588,19 @@ def _repair_lean_toolchain(args: argparse.Namespace) -> bool:
     return False
 
 
+def _looks_like_lean_project(path: Path) -> bool:
+    candidate = path.expanduser()
+    if not candidate.exists() or not candidate.is_dir():
+        return False
+    return (
+        (candidate / "lakefile.lean").exists()
+        or (candidate / "lakefile.toml").exists()
+        or (candidate / "lean-toolchain").exists()
+    )
+
+
 def _find_lean_project_for_file(file_path: Path) -> Path | None:
-    root = file_path.parent
+    root = file_path if file_path.is_dir() else file_path.parent
     for parent in [root, *root.parents]:
         if (
             (parent / "lakefile.lean").exists()
@@ -3597,6 +3608,33 @@ def _find_lean_project_for_file(file_path: Path) -> Path | None:
             or (parent / "lean-toolchain").exists()
         ):
             return parent
+    return None
+
+
+def _resolve_formalize_lean_project(
+    *,
+    args: argparse.Namespace,
+    config: dict,
+    tex_path: Path,
+    output_path: Path,
+) -> Path | None:
+    explicit = getattr(args, "lean_project", None)
+    if explicit is not None:
+        candidate = Path(explicit).expanduser()
+        if _looks_like_lean_project(candidate):
+            return candidate
+        print(f"[formalize] ignoring invalid --lean-project path: {candidate}")
+
+    configured_raw = str(config.get("lean", {}).get("project", "") or "").strip()
+    if configured_raw:
+        configured = Path(configured_raw).expanduser()
+        if _looks_like_lean_project(configured):
+            return configured
+
+    for probe in (output_path, tex_path, Path.cwd()):
+        detected = _find_lean_project_for_file(probe)
+        if detected is not None:
+            return detected
     return None
 
 
@@ -3767,6 +3805,18 @@ def run_formalize(args: argparse.Namespace) -> None:
         sys.exit(1)
     output_path = args.out if args.out else tex_path.with_suffix(".lean")
     context_files = [Path(p) for p in args.context]
+    lean_project = _resolve_formalize_lean_project(
+        args=args,
+        config=config,
+        tex_path=tex_path,
+        output_path=output_path,
+    )
+    if lean_project is not None:
+        configured = str(config.get("lean", {}).get("project", "") or "").strip()
+        if configured != str(lean_project):
+            config.setdefault("lean", {})["project"] = str(lean_project)
+            save_config(config)
+        print(f"Detected Lean project: {lean_project}")
 
     proof_backend = args.proof_backend
     if proof_backend == "dojo":
@@ -3774,6 +3824,8 @@ def run_formalize(args: argparse.Namespace) -> None:
     lean_backend = args.lean_backend
     if proof_backend == "llm":
         lean_backend = "cli"
+    if lean_project is None and proof_backend in {"tactic", "lemma"}:
+        print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
     max_rounds = max(1, int(args.max_rounds))
     max_repairs = max_rounds if args.max_repairs is None else max(0, int(args.max_repairs))
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
@@ -3800,7 +3852,7 @@ def run_formalize(args: argparse.Namespace) -> None:
         lemma_max=60,
         lemma_depth=60,
         allow_axioms=allow_axioms,
-        lean_project=args.lean_project,
+        lean_project=lean_project,
         lean_imports=args.lean_import,
         verbose=bool(args.verbose),
         proof_backend=proof_backend,

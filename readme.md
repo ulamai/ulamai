@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.17)
+## Status (v0.1.18)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.17 highlights:** added `checkpoint`/`review` read-only diagnostics, strict proof profile (`normal|strict`) policy controls, and LLM cycle patience/replan hints to reduce repeated non-progress loops
+- **v0.1.18 highlights:** formalize mode now auto-detects and persists Lean project paths (CLI + interactive/resume flows), so tactic/lemma proof-search no longer requires manual `--lean-project` in normal project layouts
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

@@ -941,8 +941,7 @@ def _menu_formalize(config: dict) -> None:
         print(f"File not found: {tex_file}")
         return
 
-    lean_project_raw = config.get("lean", {}).get("project", "")
-    lean_project = Path(lean_project_raw) if lean_project_raw else None
+    lean_project = _resolve_formalize_lean_project(config, Path(output_path), tex_file)
     formalize_cfg = config.get("formalize", {})
     proof_backend = formalize_cfg.get("proof_backend", "inherit")
     if proof_backend == "inherit":
@@ -952,6 +951,8 @@ def _menu_formalize(config: dict) -> None:
     if proof_backend not in {"tactic", "lemma", "llm"}:
         proof_backend = "tactic"
     lean_backend = formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo")
+    if lean_project is None and proof_backend in {"tactic", "lemma"}:
+        print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
     try:
         max_rounds = max(1, int(formalize_cfg.get("max_rounds", 5)))
     except Exception:
@@ -1059,8 +1060,7 @@ def _menu_formalize_resume(config: dict) -> None:
         tex_path = Path(manifest.get("tex_path", "")).expanduser()
         output_path = Path(manifest.get("output_path", "")).expanduser()
         context_files = [Path(p) for p in manifest.get("context_files", []) if p]
-        lean_project_raw = config.get("lean", {}).get("project", "")
-        lean_project = Path(lean_project_raw) if lean_project_raw else None
+        lean_project = _resolve_formalize_lean_project(config, output_path, tex_path)
         proof_backend = config.get("formalize", {}).get("proof_backend", "inherit")
         if proof_backend == "inherit":
             proof_backend = config.get("prove", {}).get("mode", "tactic")
@@ -1068,6 +1068,8 @@ def _menu_formalize_resume(config: dict) -> None:
             proof_backend = "tactic"
         if proof_backend not in {"tactic", "lemma", "llm"}:
             proof_backend = "tactic"
+        if lean_project is None and proof_backend in {"tactic", "lemma"}:
+            print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
         lean_backend = config.get("formalize", {}).get(
             "lean_backend", "cli" if proof_backend == "llm" else "dojo"
         )
@@ -1153,13 +1155,16 @@ def _menu_formalize_resume(config: dict) -> None:
         print("Could not locate a prior Lean file to resume from.")
         return
     print(f"Resuming from: {resume_path}")
-    lean_project_raw = config.get("lean", {}).get("project", "")
-    lean_project = Path(lean_project_raw) if lean_project_raw else None
+    lean_project = _resolve_formalize_lean_project(config, output_path, tex_path, resume_path)
     snapshot_project = snapshot.get("lean_project")
     if snapshot_project:
         candidate = Path(snapshot_project)
-        if candidate.exists():
+        if _looks_like_lean_project(candidate):
             lean_project = candidate
+            lean_cfg = config.setdefault("lean", {})
+            if str(lean_cfg.get("project", "") or "").strip() != str(candidate):
+                lean_cfg["project"] = str(candidate)
+                save_config(config)
     context_files = [Path(p) for p in snapshot.get("context_files", []) if p]
     formalize_cfg = config.get("formalize", {})
     proof_backend = snapshot.get("proof_backend", formalize_cfg.get("proof_backend", "inherit"))
@@ -1169,6 +1174,8 @@ def _menu_formalize_resume(config: dict) -> None:
         proof_backend = "tactic"
     if proof_backend not in {"tactic", "lemma", "llm"}:
         proof_backend = "tactic"
+    if lean_project is None and proof_backend in {"tactic", "lemma"}:
+        print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
     lean_backend = snapshot.get(
         "lean_backend",
         formalize_cfg.get("lean_backend", "cli" if proof_backend == "llm" else "dojo"),
@@ -1613,6 +1620,31 @@ def _ensure_lean_backend(
     if require_dojo and not _lean_dojo_available():
         return _handle_missing_dojo()
     return True, chosen
+
+
+def _resolve_formalize_lean_project(config: dict, *hints: Path) -> Path | None:
+    lean = config.setdefault("lean", {})
+    project_raw = str(lean.get("project", "") or "").strip()
+    if project_raw:
+        configured = Path(project_raw).expanduser()
+        if _looks_like_lean_project(configured):
+            return configured
+
+    detected: Path | None = None
+    for hint in hints:
+        detected = _find_lean_project(hint)
+        if detected is not None:
+            break
+    if detected is None:
+        detected = _find_lean_project(Path.cwd())
+    if detected is None:
+        return None
+
+    if str(lean.get("project", "") or "").strip() != str(detected):
+        lean["project"] = str(detected)
+        save_config(config)
+    print(f"Detected Lean project: {detected}")
+    return detected
 
 
 def _handle_missing_dojo() -> tuple[bool, Path | None]:
