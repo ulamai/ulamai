@@ -9,8 +9,15 @@ from ..types import ProofState
 
 
 class GeminiCLIClient(LLMClient):
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        timeout_s: float | None = None,
+        heartbeat_s: float | None = None,
+    ) -> None:
         self._model = model
+        self._timeout_s = timeout_s
+        self._heartbeat_s = heartbeat_s
         _ensure_cmd("gemini")
 
     def propose(
@@ -25,7 +32,13 @@ class GeminiCLIClient(LLMClient):
         system, user = build_prompt(
             state, retrieved, k, instruction=instruction, context=context, mode=mode
         )
-        text = gemini_exec(system, user, model=self._model)
+        text = gemini_exec(
+            system,
+            user,
+            model=self._model,
+            timeout_s=self._timeout_s,
+            heartbeat_s=self._heartbeat_s,
+        )
         return parse_tactics(text, k)
 
 

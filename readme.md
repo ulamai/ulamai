@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.15)
+## Status (v0.1.16)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.15 highlights:** benchmark mini-pipeline shipped (suite validation/comparison/campaign runner), new `bench-make-minif2f` suite builder for apples-to-apples evaluations, and improved benchmark report/metadata flow for reproducible model comparisons
+- **v0.1.16 highlights:** benchmark runtime observability improved with flushed live progress output and configurable CLI LLM timeout/heartbeat wiring (Codex/Claude/Gemini CLI backends), making long benchmark runs easier to monitor and debug
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

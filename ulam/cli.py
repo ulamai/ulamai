@@ -3257,19 +3257,20 @@ def run_bench(args: argparse.Namespace) -> None:
         status = "solved" if result.solved else "failed"
         print(
             f"[{idx}/{len(cases)}] {theorem}: {status} "
-            f"(steps={result.steps}, time={duration_s:.2f}s)"
+            f"(steps={result.steps}, time={duration_s:.2f}s)",
+            flush=True,
         )
 
-    print(f"Total: {len(cases)}")
-    print(f"Solved: {solved}")
+    print(f"Total: {len(cases)}", flush=True)
+    print(f"Solved: {solved}", flush=True)
     if results:
         success_rate = (100.0 * solved) / len(results)
-        print(f"Success rate: {success_rate:.1f}%")
-        print(f"Median steps: {statistics.median(step_counts):.1f}")
-        print(f"Median time: {statistics.median(durations_s):.2f}s")
+        print(f"Success rate: {success_rate:.1f}%", flush=True)
+        print(f"Median steps: {statistics.median(step_counts):.1f}", flush=True)
+        print(f"Median time: {statistics.median(durations_s):.2f}s", flush=True)
     if error_kinds:
         summary = ", ".join(f"{name}={count}" for name, count in error_kinds.most_common(5))
-        print(f"Top failure kinds: {summary}")
+        print(f"Top failure kinds: {summary}", flush=True)
 
     finished_at_epoch = time.time()
     summary_payload = _build_bench_summary(
@@ -3286,13 +3287,18 @@ def run_bench(args: argparse.Namespace) -> None:
         sem_unknown = int(summary_payload.get("semantic_unknown_cases", 0) or 0)
         print(
             f"Semantic verdicts: pass={sem_pass}, fail={sem_fail}, unknown={sem_unknown} "
-            f"(available={semantic_available})"
+            f"(available={semantic_available})",
+            flush=True,
         )
-        print(f"Semantic pass rate: {float(summary_payload.get('semantic_pass_rate_percent', 0.0)):.1f}%")
+        print(
+            f"Semantic pass rate: {float(summary_payload.get('semantic_pass_rate_percent', 0.0)):.1f}%",
+            flush=True,
+        )
     print(
         "Regression rejection rate: "
         f"{float(summary_payload.get('regression_rejection_rate_percent', 0.0)):.1f}% "
-        f"({int(summary_payload.get('cases_with_regression_rejections', 0) or 0)}/{len(results)} cases)"
+        f"({int(summary_payload.get('cases_with_regression_rejections', 0) or 0)}/{len(results)} cases)",
+        flush=True,
     )
     report_payload = {
         "schema": 1,
@@ -4231,6 +4237,7 @@ def _make_runner(args: argparse.Namespace) -> LeanRunner:
 
 
 def _make_llm(args: argparse.Namespace):
+    llm_timeout_s, llm_heartbeat_s = _resolve_cli_llm_runtime_settings()
     if args.llm == "mock":
         return MockLLMClient()
     if args.llm == "openai":
@@ -4260,12 +4267,56 @@ def _make_llm(args: argparse.Namespace):
         )
     if args.llm == "codex_cli":
         model = args.openai_model or None
-        return CodexCLIClient(model=model)
+        return CodexCLIClient(
+            model=model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     if args.llm == "claude_cli":
-        return ClaudeCLIClient(model=args.anthropic_model or None)
+        return ClaudeCLIClient(
+            model=args.anthropic_model or None,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     if args.llm == "gemini_cli":
-        return GeminiCLIClient(model=args.gemini_model or None)
+        return GeminiCLIClient(
+            model=args.gemini_model or None,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     raise RuntimeError(f"unknown LLM backend: {args.llm}")
+
+
+def _resolve_cli_llm_runtime_settings() -> tuple[float | None, float | None]:
+    timeout_s: float | None = None
+    heartbeat_s: float | None = 60.0
+    try:
+        cfg = load_config()
+    except Exception:
+        return timeout_s, heartbeat_s
+
+    llm_cfg = cfg.get("llm", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(llm_cfg, dict):
+        return timeout_s, heartbeat_s
+
+    raw_timeout = llm_cfg.get("timeout_s", 0)
+    raw_heartbeat = llm_cfg.get("heartbeat_s", 60)
+    try:
+        timeout_val = float(raw_timeout)
+    except Exception:
+        timeout_val = 0.0
+    try:
+        heartbeat_val = float(raw_heartbeat)
+    except Exception:
+        heartbeat_val = 60.0
+
+    if timeout_val > 0:
+        timeout_s = timeout_val
+    if heartbeat_val <= 0:
+        heartbeat_s = None
+    else:
+        heartbeat_s = heartbeat_val
+    return timeout_s, heartbeat_s
 
 
 def _llm_config_from_args(args: argparse.Namespace) -> dict:

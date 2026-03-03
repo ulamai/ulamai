@@ -23,6 +23,7 @@ def codex_exec(
     timeout_s: float | None = None,
     heartbeat_s: float | None = None,
 ) -> str:
+    heartbeat_s = _resolve_heartbeat_interval(heartbeat_s)
     with tempfile.TemporaryDirectory() as tmpdir:
         out_path = Path(tmpdir) / "codex_out.txt"
         cmd = [
@@ -63,7 +64,7 @@ def codex_exec(
                 now = time.time()
                 if heartbeat_s and heartbeat_s > 0 and now - last_beat >= heartbeat_s:
                     elapsed = int(now - start)
-                    print(f"[llm] still running ({elapsed}s)...")
+                    print(f"[llm] still running ({elapsed}s)...", flush=True)
                     last_beat = now
                 if timeout_s and timeout_s > 0 and now - start >= timeout_s:
                     proc.kill()
@@ -82,6 +83,7 @@ def claude_print(
     timeout_s: float | None = None,
     heartbeat_s: float | None = None,
 ) -> str:
+    heartbeat_s = _resolve_heartbeat_interval(heartbeat_s)
     cmd = [
         "claude",
         "-p",
@@ -110,6 +112,7 @@ def gemini_exec(
     timeout_s: float | None = None,
     heartbeat_s: float | None = None,
 ) -> str:
+    heartbeat_s = _resolve_heartbeat_interval(heartbeat_s)
     prompt = system_prompt.strip() + "\n\n" + user_prompt.strip()
     cmd = ["gemini", "-p", prompt]
     if model:
@@ -142,7 +145,7 @@ def _gemini_exec_impl(
             now = time.time()
             if heartbeat_s and heartbeat_s > 0 and now - last_beat >= heartbeat_s:
                 elapsed = int(now - start)
-                print(f"[llm] still running ({elapsed}s)...")
+                print(f"[llm] still running ({elapsed}s)...", flush=True)
                 last_beat = now
             if timeout_s and timeout_s > 0 and now - start >= timeout_s:
                 proc.kill()
@@ -214,7 +217,7 @@ def _claude_print_impl(
             now = time.time()
             if heartbeat_s and heartbeat_s > 0 and now - last_beat >= heartbeat_s:
                 elapsed = int(now - start)
-                print(f"[llm] still running ({elapsed}s)...")
+                print(f"[llm] still running ({elapsed}s)...", flush=True)
                 last_beat = now
             if timeout_s and timeout_s > 0 and now - start >= timeout_s:
                 proc.kill()
@@ -241,3 +244,12 @@ def _claude_auth_login() -> None:
         subprocess.run(["claude", "auth", "login"], check=False)
     except Exception:
         return
+
+
+def _resolve_heartbeat_interval(value: float | None) -> float:
+    if value is not None:
+        try:
+            return max(0.0, float(value))
+        except Exception:
+            return 60.0
+    return 60.0
