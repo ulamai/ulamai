@@ -7,14 +7,22 @@ from typing import Iterable
 
 from .base import LLMClient
 from .prompt import build_prompt, parse_tactics
+from .runtime import run_with_runtime_controls
 from ..types import ProofState
 
 
 class OllamaClient(LLMClient):
-    def __init__(self, base_url: str, model: str, timeout_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_s: float | None = 60.0,
+        heartbeat_s: float | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout_s = timeout_s
+        self._heartbeat_s = heartbeat_s
 
     def propose(
         self,
@@ -56,8 +64,11 @@ class OllamaClient(LLMClient):
                 headers={"Content-Type": "application/json"},
             )
             try:
-                with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
-                    raw = resp.read().decode("utf-8")
+                raw = run_with_runtime_controls(
+                    lambda req=req: _urlopen_read(req, self._timeout_s),
+                    timeout_s=self._timeout_s,
+                    heartbeat_s=self._heartbeat_s,
+                )
                 content = _extract_content(raw)
                 return parse_tactics(content, k)
             except urllib.error.HTTPError as exc:
@@ -85,3 +96,9 @@ def _extract_content(raw: str) -> str:
     if "response" in data and isinstance(data["response"], str):
         return data["response"]
     raise RuntimeError("Ollama response missing content")
+
+
+def _urlopen_read(req: urllib.request.Request, timeout_s: float | None) -> str:
+    timeout = timeout_s if timeout_s and timeout_s > 0 else None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")

@@ -933,21 +933,30 @@ def _make_llm_client(config: FormalizationConfig):
     )
 
     cfg = _load_global_config()
+    llm_timeout_s, llm_heartbeat_s = _resolve_llm_runtime_settings(cfg)
     provider = cfg.get("llm_provider", "openai")
     if provider == "openai":
         return OpenAICompatClient(
             api_key=cfg.get("openai", {}).get("api_key", "") or "",
             base_url=cfg.get("openai", {}).get("base_url", "https://api.openai.com"),
             model=cfg.get("openai", {}).get("model", "gpt-4.1"),
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if provider == "codex_cli":
         openai_cfg = cfg.get("openai", {})
         model = openai_cfg.get("codex_model") or openai_cfg.get("model") or "gpt-5.2-codex"
-        return CodexCLIClient(model=model)
+        return CodexCLIClient(
+            model=model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     if provider == "ollama":
         return OllamaClient(
             base_url=cfg.get("ollama", {}).get("base_url", "http://localhost:11434"),
             model=cfg.get("ollama", {}).get("model", "llama3.1"),
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if provider == "anthropic":
         token = cfg.get("anthropic", {}).get("api_key", "") or cfg.get("anthropic", {}).get("setup_token", "")
@@ -955,11 +964,17 @@ def _make_llm_client(config: FormalizationConfig):
             api_key=token,
             base_url=cfg.get("anthropic", {}).get("base_url", "https://api.anthropic.com"),
             model=cfg.get("anthropic", {}).get("model", "claude-3-5-sonnet-20240620"),
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if provider == "claude_cli":
         anthropic_cfg = cfg.get("anthropic", {})
         model = anthropic_cfg.get("claude_model") or anthropic_cfg.get("model") or "claude-3-5-sonnet-20240620"
-        return ClaudeCLIClient(model=model)
+        return ClaudeCLIClient(
+            model=model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     if provider == "gemini":
         gemini_cfg = cfg.get("gemini", {})
         api_key = gemini_cfg.get("api_key", "") or os.environ.get("ULAM_GEMINI_API_KEY", "") or os.environ.get(
@@ -969,12 +984,45 @@ def _make_llm_client(config: FormalizationConfig):
             api_key=api_key,
             base_url=gemini_cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai"),
             model=gemini_cfg.get("model", "gemini-3.1-pro-preview"),
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if provider == "gemini_cli":
         gemini_cfg = cfg.get("gemini", {})
         model = gemini_cfg.get("cli_model") or gemini_cfg.get("model") or "gemini-3.1-pro-preview"
-        return GeminiCLIClient(model=model)
+        return GeminiCLIClient(
+            model=model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     raise RuntimeError("No LLM provider configured")
+
+
+def _resolve_llm_runtime_settings(cfg: dict) -> tuple[float | None, float | None]:
+    timeout_s: float | None = None
+    heartbeat_s: float | None = 60.0
+    llm_cfg = cfg.get("llm", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(llm_cfg, dict):
+        return timeout_s, heartbeat_s
+
+    raw_timeout = llm_cfg.get("timeout_s", 0)
+    raw_heartbeat = llm_cfg.get("heartbeat_s", 60)
+    try:
+        timeout_val = float(raw_timeout)
+    except Exception:
+        timeout_val = 0.0
+    try:
+        heartbeat_val = float(raw_heartbeat)
+    except Exception:
+        heartbeat_val = 60.0
+
+    if timeout_val > 0:
+        timeout_s = timeout_val
+    if heartbeat_val <= 0:
+        heartbeat_s = None
+    else:
+        heartbeat_s = heartbeat_val
+    return timeout_s, heartbeat_s
 
 
 def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:

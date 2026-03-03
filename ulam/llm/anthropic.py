@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .base import LLMClient
 from .prompt import build_prompt, parse_tactics
+from .runtime import run_with_runtime_controls
 from ..types import ProofState
 
 
@@ -16,7 +17,8 @@ class AnthropicClient(LLMClient):
         base_url: str = "https://api.anthropic.com",
         model: str = "claude-3-5-sonnet-20240620",
         temperature: float = 0.2,
-        timeout_s: float = 60.0,
+        timeout_s: float | None = 60.0,
+        heartbeat_s: float | None = None,
         api_version: str = "2023-06-01",
     ) -> None:
         if not api_key:
@@ -26,6 +28,7 @@ class AnthropicClient(LLMClient):
         self._model = model
         self._temperature = temperature
         self._timeout_s = timeout_s
+        self._heartbeat_s = heartbeat_s
         self._api_version = api_version
 
     def propose(
@@ -59,8 +62,11 @@ class AnthropicClient(LLMClient):
                 "anthropic-version": self._api_version,
             },
         )
-        with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
-            raw = resp.read().decode("utf-8")
+        raw = run_with_runtime_controls(
+            lambda: _urlopen_read(req, self._timeout_s),
+            timeout_s=self._timeout_s,
+            heartbeat_s=self._heartbeat_s,
+        )
         content = _extract_content(raw)
         return parse_tactics(content, k)
 
@@ -78,3 +84,9 @@ def _extract_content(raw: str) -> str:
     if "text" in data and isinstance(data["text"], str):
         return data["text"]
     raise RuntimeError("Anthropic response missing content")
+
+
+def _urlopen_read(req: urllib.request.Request, timeout_s: float | None) -> str:
+    timeout = timeout_s if timeout_s and timeout_s > 0 else None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")

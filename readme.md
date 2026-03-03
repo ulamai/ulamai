@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.18)
+## Status (v0.1.19)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.18 highlights:** formalize mode now auto-detects and persists Lean project paths (CLI + interactive/resume flows), so tactic/lemma proof-search no longer requires manual `--lean-project` in normal project layouts
+- **v0.1.19 highlights:** unified LLM runtime controls across providers: `llm.timeout_s` and `llm.heartbeat_s` now apply consistently to Ollama/API providers as well as CLI providers (including formalize path)
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

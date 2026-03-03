@@ -4995,15 +4995,24 @@ def _make_llm(args: argparse.Namespace):
             api_key=args.openai_key,
             base_url=args.openai_base_url,
             model=args.openai_model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if args.llm == "ollama":
-        return OllamaClient(base_url=args.ollama_base_url, model=args.ollama_model)
+        return OllamaClient(
+            base_url=args.ollama_base_url,
+            model=args.ollama_model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
+        )
     if args.llm == "anthropic":
         token = args.anthropic_key or args.anthropic_setup_token
         return AnthropicClient(
             api_key=token,
             base_url=args.anthropic_base_url,
             model=args.anthropic_model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if args.llm == "gemini":
         if not args.gemini_api_key:
@@ -5012,6 +5021,8 @@ def _make_llm(args: argparse.Namespace):
             api_key=args.gemini_api_key,
             base_url=args.gemini_base_url,
             model=args.gemini_model,
+            timeout_s=llm_timeout_s,
+            heartbeat_s=llm_heartbeat_s,
         )
     if args.llm == "codex_cli":
         model = args.openai_model or None

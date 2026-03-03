@@ -6,6 +6,8 @@ import urllib.error
 import urllib.request
 from typing import Iterable
 
+from ..llm.runtime import run_with_runtime_controls
+
 
 class FormalizationLLM:
     def __init__(self, provider: str, config: dict) -> None:
@@ -483,8 +485,12 @@ def _call_openai(config: dict, prompt: str) -> str:
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urllib.request.urlopen(req, timeout=120.0) as resp:
-        raw = resp.read().decode("utf-8")
+    timeout_s, heartbeat_s = _llm_runtime_settings(config)
+    raw = run_with_runtime_controls(
+        lambda: _urlopen_read(req, timeout_s),
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
     return _extract_openai(raw)
 
 
@@ -512,6 +518,7 @@ def _call_ollama(config: dict, prompt: str) -> str:
     seen = set()
     endpoints = [url for url in endpoints if not (url in seen or seen.add(url))]
     last_error: Exception | None = None
+    timeout_s, heartbeat_s = _llm_runtime_settings(config)
     for url in endpoints:
         req = urllib.request.Request(
             url,
@@ -519,8 +526,11 @@ def _call_ollama(config: dict, prompt: str) -> str:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=120.0) as resp:
-                raw = resp.read().decode("utf-8")
+            raw = run_with_runtime_controls(
+                lambda req=req: _urlopen_read(req, timeout_s),
+                timeout_s=timeout_s,
+                heartbeat_s=heartbeat_s,
+            )
             return _extract_ollama(raw)
         except urllib.error.HTTPError as exc:
             last_error = exc
@@ -558,8 +568,12 @@ def _call_anthropic(config: dict, prompt: str) -> str:
             "anthropic-version": "2023-06-01",
         },
     )
-    with urllib.request.urlopen(req, timeout=120.0) as resp:
-        raw = resp.read().decode("utf-8")
+    timeout_s, heartbeat_s = _llm_runtime_settings(config)
+    raw = run_with_runtime_controls(
+        lambda: _urlopen_read(req, timeout_s),
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
     return _extract_anthropic(raw)
 
 
@@ -592,9 +606,36 @@ def _call_gemini(config: dict, prompt: str) -> str:
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urllib.request.urlopen(req, timeout=120.0) as resp:
-        raw = resp.read().decode("utf-8")
+    timeout_s, heartbeat_s = _llm_runtime_settings(config)
+    raw = run_with_runtime_controls(
+        lambda: _urlopen_read(req, timeout_s),
+        timeout_s=timeout_s,
+        heartbeat_s=heartbeat_s,
+    )
     return _extract_openai(raw)
+
+
+def _llm_runtime_settings(config: dict) -> tuple[float | None, float | None]:
+    llm_cfg = config.get("llm", {})
+    if not isinstance(llm_cfg, dict):
+        return None, 60.0
+    try:
+        timeout = float(llm_cfg.get("timeout_s", 0))
+    except Exception:
+        timeout = 0.0
+    try:
+        heartbeat = float(llm_cfg.get("heartbeat_s", 60))
+    except Exception:
+        heartbeat = 60.0
+    timeout_s: float | None = timeout if timeout > 0 else None
+    heartbeat_s: float | None = heartbeat if heartbeat > 0 else None
+    return timeout_s, heartbeat_s
+
+
+def _urlopen_read(req: urllib.request.Request, timeout_s: float | None) -> str:
+    timeout = timeout_s if timeout_s and timeout_s > 0 else None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
 
 
 def _extract_openai(raw: str) -> str:

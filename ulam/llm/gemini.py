@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .base import LLMClient
 from .prompt import build_prompt, parse_tactics
+from .runtime import run_with_runtime_controls
 from ..types import ProofState
 
 
@@ -16,7 +17,8 @@ class GeminiClient(LLMClient):
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
         model: str = "gemini-3.1-pro-preview",
         temperature: float = 0.2,
-        timeout_s: float = 60.0,
+        timeout_s: float | None = 60.0,
+        heartbeat_s: float | None = None,
     ) -> None:
         if not api_key:
             raise RuntimeError("Gemini API key is required.")
@@ -25,6 +27,7 @@ class GeminiClient(LLMClient):
         self._model = model
         self._temperature = temperature
         self._timeout_s = timeout_s
+        self._heartbeat_s = heartbeat_s
 
     def propose(
         self,
@@ -56,8 +59,11 @@ class GeminiClient(LLMClient):
                 "Authorization": f"Bearer {self._api_key}",
             },
         )
-        with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
-            raw = resp.read().decode("utf-8")
+        raw = run_with_runtime_controls(
+            lambda: _urlopen_read(req, self._timeout_s),
+            timeout_s=self._timeout_s,
+            heartbeat_s=self._heartbeat_s,
+        )
         content = _extract_content(raw)
         return parse_tactics(content, k)
 
@@ -82,3 +88,9 @@ def _extract_content(raw: str) -> str:
     if "text" in msg:
         return msg["text"]
     raise RuntimeError("Gemini response missing content")
+
+
+def _urlopen_read(req: urllib.request.Request, timeout_s: float | None) -> str:
+    timeout = timeout_s if timeout_s and timeout_s > 0 else None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
