@@ -196,6 +196,14 @@ def _configure_prover(config: dict) -> None:
 
 
 def _configure_prover_all(config: dict) -> None:
+    policy = config.setdefault("policy", {})
+    profile_raw = _prompt(
+        "Proof profile (normal|strict)",
+        default=str(policy.get("proof_profile", "normal")),
+    ).strip().lower()
+    profile = _normalize_proof_profile(profile_raw)
+    policy["proof_profile"] = profile
+
     prove = config.setdefault("prove", {})
     mode = _prompt("Default proof mode (tactic|lemma|llm)", default=prove.get("mode", "tactic")).strip().lower()
     if mode not in {"tactic", "lemma", "llm"}:
@@ -248,6 +256,15 @@ def _configure_prover_all(config: dict) -> None:
         prove["llm_rounds"] = max(1, int(llm_rounds_raw))
     except Exception:
         prove["llm_rounds"] = 4
+    cycle_patience_default = str(prove.get("llm_cycle_patience", 2))
+    cycle_patience_raw = _prompt(
+        "LLM cycle patience (rounds without progress)",
+        default=cycle_patience_default,
+    ).strip()
+    try:
+        prove["llm_cycle_patience"] = max(1, int(cycle_patience_raw))
+    except Exception:
+        prove["llm_cycle_patience"] = 2
     allow_helpers_default = "y" if prove.get("llm_allow_helper_lemmas", True) else "n"
     allow_helpers_raw = _prompt(
         "LLM mode allow helper lemmas (Y/n)",
@@ -387,9 +404,12 @@ def _configure_prover_all(config: dict) -> None:
     except Exception:
         formalize["llm_check_repairs"] = 2
 
+    _apply_proof_profile_config(config, profile)
+
 
 def _configure_prover_single(config: dict) -> None:
     settings: list[tuple[str, str]] = [
+        ("policy.proof_profile", "Proof profile"),
         ("prove.mode", "Default proof mode"),
         ("prove.solver", "Default solver"),
         ("prove.autop", "Enable autop tactics"),
@@ -399,6 +419,7 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.retriever_build", "Auto retriever index build"),
         ("prove.retriever_index", "Auto retriever index path"),
         ("prove.llm_rounds", "LLM-only max rounds"),
+        ("prove.llm_cycle_patience", "LLM cycle patience"),
         ("prove.llm_allow_helper_lemmas", "LLM mode allow helper lemmas"),
         ("prove.llm_edit_scope", "LLM mode edit scope"),
         ("prove.typecheck_timeout_s", "LLM mode typecheck timeout"),
@@ -441,11 +462,14 @@ def _configure_prover_single(config: dict) -> None:
 
 
 def _prover_setting_value(config: dict, key: str) -> str:
+    policy = config.setdefault("policy", {})
     prove = config.setdefault("prove", {})
     llm = config.setdefault("llm", {})
     lean = config.setdefault("lean", {})
     segmentation = config.setdefault("segmentation", {})
     formalize = config.setdefault("formalize", {})
+    if key == "policy.proof_profile":
+        return _normalize_proof_profile(policy.get("proof_profile", "normal"))
     if key == "prove.mode":
         return str(prove.get("mode", "tactic"))
     if key == "prove.solver":
@@ -464,6 +488,8 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(prove.get("retriever_index", ""))
     if key == "prove.llm_rounds":
         return str(int(prove.get("llm_rounds", 4)))
+    if key == "prove.llm_cycle_patience":
+        return str(int(prove.get("llm_cycle_patience", 2)))
     if key == "prove.llm_allow_helper_lemmas":
         return "on" if bool(prove.get("llm_allow_helper_lemmas", True)) else "off"
     if key == "prove.llm_edit_scope":
@@ -506,11 +532,21 @@ def _prover_setting_value(config: dict, key: str) -> str:
 
 
 def _update_prover_setting(config: dict, key: str) -> None:
+    policy = config.setdefault("policy", {})
     prove = config.setdefault("prove", {})
     llm = config.setdefault("llm", {})
     lean = config.setdefault("lean", {})
     segmentation = config.setdefault("segmentation", {})
     formalize = config.setdefault("formalize", {})
+    if key == "policy.proof_profile":
+        raw = _prompt(
+            "Proof profile (normal|strict)",
+            default=_normalize_proof_profile(policy.get("proof_profile", "normal")),
+        ).strip().lower()
+        profile = _normalize_proof_profile(raw)
+        policy["proof_profile"] = profile
+        _apply_proof_profile_config(config, profile)
+        return
     if key == "prove.mode":
         mode = _prompt("Default proof mode (tactic|lemma|llm)", default=str(prove.get("mode", "tactic"))).strip().lower()
         if mode not in {"tactic", "lemma", "llm"}:
@@ -575,6 +611,16 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["llm_rounds"] = max(1, int(raw))
         except Exception:
             prove["llm_rounds"] = 4
+        return
+    if key == "prove.llm_cycle_patience":
+        raw = _prompt(
+            "LLM cycle patience (rounds without progress)",
+            default=str(prove.get("llm_cycle_patience", 2)),
+        ).strip()
+        try:
+            prove["llm_cycle_patience"] = max(1, int(raw))
+        except Exception:
+            prove["llm_cycle_patience"] = 2
         return
     if key == "prove.llm_allow_helper_lemmas":
         allow_default = "y" if prove.get("llm_allow_helper_lemmas", True) else "n"
@@ -718,11 +764,14 @@ def _update_prover_setting(config: dict, key: str) -> None:
 
 
 def _reset_prover_settings(config: dict) -> None:
+    policy_defaults = DEFAULT_CONFIG.get("policy", {})
     prove_defaults = DEFAULT_CONFIG.get("prove", {})
     llm_defaults = DEFAULT_CONFIG.get("llm", {})
     lean_defaults = DEFAULT_CONFIG.get("lean", {})
     formalize_defaults = DEFAULT_CONFIG.get("formalize", {})
     segmentation_defaults = DEFAULT_CONFIG.get("segmentation", {"chunk_words": 1000})
+    policy = config.setdefault("policy", {})
+    policy["proof_profile"] = _normalize_proof_profile(policy_defaults.get("proof_profile", "normal"))
     prove = config.setdefault("prove", {})
     prove.clear()
     prove.update(json.loads(json.dumps(prove_defaults)))
@@ -748,6 +797,24 @@ def _reset_prover_settings(config: dict) -> None:
         timing = "end"
     formalize["llm_check_timing"] = timing
     formalize["llm_check_repairs"] = int(formalize_defaults.get("llm_check_repairs", 2))
+    _apply_proof_profile_config(config, policy["proof_profile"])
+
+
+def _normalize_proof_profile(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"normal", "strict"}:
+        return raw
+    return "normal"
+
+
+def _apply_proof_profile_config(config: dict, profile: str) -> None:
+    mode = _normalize_proof_profile(profile)
+    prove = config.setdefault("prove", {})
+    if mode == "strict":
+        prove["allow_axioms"] = False
+        prove["llm_allow_helper_lemmas"] = False
+        prove["llm_edit_scope"] = "errors_only"
+    return
 
 
 def _menu_prove(config: dict) -> None:
@@ -1246,6 +1313,7 @@ def _build_args_from_config(
     embed = config.get("embed", {})
     lean = config.get("lean", {})
     prove = config.get("prove", {})
+    policy = config.get("policy", {})
     openai_model = openai.get("model", "gpt-4.1")
     if provider == "codex_cli":
         openai_model = openai.get("codex_model") or openai_model or _default_codex_model(openai)
@@ -1273,8 +1341,10 @@ def _build_args_from_config(
         k=int(prove.get("k", 1)),
         retriever_k=int(prove.get("retriever_k", 8)),
         llm_rounds=int(prove.get("llm_rounds", 4)),
+        llm_cycle_patience=int(prove.get("llm_cycle_patience", 2)),
         llm_allow_helper_lemmas=bool(prove.get("llm_allow_helper_lemmas", True)),
         llm_edit_scope=str(prove.get("llm_edit_scope", "full")),
+        proof_profile=_normalize_proof_profile(policy.get("proof_profile", "normal")),
         timeout=5.0,
         typecheck_timeout=float(prove.get("typecheck_timeout_s", 60)),
         repair=2,

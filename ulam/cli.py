@@ -160,6 +160,18 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--k", type=int, default=1, help="suggestions per state")
     prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
     prove.add_argument(
+        "--llm-cycle-patience",
+        type=int,
+        default=None,
+        help="rounds without progress before forcing a replan hint",
+    )
+    prove.add_argument(
+        "--proof-profile",
+        choices=["normal", "strict"],
+        default=None,
+        help="policy profile for guardrails (strict disables axioms/helpers and locks edits)",
+    )
+    prove.add_argument(
         "--llm-allow-helper-lemmas",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -262,6 +274,40 @@ def main(argv: list[str] | None = None) -> None:
     replay.add_argument("--lean-import", action="append", default=[], help="additional Lean imports")
     replay.add_argument("--timeout", type=float, default=5.0, help="tactic timeout for execute replay")
 
+    checkpoint = sub.add_parser("checkpoint", help="read-only proof health check for a Lean file")
+    checkpoint.add_argument("file", type=Path, help="path to Lean file")
+    checkpoint.add_argument("--theorem", default="", help="optional theorem/lemma name to focus on")
+    checkpoint.add_argument("--trace", type=Path, default=Path("run.jsonl"), help="optional run trace JSONL")
+    checkpoint.add_argument("--lean-project", type=Path, default=None, help="Lean project root")
+    checkpoint.add_argument("--lean-import", action="append", default=[], help="additional Lean imports")
+    checkpoint.add_argument(
+        "--proof-profile",
+        choices=["normal", "strict"],
+        default=None,
+        help="policy profile for checkpoint criteria",
+    )
+    checkpoint.add_argument(
+        "--allow-axioms",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow axioms/constants anywhere (default: enabled unless strict profile)",
+    )
+    checkpoint.add_argument(
+        "--typecheck-timeout",
+        type=float,
+        default=None,
+        help="Lean typecheck timeout in checkpoint mode (seconds)",
+    )
+    checkpoint.add_argument("--strict", action="store_true", help="exit non-zero when blockers are found")
+    checkpoint.add_argument("--out-json", type=Path, default=None, help="write checkpoint report JSON")
+
+    review = sub.add_parser("review", help="read-only run review with actionable next steps")
+    review.add_argument("--trace", type=Path, default=Path("run.jsonl"), help="run trace JSONL")
+    review.add_argument("--file", type=Path, default=None, help="optional Lean file for declaration stats")
+    review.add_argument("--theorem", default="", help="optional theorem/lemma name to focus on")
+    review.add_argument("--max-lines", type=int, default=800, help="max trace lines to inspect")
+    review.add_argument("--out-json", type=Path, default=None, help="write review report JSON")
+
     auth = sub.add_parser("auth", help="authenticate with Codex, Claude, or Gemini CLI")
     auth.add_argument("provider", choices=["codex", "claude", "gemini"])
 
@@ -282,6 +328,12 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--proof-beam", type=int, default=4)
     formalize.add_argument("--proof-k", type=int, default=1)
     formalize.add_argument("--proof-timeout", type=float, default=5.0)
+    formalize.add_argument(
+        "--proof-profile",
+        choices=["normal", "strict"],
+        default=None,
+        help="policy profile for guardrails (strict disables axioms by default)",
+    )
     formalize.add_argument("--proof-repair", type=int, default=2)
     formalize.add_argument(
         "--typecheck-timeout",
@@ -590,6 +642,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "replay":
         run_replay(args)
         return
+    if args.command == "checkpoint":
+        run_checkpoint(args)
+        return
+    if args.command == "review":
+        run_review(args)
+        return
     if args.command == "auth":
         run_auth(args)
         return
@@ -617,6 +675,11 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run_prove(args: argparse.Namespace) -> None:
+    config_data = load_config()
+    profile = _resolve_proof_profile(args, config_data)
+    _apply_proof_profile_to_args(args, profile)
+    if getattr(args, "verbose", False):
+        print(f"[policy] profile={profile}")
     allow_axioms = _resolve_allow_axioms(args)
     context = _read_context_files(args.context)
     config = RunConfig(
@@ -741,6 +804,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
     allow_axioms = _resolve_allow_axioms(args)
     allow_helper_lemmas = _resolve_llm_allow_helper_lemmas(args)
     edit_scope = _resolve_llm_edit_scope(args)
+    cycle_patience = _resolve_llm_cycle_patience(args)
     try:
         text = args.file.read_text(encoding="utf-8")
     except Exception as exc:
@@ -766,6 +830,24 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
 
     error: str | None = None
     error_counts: dict[str, int] = {}
+    best_score = _llm_round_score(text, args.theorem)
+    stalled_rounds = 0
+
+    def _bump_cycle(current_text: str, reason: str) -> None:
+        nonlocal error, best_score, stalled_rounds
+        score = _llm_round_score(current_text, args.theorem)
+        if score < best_score:
+            best_score = score
+            stalled_rounds = 0
+            return
+        stalled_rounds += 1
+        if stalled_rounds < cycle_patience:
+            return
+        stalled_rounds = 0
+        replan = _llm_replan_hint(reason)
+        error = replan if not error else f"{error}\n\n{replan}"
+        print("[cycle] no measurable progress; forcing replan constraints.")
+
     for round_idx in range(1, max_rounds + 1):
         print(f"[llm] round {round_idx}/{max_rounds}")
         tex_snippet = _extract_tex_snippet(text, args.theorem)
@@ -813,6 +895,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             if count >= 3:
                 print("[stagnation] same scope error repeated multiple rounds; stopping.")
                 break
+            _bump_cycle(text, scope_error)
             continue
         if updated.strip() == text.strip():
             print("[stagnation] LLM returned no effective code changes.")
@@ -826,6 +909,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             if count >= 3:
                 print("[stagnation] same error repeated multiple rounds; stopping.")
                 break
+            _bump_cycle(updated, error)
             continue
         check_error = lean_cli_check(
             args.file,
@@ -839,6 +923,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             if count >= 3:
                 print("[stagnation] same typecheck error repeated multiple rounds; stopping.")
                 break
+            _bump_cycle(updated, check_error)
             continue
         axiom_error = _axiom_guardrail_error(updated, allow_axioms)
         if axiom_error:
@@ -848,6 +933,7 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             if count >= 3:
                 print("[stagnation] same axiom guardrail error repeated multiple rounds; stopping.")
                 break
+            _bump_cycle(updated, axiom_error)
             continue
         print("Solved.")
         print(f"Wrote proof to: {args.file}")
@@ -855,6 +941,26 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
 
     print("Failed to solve with LLM-only mode.")
     return False
+
+
+def _llm_round_score(text: str, theorem: str) -> tuple[int, int]:
+    target = _decl_block(text, theorem)
+    if not target:
+        target = _any_decl_block(text, theorem)
+    target_placeholders = len(re.findall(r"\b(sorry|admit)\b", _strip_comments(target)))
+    total_placeholders = len(re.findall(r"\b(sorry|admit)\b", _strip_comments(text)))
+    return (target_placeholders, total_placeholders)
+
+
+def _llm_replan_hint(reason: str) -> str:
+    short = (reason or "").strip().splitlines()[0] if reason else "unknown failure"
+    return (
+        "REPLAN REQUIRED:\n"
+        "- Use a different proof strategy than previous attempts.\n"
+        "- Edit only what is necessary for the target declaration.\n"
+        "- Avoid repeating the same failing tactic/script pattern.\n"
+        f"- Last blocker: {short}"
+    )
 
 
 def _append_context_block(base: str, title: str, body: str) -> str:
@@ -1600,6 +1706,36 @@ def _autop_enabled(args: argparse.Namespace) -> bool:
     return True
 
 
+def _normalize_proof_profile(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"strict", "normal"}:
+        return raw
+    return "normal"
+
+
+def _resolve_proof_profile(args: argparse.Namespace, config: dict | None = None) -> str:
+    explicit = _normalize_proof_profile(getattr(args, "proof_profile", ""))
+    if explicit != "normal" or str(getattr(args, "proof_profile", "")).strip():
+        return explicit
+    cfg = config if config is not None else load_config()
+    policy = cfg.get("policy", {})
+    if isinstance(policy, dict):
+        return _normalize_proof_profile(policy.get("proof_profile", "normal"))
+    return "normal"
+
+
+def _apply_proof_profile_to_args(args: argparse.Namespace, profile: str) -> None:
+    mode = _normalize_proof_profile(profile)
+    if mode != "strict":
+        return
+    if hasattr(args, "allow_axioms"):
+        setattr(args, "allow_axioms", False)
+    if hasattr(args, "llm_allow_helper_lemmas"):
+        setattr(args, "llm_allow_helper_lemmas", False)
+    if hasattr(args, "llm_edit_scope"):
+        setattr(args, "llm_edit_scope", "errors_only")
+
+
 def _resolve_allow_axioms(args: argparse.Namespace, config: dict | None = None) -> bool:
     explicit = getattr(args, "allow_axioms", None)
     if explicit is not None:
@@ -1646,6 +1782,24 @@ def _resolve_llm_edit_scope(
     if raw in {"full", "errors_only"}:
         return raw
     return "full"
+
+
+def _resolve_llm_cycle_patience(
+    args: argparse.Namespace,
+    config: dict | None = None,
+) -> int:
+    explicit = getattr(args, "llm_cycle_patience", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 2
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("llm_cycle_patience", 2)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 2
 
 
 def _resolve_formalize_typecheck_timeout(
@@ -2104,6 +2258,351 @@ def _expected_state_hash(payload: dict, *, key: str, pretty_key: str | None = No
         if pretty:
             return state_hash(pretty)
     return ""
+
+
+def run_checkpoint(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    profile = _resolve_proof_profile(args, cfg)
+    _apply_proof_profile_to_args(args, profile)
+
+    file_path = Path(args.file).expanduser()
+    if not file_path.exists():
+        print(f"File not found: {file_path}")
+        sys.exit(1)
+
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"Failed to read Lean file: {exc}")
+        sys.exit(1)
+
+    allow_axioms = _resolve_allow_axioms(args, cfg)
+    timeout_s = _resolve_typecheck_timeout(args, cfg)
+    lean_project = args.lean_project or _find_lean_project_for_file(file_path)
+
+    from .lean.cli_check import lean_cli_check
+
+    typecheck_error: str | None
+    try:
+        typecheck_error = lean_cli_check(file_path, project_path=lean_project, timeout_s=timeout_s)
+    except Exception as exc:
+        typecheck_error = str(exc) or repr(exc)
+
+    file_stats = _checkpoint_file_stats(text, theorem=str(args.theorem or "").strip())
+    axiom_names = _scan_axiom_constant_names(_strip_comments(text))
+    trace_stats = _checkpoint_trace_stats(args.trace)
+
+    blockers: list[str] = []
+    theorem = str(args.theorem or "").strip()
+    if theorem and not file_stats["theorem_found"]:
+        blockers.append(f"target declaration `{theorem}` was not found")
+    if typecheck_error:
+        first = _primary_typecheck_error_line(typecheck_error)
+        blockers.append(first)
+    if (not allow_axioms) and axiom_names:
+        blockers.append(f"axioms/constants present while disallowed ({len(axiom_names)})")
+    if args.strict and int(file_stats["placeholders"]) > 0:
+        blockers.append(f"placeholders remain ({file_stats['placeholders']})")
+
+    report = {
+        "profile": profile,
+        "file": str(file_path),
+        "lean_project": str(lean_project) if lean_project else "",
+        "typecheck_timeout_s": timeout_s,
+        "allow_axioms": bool(allow_axioms),
+        "typecheck_ok": typecheck_error is None,
+        "typecheck_error": typecheck_error or "",
+        "declarations_total": int(file_stats["decl_total"]),
+        "placeholders": int(file_stats["placeholders"]),
+        "axiom_constant_count": len(axiom_names),
+        "axiom_constant_names": axiom_names[:50],
+        "theorem": theorem,
+        "theorem_found": bool(file_stats["theorem_found"]),
+        "theorem_has_placeholder": bool(file_stats["theorem_has_placeholder"]),
+        "trace": trace_stats,
+        "blockers": blockers,
+    }
+
+    print(f"Checkpoint file: {file_path}")
+    print(f"Policy profile: {profile}")
+    print(f"Typecheck: {'ok' if typecheck_error is None else 'failed'}")
+    if typecheck_error:
+        preview = "\n".join((typecheck_error or "").splitlines()[:3]).strip()
+        if preview:
+            print(f"Typecheck error: {preview}")
+    print(
+        "Declarations: "
+        f"{int(file_stats['decl_total'])}, placeholders: {int(file_stats['placeholders'])}, "
+        f"axioms/constants: {len(axiom_names)}"
+    )
+    if theorem:
+        print(
+            f"Theorem `{theorem}`: "
+            f"{'found' if file_stats['theorem_found'] else 'missing'}, "
+            f"placeholder={'yes' if file_stats['theorem_has_placeholder'] else 'no'}"
+        )
+    if trace_stats.get("trace_found", False):
+        print(
+            "Trace: "
+            f"{trace_stats.get('steps', 0)} steps, "
+            f"ok={trace_stats.get('ok_steps', 0)}, "
+            f"fail={trace_stats.get('fail_steps', 0)}"
+        )
+    if blockers:
+        print("Blockers:")
+        for item in blockers[:10]:
+            print(f"- {item}")
+        if len(blockers) > 10:
+            print(f"- ... ({len(blockers) - 10} more)")
+    else:
+        print("Blockers: none")
+
+    if args.out_json:
+        out_path = Path(args.out_json).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"Report JSON: {out_path}")
+
+    if args.strict and blockers:
+        sys.exit(1)
+
+
+def _primary_typecheck_error_line(error: str) -> str:
+    lines = [line.strip() for line in str(error or "").splitlines() if line.strip()]
+    for line in lines:
+        if not line.lower().startswith("warning:"):
+            return line
+    if lines:
+        return lines[0]
+    return "Lean typecheck error"
+
+
+def _checkpoint_file_stats(text: str, theorem: str = "") -> dict[str, object]:
+    cleaned = _strip_comments(text)
+    decl_pattern = re.compile(
+        r"^\s*(?:theorem|lemma|example|proposition|corollary|def|abbrev|structure|class|inductive)\s+([A-Za-z_][A-Za-z0-9_']*)",
+        re.M,
+    )
+    decl_total = len(list(decl_pattern.finditer(text)))
+    placeholders = len(re.findall(r"\b(sorry|admit)\b", cleaned))
+    theorem_found = False
+    theorem_has_placeholder = False
+    if theorem:
+        theorem_found = _file_has_decl(text, theorem) or bool(
+            re.search(
+                rf"^\s*(?:theorem|lemma|example|proposition|corollary|def|abbrev|structure|class|inductive)\s+{_name_token_regex(theorem)}\b",
+                text,
+                re.M,
+            )
+        )
+        block = _decl_block(text, theorem)
+        if not block:
+            block = _any_decl_block(text, theorem)
+        theorem_has_placeholder = bool(re.search(r"\b(sorry|admit)\b", _strip_comments(block)))
+    return {
+        "decl_total": decl_total,
+        "placeholders": placeholders,
+        "theorem_found": theorem_found,
+        "theorem_has_placeholder": theorem_has_placeholder,
+    }
+
+
+def _any_decl_block(text: str, name: str) -> str:
+    pattern = re.compile(
+        rf"^\s*(?:theorem|lemma|example|proposition|corollary|def|abbrev|structure|class|inductive)\s+{_name_token_regex(name)}\b",
+        re.M,
+    )
+    match = pattern.search(text)
+    if not match:
+        return ""
+    next_decl = re.compile(
+        r"^\s*(?:theorem|lemma|example|proposition|corollary|def|abbrev|structure|class|inductive)\s+[A-Za-z_][A-Za-z0-9_']*\b",
+        re.M,
+    ).search(text, match.end())
+    end = next_decl.start() if next_decl else len(text)
+    return text[match.start() : end]
+
+
+def _scan_axiom_constant_names(cleaned_text: str) -> list[str]:
+    names: list[str] = []
+    pattern = re.compile(r"^\s*(?:private\s+)?(?:axiom|constant)\s+([A-Za-z_][A-Za-z0-9_']*)", re.M)
+    for match in pattern.finditer(cleaned_text):
+        names.append(match.group(1))
+    return names
+
+
+def _checkpoint_trace_stats(trace_path: Path) -> dict[str, object]:
+    path = Path(trace_path).expanduser()
+    if not path.exists():
+        return {"trace_found": False, "path": str(path)}
+    steps = _read_trace_steps(path, max_lines=1000)
+    ok_steps = 0
+    fail_steps = 0
+    for step in steps:
+        if bool(step.get("ok", False)):
+            ok_steps += 1
+        else:
+            fail_steps += 1
+    return {
+        "trace_found": True,
+        "path": str(path),
+        "steps": len(steps),
+        "ok_steps": ok_steps,
+        "fail_steps": fail_steps,
+    }
+
+
+def run_review(args: argparse.Namespace) -> None:
+    trace_path = Path(args.trace).expanduser()
+    if not trace_path.exists():
+        print(f"Trace not found: {trace_path}")
+        sys.exit(1)
+
+    steps = _read_trace_steps(trace_path, max_lines=max(20, int(args.max_lines)))
+    if not steps:
+        print(f"Trace has no readable steps: {trace_path}")
+        sys.exit(1)
+
+    ok_steps = 0
+    fail_steps = 0
+    solved_steps = 0
+    error_kinds: Counter[str] = Counter()
+    fingerprints: Counter[str] = Counter()
+    tactic_heads: Counter[str] = Counter()
+    unique_states: set[str] = set()
+    unique_new_states: set[str] = set()
+    for row in steps:
+        if bool(row.get("ok", False)):
+            ok_steps += 1
+        else:
+            fail_steps += 1
+            err = str(row.get("error") or "")
+            kind = _bench_error_kind(err) or "other"
+            error_kinds[kind] += 1
+            if err.strip():
+                fingerprints[_error_fingerprint(err)] += 1
+        if bool(row.get("solved", False)):
+            solved_steps += 1
+        tactic = str(row.get("tactic") or "").strip()
+        if tactic:
+            tactic_heads[_tactic_head(tactic)] += 1
+        st = str(row.get("state_hash") or "").strip()
+        if st:
+            unique_states.add(st)
+        nst = str(row.get("new_state_hash") or "").strip()
+        if nst:
+            unique_new_states.add(nst)
+
+    metadata = _load_trace_metadata(trace_path, None)
+    review_file = args.file or _path_from_meta(metadata.get("file"))
+    file_stats: dict[str, object] | None = None
+    if isinstance(review_file, Path) and review_file.exists():
+        try:
+            file_text = review_file.read_text(encoding="utf-8")
+            file_stats = _checkpoint_file_stats(file_text, theorem=str(args.theorem or "").strip())
+            file_stats["path"] = str(review_file)
+            file_stats["axiom_constant_count"] = len(_scan_axiom_constant_names(_strip_comments(file_text)))
+        except Exception:
+            file_stats = None
+
+    top_errors = error_kinds.most_common(5)
+    repeated_errors = [(k, v) for k, v in fingerprints.most_common(5) if v >= 2]
+    repeated_heads = [(k, v) for k, v in tactic_heads.most_common(5) if v >= 3]
+    suggestions = _review_suggestions(
+        fail_steps=fail_steps,
+        top_errors=top_errors,
+        repeated_errors=repeated_errors,
+        repeated_heads=repeated_heads,
+        file_stats=file_stats,
+    )
+
+    report = {
+        "trace": str(trace_path),
+        "steps": len(steps),
+        "ok_steps": ok_steps,
+        "fail_steps": fail_steps,
+        "solved_steps": solved_steps,
+        "unique_state_hashes": len(unique_states),
+        "unique_new_state_hashes": len(unique_new_states),
+        "top_error_kinds": top_errors,
+        "repeated_error_fingerprints": repeated_errors,
+        "repeated_tactic_heads": repeated_heads,
+        "file_stats": file_stats or {},
+        "suggestions": suggestions,
+    }
+
+    print(f"Review trace: {trace_path}")
+    print(f"Steps: {len(steps)} (ok={ok_steps}, fail={fail_steps}, solved_markers={solved_steps})")
+    print(f"State coverage: unique={len(unique_states)}, progressed={len(unique_new_states)}")
+    if top_errors:
+        print("Top failure kinds:")
+        for kind, count in top_errors:
+            print(f"- {kind}: {count}")
+    if repeated_errors:
+        print("Repeated error fingerprints:")
+        for fp, count in repeated_errors:
+            print(f"- {fp}: {count}")
+    if repeated_heads:
+        print("Repeated tactic heads:")
+        for head, count in repeated_heads:
+            print(f"- {head}: {count}")
+    if file_stats:
+        print(
+            "File stats: "
+            f"declarations={file_stats.get('decl_total', 0)}, "
+            f"placeholders={file_stats.get('placeholders', 0)}, "
+            f"axioms/constants={file_stats.get('axiom_constant_count', 0)}"
+        )
+    print("Next actions:")
+    for item in suggestions:
+        print(f"- {item}")
+
+    if args.out_json:
+        out_path = Path(args.out_json).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"Report JSON: {out_path}")
+
+
+def _tactic_head(tactic: str) -> str:
+    stripped = tactic.strip()
+    if not stripped:
+        return ""
+    return stripped.split(maxsplit=1)[0][:40]
+
+
+def _review_suggestions(
+    *,
+    fail_steps: int,
+    top_errors: list[tuple[str, int]],
+    repeated_errors: list[tuple[str, int]],
+    repeated_heads: list[tuple[str, int]],
+    file_stats: dict[str, object] | None,
+) -> list[str]:
+    suggestions: list[str] = []
+    top_kind = top_errors[0][0] if top_errors else ""
+    if fail_steps == 0:
+        suggestions.append("No failing steps in trace; keep current settings and expand benchmark coverage.")
+    if top_kind == "timeout":
+        suggestions.append("Increase tactic timeout (--timeout) or reduce search branching/step budget.")
+    if top_kind in {"type_mismatch", "unsolved_goals"}:
+        suggestions.append("Switch to script/LLM mode for multi-step edits and add tighter theorem-local guidance.")
+    if top_kind == "unknown_identifier":
+        suggestions.append("Enable retrieval/indexing and verify imports in the Lean file before next run.")
+    if repeated_errors:
+        suggestions.append("Run with strict profile to force alternative edits when the same error repeats.")
+    if repeated_heads:
+        suggestions.append("Disable autop temporarily to avoid repeating the same fallback tactic heads.")
+    if file_stats:
+        placeholders = int(file_stats.get("placeholders", 0) or 0)
+        if placeholders > 0:
+            suggestions.append("Focus next run on filling existing `sorry/admit` placeholders before broad refactors.")
+        ax_count = int(file_stats.get("axiom_constant_count", 0) or 0)
+        if ax_count > 0:
+            suggestions.append("If semantic fidelity matters, run strict profile (`--proof-profile strict`) to disallow axioms.")
+    if not suggestions:
+        suggestions.append("Run `ulam checkpoint --strict` to gate the next iteration on deterministic blockers.")
+    return suggestions
 
 
 def run_auth(args: argparse.Namespace) -> None:
@@ -3258,6 +3757,10 @@ def _read_toolchain_file(path: Path) -> str | None:
 
 def run_formalize(args: argparse.Namespace) -> None:
     config = load_config()
+    profile = _resolve_proof_profile(args, config)
+    _apply_proof_profile_to_args(args, profile)
+    if getattr(args, "verbose", False):
+        print(f"[policy] profile={profile}")
     tex_path = args.tex
     if not tex_path.exists():
         print(f"Tex file not found: {tex_path}")

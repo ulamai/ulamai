@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.16)
+## Status (v0.1.17)
 This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
 
-- **v0.1.16 highlights:** benchmark runtime observability improved with flushed live progress output and configurable CLI LLM timeout/heartbeat wiring (Codex/Claude/Gemini CLI backends); added stronger LLM output sanitization, configurable formalize typecheck timeout, missing `.olean` auto-rebuild retry, LLM edit-scope/helper-lemma controls, and LeanDojo per-step timeout handling with explicit tactic-attempt logs
+- **v0.1.17 highlights:** added `checkpoint`/`review` read-only diagnostics, strict proof profile (`normal|strict`) policy controls, and LLM cycle patience/replan hints to reduce repeated non-progress loops
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -206,6 +206,18 @@ Replay the run:
 
 ```bash
 python3 -m ulam replay run.jsonl
+```
+
+Read-only checkpoint (typecheck/placeholders/axiom drift):
+
+```bash
+python3 -m ulam checkpoint examples/Smoke.lean --theorem irrational_sqrt_two_smoke --strict
+```
+
+Run review with next-step suggestions:
+
+```bash
+python3 -m ulam review --trace run.jsonl --file examples/Smoke.lean --theorem irrational_sqrt_two_smoke
 ```
 
 Execute deterministic replay (re-run every tactic from the trace):

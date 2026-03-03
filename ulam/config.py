@@ -47,6 +47,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "autop": True,
         "k": 1,
         "llm_rounds": 4,
+        "llm_cycle_patience": 2,
         "llm_allow_helper_lemmas": True,
         "llm_edit_scope": "full",
         "lemma_max": 60,
@@ -78,6 +79,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "project": "",
         "imports": [],
         "dojo_timeout_s": 180,
+    },
+    "policy": {
+        "proof_profile": "normal",
     },
 }
 
