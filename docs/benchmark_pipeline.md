@@ -60,6 +60,8 @@ Deliverables:
   - `minif2f_dev.jsonl`
   - `internal_regression.jsonl`
   - optional `putnambench_sample.jsonl`
+- Add suite alias registry (`bench/suites/registry.json`) and listing command (`ulam bench-list-suites`).
+- Add deterministic fixed-suite builder (`ulam bench-make-regression100`) for large, versioned regression slices.
 - Add `bench/README.md` documenting schema and curation rules.
 - Add a validator command/script to check suite entries before running.
 

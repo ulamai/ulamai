@@ -156,6 +156,8 @@ Scope boundary:
 Current implementation snapshot:
 - `prove --prove-mode llm --lean lsp` supports Lean LSP diagnostics in the edit/typecheck loop.
 - `formalize --lean-backend lsp` supports Lean LSP diagnostics for formalization typecheck loops.
+- Bench suite management now supports aliases/registry (`ulam bench-list-suites`) and deterministic fixed-suite generation (`ulam bench-make-regression100`).
+- Bench reports now include dataset/split breakdowns and top tag counts when suite metadata is present.
 
 Parity criteria (before promoting beyond optional):
 - Supports runner-style `start/apply/close` semantics at theorem scope.

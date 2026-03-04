@@ -2,6 +2,8 @@
 
 `ulam` benchmark suites are JSONL files with one case per line.
 
+You can pass either a JSONL path or a known suite alias (see `ulam bench-list-suites`).
+
 ## Schema
 
 Required fields:
@@ -26,6 +28,8 @@ Validate a suite before running:
 
 ```bash
 python3 -m ulam bench-validate --suite bench/suites/internal_regression.jsonl
+# or by alias
+python3 -m ulam bench-validate --suite internal_regression
 ```
 
 Validation checks:
@@ -50,6 +54,31 @@ Notes:
 - Use `--require-sorry` if your benchmark protocol requires explicit placeholders.
 - Use `--shuffle --seed <N> --limit <K>` for fixed-size reproducible slices.
 
+## Fixed Regression Suites (`regression100`)
+
+List known suite aliases and availability:
+
+```bash
+python3 -m ulam bench-list-suites
+```
+
+Build a deterministic 100-case fixed suite from a larger source suite:
+
+```bash
+python3 -m ulam bench-make-regression100 \
+  --source bench/suites/minif2f_valid.jsonl \
+  --out bench/suites/regression100.jsonl \
+  --size 100 \
+  --seed 0
+```
+
+Validate/run it by alias:
+
+```bash
+python3 -m ulam bench-validate --suite regression100
+python3 -m ulam bench --suite regression100 --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
+```
+
 ## Comparison
 
 Compare two benchmark report JSON files:
@@ -72,3 +101,4 @@ scripts/run_bench_campaign.sh --suite bench/suites/internal_regression.jsonl -- 
 - Prefer deterministic, self-contained cases (minimal dependence on machine-local state).
 - Keep theorem names exact (including apostrophes when present).
 - Add metadata fields (e.g. `dataset`, `difficulty`, `tags`) as needed; they are preserved in suite files and ignored by the runner.
+- Bench reports now include dataset/split breakdowns and top tag counts when these fields are present in suite rows.

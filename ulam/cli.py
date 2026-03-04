@@ -396,7 +396,12 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("--verbose", action="store_true")
 
     bench = sub.add_parser("bench", help="run a regression suite")
-    bench.add_argument("--suite", type=Path, required=True, help="jsonl suite path")
+    bench.add_argument(
+        "--suite",
+        type=Path,
+        required=True,
+        help="suite alias or jsonl path (run `ulam bench-list-suites`)",
+    )
     bench.add_argument(
         "--llm",
         choices=[
@@ -522,8 +527,21 @@ def main(argv: list[str] | None = None) -> None:
         default=os.environ.get("ULAM_GEMINI_MODEL", "gemini-3.1-pro-preview"),
     )
 
+    bench_list = sub.add_parser("bench-list-suites", help="list known benchmark suite aliases")
+    bench_list.add_argument(
+        "--out-json",
+        type=Path,
+        default=None,
+        help="optional path to write suite registry snapshot JSON",
+    )
+
     bench_validate = sub.add_parser("bench-validate", help="validate a benchmark suite jsonl")
-    bench_validate.add_argument("--suite", type=Path, required=True, help="jsonl suite path")
+    bench_validate.add_argument(
+        "--suite",
+        type=Path,
+        required=True,
+        help="suite alias or jsonl path (run `ulam bench-list-suites`)",
+    )
     bench_validate.add_argument(
         "--no-theorem-check",
         action="store_true",
@@ -650,6 +668,50 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="allow same theorem name multiple times across files",
     )
+    bench_make_regression100 = sub.add_parser(
+        "bench-make-regression100",
+        help="build a fixed-size regression suite from a source suite JSONL",
+    )
+    bench_make_regression100.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="source suite JSONL path",
+    )
+    bench_make_regression100.add_argument(
+        "--out",
+        type=Path,
+        default=Path("bench/suites/regression100.jsonl"),
+        help="output suite JSONL path",
+    )
+    bench_make_regression100.add_argument(
+        "--size",
+        type=int,
+        default=100,
+        help="number of cases to include",
+    )
+    bench_make_regression100.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="sampling seed",
+    )
+    bench_make_regression100.add_argument(
+        "--dataset",
+        default="regression100",
+        help="dataset label written to each output row",
+    )
+    bench_make_regression100.add_argument(
+        "--tag",
+        action="append",
+        default=["regression100"],
+        help="tag to append to each row (repeatable)",
+    )
+    bench_make_regression100.add_argument(
+        "--allow-duplicate-pairs",
+        action="store_true",
+        help="allow duplicate (file,theorem) rows in output",
+    )
 
     index = sub.add_parser("index", help="build or inspect retrieval indices")
     index_sub = index.add_subparsers(dest="index_command", required=True)
@@ -693,6 +755,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "bench":
         run_bench(args)
         return
+    if args.command == "bench-list-suites":
+        run_bench_list_suites(args)
+        return
     if args.command == "bench-validate":
         run_bench_validate(args)
         return
@@ -701,6 +766,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "bench-make-minif2f":
         run_bench_make_minif2f(args)
+        return
+    if args.command == "bench-make-regression100":
+        run_bench_make_regression100(args)
         return
     if args.command == "index":
         run_index(args)
@@ -3978,12 +4046,204 @@ def run_formalize(args: argparse.Namespace) -> None:
         print(f"Artifacts: {result.artifact_dir}")
 
 
-def run_bench(args: argparse.Namespace) -> None:
-    if not args.suite.exists():
-        print(f"Suite not found: {args.suite}")
-        sys.exit(1)
+def _bench_repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
-    suite_path = args.suite.expanduser().resolve()
+
+def _default_bench_suite_registry() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "regression",
+            "path": "bench/regression.jsonl",
+            "description": "Legacy smoke regression suite.",
+            "target_cases": 1,
+            "kind": "fixed",
+        },
+        {
+            "name": "internal_regression",
+            "path": "bench/suites/internal_regression.jsonl",
+            "description": "Internal smoke regression suite.",
+            "target_cases": 1,
+            "kind": "fixed",
+        },
+        {
+            "name": "minif2f_dev",
+            "path": "bench/suites/minif2f_dev.jsonl",
+            "description": "Development placeholder miniF2F suite.",
+            "target_cases": 1,
+            "kind": "dev",
+        },
+        {
+            "name": "putnambench_sample",
+            "path": "bench/suites/putnambench_sample.jsonl",
+            "description": "Optional PutnamBench placeholder sample.",
+            "target_cases": 1,
+            "kind": "sample",
+        },
+        {
+            "name": "regression100",
+            "path": "bench/suites/regression100.jsonl",
+            "description": "Fixed-size 100-case regression suite.",
+            "target_cases": 100,
+            "kind": "fixed",
+            "generator_hint": (
+                "python3 -m ulam bench-make-regression100 --source "
+                "bench/suites/minif2f_valid.jsonl --out bench/suites/regression100.jsonl "
+                "--size 100 --seed 0"
+            ),
+        },
+    ]
+
+
+def _normalize_suite_alias(name: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(name or "").strip().lower())
+    return text.strip("_")
+
+
+def _load_bench_suite_registry() -> dict[str, dict[str, object]]:
+    repo_root = _bench_repo_root()
+    entries: dict[str, dict[str, object]] = {}
+    for item in _default_bench_suite_registry():
+        name = _normalize_suite_alias(item.get("name"))
+        if not name:
+            continue
+        entries[name] = dict(item)
+
+    registry_path = repo_root / "bench" / "suites" / "registry.json"
+    payload = _load_json_object(registry_path)
+    if not isinstance(payload, dict):
+        return entries
+    suite_rows = payload.get("suites")
+    if not isinstance(suite_rows, list):
+        return entries
+    for row in suite_rows:
+        if not isinstance(row, dict):
+            continue
+        name = _normalize_suite_alias(row.get("name"))
+        path_text = str(row.get("path", "")).strip()
+        if not name or not path_text:
+            continue
+        merged = dict(entries.get(name, {}))
+        merged.update(row)
+        merged["name"] = name
+        entries[name] = merged
+    return entries
+
+
+def _resolve_suite_entry_path(path_text: str, repo_root: Path) -> Path:
+    path = Path(path_text).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (repo_root / path).resolve()
+
+
+def _resolve_bench_suite_input(suite_arg: Path) -> tuple[Path, dict[str, object] | None]:
+    raw_text = str(suite_arg).strip()
+    repo_root = _bench_repo_root()
+    direct = Path(raw_text).expanduser()
+    if direct.exists():
+        return direct.resolve(), None
+    repo_relative = (repo_root / direct).resolve()
+    if repo_relative.exists():
+        return repo_relative, None
+
+    registry = _load_bench_suite_registry()
+    alias = _normalize_suite_alias(raw_text)
+    entry = registry.get(alias)
+    if entry is None:
+        known = ", ".join(sorted(registry.keys()))
+        raise FileNotFoundError(
+            f"Suite not found: {suite_arg}. Use a JSONL path or one of: {known}"
+        )
+    path_text = str(entry.get("path", "")).strip()
+    if not path_text:
+        raise FileNotFoundError(f"Suite alias `{alias}` has no path in registry.")
+    resolved = _resolve_suite_entry_path(path_text, repo_root)
+    if resolved.exists():
+        return resolved, dict(entry)
+    hint = str(entry.get("generator_hint", "")).strip()
+    if hint:
+        raise FileNotFoundError(
+            f"Suite alias `{alias}` maps to missing file: {resolved}\nGenerate it with:\n{hint}"
+        )
+    raise FileNotFoundError(f"Suite alias `{alias}` maps to missing file: {resolved}")
+
+
+def _count_suite_cases_quick(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                if raw.strip():
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def run_bench_list_suites(args: argparse.Namespace) -> None:
+    repo_root = _bench_repo_root()
+    registry = _load_bench_suite_registry()
+    if not registry:
+        print("No suite aliases found.")
+        return
+
+    rows: list[dict[str, object]] = []
+    for name in sorted(registry):
+        entry = registry[name]
+        path_text = str(entry.get("path", "")).strip()
+        resolved = _resolve_suite_entry_path(path_text, repo_root) if path_text else Path("")
+        exists = bool(path_text) and resolved.exists()
+        rows.append(
+            {
+                "name": name,
+                "path": str(resolved) if path_text else "",
+                "description": str(entry.get("description", "")).strip(),
+                "target_cases": int(entry.get("target_cases", 0) or 0),
+                "cases": _count_suite_cases_quick(resolved) if exists else 0,
+                "exists": exists,
+                "generator_hint": str(entry.get("generator_hint", "")).strip(),
+            }
+        )
+
+    print("Known benchmark suites:")
+    for row in rows:
+        status = "ok" if bool(row["exists"]) else "missing"
+        target = int(row.get("target_cases", 0) or 0)
+        target_text = f", target={target}" if target > 0 else ""
+        print(
+            f"- {row['name']}: {row['path']} [{status}, cases={row['cases']}{target_text}]"
+        )
+        desc = str(row.get("description", "")).strip()
+        if desc:
+            print(f"  {desc}")
+        hint = str(row.get("generator_hint", "")).strip()
+        if hint and not bool(row["exists"]):
+            print(f"  generate: {hint}")
+
+    if args.out_json:
+        out_json = Path(args.out_json).expanduser().resolve()
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "suites": rows,
+        }
+        out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"Wrote suite registry snapshot: {out_json}")
+
+
+def run_bench(args: argparse.Namespace) -> None:
+    try:
+        suite_path, suite_entry = _resolve_bench_suite_input(args.suite)
+    except Exception as exc:
+        print(str(exc))
+        sys.exit(1)
+    if suite_entry is not None:
+        print(f"Resolved suite alias `{suite_entry.get('name', '')}` -> {suite_path}")
+
     try:
         cases = _load_bench_cases(suite_path)
     except Exception as exc:
@@ -4007,6 +4267,12 @@ def run_bench(args: argparse.Namespace) -> None:
         premises = case["premises"]
         semantic_report = case.get("semantic_report")
         artifact_dir = case.get("artifact_dir")
+        dataset = str(case.get("dataset", "")).strip()
+        split = str(case.get("split", "")).strip()
+        tags_raw = case.get("tags", [])
+        tags: list[str] = []
+        if isinstance(tags_raw, list):
+            tags = [str(item).strip() for item in tags_raw if str(item).strip()]
         case_args = argparse.Namespace(**vars(args))
         case_args.premises = premises if premises is not None else args.premises
         context = _read_context_files(case_args.context)
@@ -4083,6 +4349,9 @@ def run_bench(args: argparse.Namespace) -> None:
                 "error_kind": kind,
                 "error": error_text,
                 "trace_path": str(trace_path) if trace_path else "",
+                "dataset": dataset,
+                "split": split,
+                "tags": tags,
                 "semantic_available": bool(semantic.get("available", False)),
                 "semantic_source": str(semantic.get("source", "") or ""),
                 "semantic_verdict": str(semantic.get("verdict", "unknown")),
@@ -4120,6 +4389,15 @@ def run_bench(args: argparse.Namespace) -> None:
         durations_s=durations_s,
         error_kinds=error_kinds,
     )
+    dataset_rows = summary_payload.get("dataset_breakdown", [])
+    if isinstance(dataset_rows, list) and dataset_rows:
+        preview = []
+        for item in dataset_rows[:6]:
+            if not isinstance(item, dict):
+                continue
+            preview.append(f"{item.get('dataset', '')}={item.get('total', 0)}")
+        if preview:
+            print(f"Datasets: {', '.join(preview)}", flush=True)
     semantic_available = int(summary_payload.get("semantic_available_cases", 0) or 0)
     if semantic_available:
         sem_pass = int(summary_payload.get("semantic_pass_cases", 0) or 0)
@@ -4145,6 +4423,7 @@ def run_bench(args: argparse.Namespace) -> None:
         "metadata": _build_bench_metadata(
             args=args,
             suite_path=suite_path,
+            suite_entry=suite_entry,
             cases=cases,
             started_at_epoch=started_at_epoch,
             finished_at_epoch=finished_at_epoch,
@@ -4181,6 +4460,15 @@ def _load_bench_cases(suite_path: Path) -> list[dict[str, object]]:
             premises_raw = str(payload.get("premises", "")).strip()
             semantic_report_raw = str(payload.get("semantic_report", "")).strip()
             artifact_dir_raw = str(payload.get("artifact_dir", "")).strip()
+            dataset = str(payload.get("dataset", "")).strip()
+            split = str(payload.get("split", "")).strip()
+            tags_raw = payload.get("tags", [])
+            tags: list[str] = []
+            if isinstance(tags_raw, list):
+                for item in tags_raw:
+                    tag = str(item).strip()
+                    if tag:
+                        tags.append(tag)
             cases.append(
                 {
                     "line": line_no,
@@ -4195,6 +4483,9 @@ def _load_bench_cases(suite_path: Path) -> list[dict[str, object]]:
                     "artifact_dir": _resolve_suite_path_entry(suite_path, artifact_dir_raw)
                     if artifact_dir_raw
                     else None,
+                    "dataset": dataset,
+                    "split": split,
+                    "tags": tags,
                 }
             )
     return cases
@@ -4442,6 +4733,115 @@ def run_bench_make_minif2f(args: argparse.Namespace) -> None:
     print(f"Next: ulam bench-validate --suite {out_path}")
 
 
+def _load_bench_suite_rows_raw(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception as exc:
+                raise RuntimeError(f"Invalid JSON in suite at line {line_no}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Suite line {line_no} must be a JSON object.")
+            file_raw = str(payload.get("file", "")).strip()
+            theorem = str(payload.get("theorem", "")).strip()
+            if not file_raw or not theorem:
+                raise RuntimeError(
+                    f"Suite line {line_no} must include non-empty `file` and `theorem`."
+                )
+            rows.append(payload)
+    return rows
+
+
+def run_bench_make_regression100(args: argparse.Namespace) -> None:
+    source_path = args.source.expanduser().resolve()
+    if not source_path.exists():
+        print(f"Source suite not found: {source_path}")
+        sys.exit(1)
+    out_path = args.out.expanduser().resolve()
+    size = max(1, int(getattr(args, "size", 100)))
+    seed = int(getattr(args, "seed", 0))
+    dataset = str(getattr(args, "dataset", "regression100") or "regression100").strip() or "regression100"
+    allow_dupes = bool(getattr(args, "allow_duplicate_pairs", False))
+    raw_tags = list(getattr(args, "tag", []) or [])
+    tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+    if not tags:
+        tags = ["regression100"]
+
+    try:
+        source_rows = _load_bench_suite_rows_raw(source_path)
+    except Exception as exc:
+        print(f"Failed to read source suite: {exc}")
+        sys.exit(1)
+    if not source_rows:
+        print(f"Source suite has no cases: {source_path}")
+        sys.exit(1)
+
+    unique_rows: list[dict[str, object]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    duplicate_skips = 0
+    for row in source_rows:
+        file_raw = str(row.get("file", "")).strip()
+        theorem = str(row.get("theorem", "")).strip()
+        key = (file_raw, theorem)
+        if not allow_dupes and key in seen_pairs:
+            duplicate_skips += 1
+            continue
+        seen_pairs.add(key)
+        unique_rows.append(dict(row))
+
+    if len(unique_rows) < size:
+        print(
+            f"Source suite only has {len(unique_rows)} eligible unique cases; "
+            f"cannot build size {size}."
+        )
+        if not allow_dupes:
+            print("Tip: pass --allow-duplicate-pairs if your source suite intentionally repeats pairs.")
+        sys.exit(1)
+
+    rng = random.Random(seed)
+    selected_indices = sorted(rng.sample(range(len(unique_rows)), size))
+    selected_rows: list[dict[str, object]] = []
+    source_hint = _suite_entry_path_for_output(out_path, source_path)
+    for index in selected_indices:
+        row = dict(unique_rows[index])
+        for field in ("file", "premises", "semantic_report", "artifact_dir"):
+            raw_value = str(row.get(field, "")).strip()
+            if not raw_value:
+                continue
+            resolved_value = _resolve_suite_path_entry(source_path, raw_value)
+            row[field] = _suite_entry_path_for_output(out_path, resolved_value)
+        row["dataset"] = dataset
+        tag_list = row.get("tags", [])
+        merged_tags: list[str] = []
+        if isinstance(tag_list, list):
+            merged_tags.extend(str(item).strip() for item in tag_list if str(item).strip())
+        for tag in tags:
+            if tag not in merged_tags:
+                merged_tags.append(tag)
+        row["tags"] = merged_tags
+        row["fixed_suite"] = "regression100"
+        row["fixed_seed"] = seed
+        row["source_suite"] = source_hint
+        selected_rows.append(row)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in selected_rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"Wrote regression suite: {out_path}")
+    print(f"Cases: {len(selected_rows)} (target={size})")
+    print(f"Source suite: {source_path}")
+    print(f"Seed: {seed}")
+    if duplicate_skips:
+        print(f"Skipped duplicate (file,theorem) rows from source: {duplicate_skips}")
+    print(f"Next: ulam bench-validate --suite {out_path}")
+
+
 def _bench_path_is_excluded(rel_posix: str, patterns: list[str]) -> bool:
     for pattern in patterns:
         pat = pattern.strip()
@@ -4482,10 +4882,13 @@ def _suite_entry_path_for_output(out_path: Path, target: Path) -> str:
 
 
 def run_bench_validate(args: argparse.Namespace) -> None:
-    suite_path = args.suite.expanduser().resolve()
-    if not suite_path.exists():
-        print(f"Suite not found: {suite_path}")
+    try:
+        suite_path, suite_entry = _resolve_bench_suite_input(args.suite)
+    except Exception as exc:
+        print(str(exc))
         sys.exit(1)
+    if suite_entry is not None:
+        print(f"Resolved suite alias `{suite_entry.get('name', '')}` -> {suite_path}")
     try:
         cases = _load_bench_cases(suite_path)
     except Exception as exc:
@@ -4598,6 +5001,19 @@ def run_bench_validate(args: argparse.Namespace) -> None:
     print(f"Unique files: {len(unique_files)}")
     if duplicate_pairs:
         print(f"Duplicate (file,theorem) entries: {duplicate_pairs}")
+    dataset_counts: Counter[str] = Counter()
+    split_counts: Counter[str] = Counter()
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        dataset_counts[_normalize_group_label(case.get("dataset"))] += 1
+        split_counts[_normalize_group_label(case.get("split"))] += 1
+    if dataset_counts:
+        dataset_summary = ", ".join(f"{name}={count}" for name, count in dataset_counts.most_common())
+        print(f"Datasets: {dataset_summary}")
+    if split_counts:
+        split_summary = ", ".join(f"{name}={count}" for name, count in split_counts.most_common())
+        print(f"Splits: {split_summary}")
     if check_theorem:
         print("Theorem check: enabled")
     else:
@@ -4641,6 +5057,11 @@ def run_bench_compare(args: argparse.Namespace) -> None:
     meta_b = report_b.get("metadata", {}) if isinstance(report_b.get("metadata"), dict) else {}
     label_a = _report_label(meta_a)
     label_b = _report_label(meta_b)
+    suite_a = str(meta_a.get("suite_alias") or meta_a.get("suite_path") or "").strip()
+    suite_b = str(meta_b.get("suite_alias") or meta_b.get("suite_path") or "").strip()
+    suite_sha_a = str(meta_a.get("suite_sha256", "") or "").strip()
+    suite_sha_b = str(meta_b.get("suite_sha256", "") or "").strip()
+    same_suite_sha = bool(suite_sha_a and suite_sha_a == suite_sha_b)
 
     delta = _bench_metrics_delta(metrics_a, metrics_b)
     payload = {
@@ -4650,6 +5071,11 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         "report_b": str(path_b),
         "label_a": label_a,
         "label_b": label_b,
+        "suite_a": suite_a,
+        "suite_b": suite_b,
+        "suite_sha_a": suite_sha_a,
+        "suite_sha_b": suite_sha_b,
+        "same_suite_sha": same_suite_sha,
         "metrics_a": metrics_a,
         "metrics_b": metrics_b,
         "delta": delta,
@@ -4684,6 +5110,11 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         metrics_b["regression_rejection_rate_percent"],
         as_percent=True,
     )
+    if suite_a or suite_b:
+        print(f"- Suite A: {suite_a or '(unknown)'}")
+        print(f"- Suite B: {suite_b or '(unknown)'}")
+    if suite_sha_a and suite_sha_b and not same_suite_sha:
+        print("- WARNING: suite SHA256 differs between A and B; parity comparison may be invalid.")
     if bool(getattr(args, "gate", False)):
         print(f"Parity gate: {'PASS' if gate['passed'] else 'FAIL'}")
         if gate["reasons"]:
@@ -4859,6 +5290,9 @@ def _render_bench_compare_markdown(payload: dict) -> str:
         f"- Report B: {payload.get('report_b', '')}",
         f"- Label A: {payload.get('label_a', '')}",
         f"- Label B: {payload.get('label_b', '')}",
+        f"- Suite A: {payload.get('suite_a', '')}",
+        f"- Suite B: {payload.get('suite_b', '')}",
+        f"- Same suite SHA256: {'yes' if bool(payload.get('same_suite_sha', False)) else 'no'}",
     ]
     gate = payload.get("gate", {})
     if isinstance(gate, dict):
@@ -4892,6 +5326,69 @@ def _render_bench_compare_markdown(payload: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _normalize_group_label(value: object, fallback: str = "unspecified") -> str:
+    text = str(value or "").strip()
+    return text if text else fallback
+
+
+def _update_group_breakdown(
+    bucket: dict[str, dict[str, int]],
+    *,
+    label: str,
+    solved: bool,
+    semantic_available: bool,
+    semantic_verdict: str,
+    regression_rejections: int,
+) -> None:
+    row = bucket.setdefault(
+        label,
+        {
+            "total": 0,
+            "solved": 0,
+            "semantic_available": 0,
+            "semantic_pass": 0,
+            "regression_cases": 0,
+        },
+    )
+    row["total"] += 1
+    if solved:
+        row["solved"] += 1
+    if semantic_available:
+        row["semantic_available"] += 1
+        if semantic_verdict == "pass":
+            row["semantic_pass"] += 1
+    if regression_rejections > 0:
+        row["regression_cases"] += 1
+
+
+def _finalize_group_breakdown(
+    bucket: dict[str, dict[str, int]],
+    label_key: str,
+) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for label in sorted(bucket):
+        row = bucket[label]
+        total = int(row.get("total", 0))
+        solved = int(row.get("solved", 0))
+        semantic_available = int(row.get("semantic_available", 0))
+        semantic_pass = int(row.get("semantic_pass", 0))
+        out.append(
+            {
+                label_key: label,
+                "total": total,
+                "solved": solved,
+                "failed": max(0, total - solved),
+                "success_rate_percent": (100.0 * solved / total) if total else 0.0,
+                "semantic_available_cases": semantic_available,
+                "semantic_pass_rate_percent": (
+                    (100.0 * semantic_pass / semantic_available) if semantic_available else 0.0
+                ),
+                "cases_with_regression_rejections": int(row.get("regression_cases", 0)),
+            }
+        )
+    return out
+
+
 def _build_bench_summary(
     *,
     results: list[dict[str, object]],
@@ -4911,6 +5408,9 @@ def _build_bench_summary(
     deterministic_low_total = 0
     regression_cases = 0
     regression_total = 0
+    dataset_breakdown: dict[str, dict[str, int]] = {}
+    split_breakdown: dict[str, dict[str, int]] = {}
+    tag_counts: Counter[str] = Counter()
     for case in results:
         if not isinstance(case, dict):
             continue
@@ -4921,6 +5421,33 @@ def _build_bench_summary(
         if regressions > 0:
             regression_cases += 1
         regression_total += regressions
+        solved_case = bool(case.get("solved", False))
+        semantic_available_case = bool(case.get("semantic_available", False))
+        semantic_verdict_case = _normalize_semantic_verdict(case.get("semantic_verdict"))
+        dataset_label = _normalize_group_label(case.get("dataset"))
+        split_label = _normalize_group_label(case.get("split"))
+        _update_group_breakdown(
+            dataset_breakdown,
+            label=dataset_label,
+            solved=solved_case,
+            semantic_available=semantic_available_case,
+            semantic_verdict=semantic_verdict_case,
+            regression_rejections=regressions,
+        )
+        _update_group_breakdown(
+            split_breakdown,
+            label=split_label,
+            solved=solved_case,
+            semantic_available=semantic_available_case,
+            semantic_verdict=semantic_verdict_case,
+            regression_rejections=regressions,
+        )
+        tags = case.get("tags", [])
+        if isinstance(tags, list):
+            for raw in tags:
+                tag = str(raw).strip()
+                if tag:
+                    tag_counts[tag] += 1
         if not bool(case.get("semantic_available", False)):
             continue
         semantic_available += 1
@@ -4955,6 +5482,12 @@ def _build_bench_summary(
         "cases_with_regression_rejections": regression_cases,
         "regression_rejections_total": regression_total,
         "regression_rejection_rate_percent": regression_rate,
+        "dataset_breakdown": _finalize_group_breakdown(dataset_breakdown, "dataset"),
+        "split_breakdown": _finalize_group_breakdown(split_breakdown, "split"),
+        "top_tags": [
+            {"tag": tag, "count": count}
+            for tag, count in tag_counts.most_common(20)
+        ],
     }
 
 
@@ -4962,6 +5495,7 @@ def _build_bench_metadata(
     *,
     args: argparse.Namespace,
     suite_path: Path,
+    suite_entry: dict[str, object] | None,
     cases: list[dict[str, object]],
     started_at_epoch: float,
     finished_at_epoch: float,
@@ -4980,6 +5514,13 @@ def _build_bench_metadata(
         "run_duration_s": total_runtime_s,
         "ulam_version": __version__,
         "ulam_git_commit": _git_rev_parse(repo_root),
+        "suite_alias": str(suite_entry.get("name", "")).strip() if isinstance(suite_entry, dict) else "",
+        "suite_description": (
+            str(suite_entry.get("description", "")).strip() if isinstance(suite_entry, dict) else ""
+        ),
+        "suite_target_cases": int(suite_entry.get("target_cases", 0) or 0)
+        if isinstance(suite_entry, dict)
+        else 0,
         "suite_path": str(suite_path),
         "suite_sha256": _sha256_file(suite_path),
         "suite_cases": len(cases),
@@ -5115,8 +5656,10 @@ def _render_bench_markdown(report_payload: dict[str, object]) -> str:
         f"- Duration: {float(metadata.get('run_duration_s', 0.0)):.2f}s",
         f"- Ulam version: {metadata.get('ulam_version', '')}",
         f"- Ulam commit: {metadata.get('ulam_git_commit', '')}",
+        f"- Suite alias: {metadata.get('suite_alias', '')}",
         f"- Suite: {metadata.get('suite_path', '')}",
         f"- Suite SHA256: {metadata.get('suite_sha256', '')}",
+        f"- Suite cases (target/actual): {metadata.get('suite_target_cases', 0)}/{metadata.get('suite_cases', 0)}",
         f"- LLM: {metadata.get('llm_backend', '')} ({metadata.get('llm_model', '')})",
         f"- Lean backend: {metadata.get('lean_backend', '')}",
         f"- Lean project: {metadata.get('lean_project', '')}",
@@ -5134,25 +5677,85 @@ def _render_bench_markdown(report_payload: dict[str, object]) -> str:
             lines.append(f"- {name}: {count}")
         lines.append("")
 
+    dataset_rows = summary.get("dataset_breakdown", [])
+    if isinstance(dataset_rows, list) and dataset_rows:
+        lines.extend(
+            [
+                "## Dataset Breakdown",
+                "",
+                "| Dataset | Total | Solved | Success (%) | Semantic pass (%) | Regression cases |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in dataset_rows:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"| {item.get('dataset', '')} | "
+                f"{int(item.get('total', 0) or 0)} | "
+                f"{int(item.get('solved', 0) or 0)} | "
+                f"{float(item.get('success_rate_percent', 0.0) or 0.0):.1f} | "
+                f"{float(item.get('semantic_pass_rate_percent', 0.0) or 0.0):.1f} | "
+                f"{int(item.get('cases_with_regression_rejections', 0) or 0)} |"
+            )
+        lines.append("")
+
+    split_rows = summary.get("split_breakdown", [])
+    if isinstance(split_rows, list) and split_rows:
+        lines.extend(
+            [
+                "## Split Breakdown",
+                "",
+                "| Split | Total | Solved | Success (%) | Semantic pass (%) | Regression cases |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in split_rows:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"| {item.get('split', '')} | "
+                f"{int(item.get('total', 0) or 0)} | "
+                f"{int(item.get('solved', 0) or 0)} | "
+                f"{float(item.get('success_rate_percent', 0.0) or 0.0):.1f} | "
+                f"{float(item.get('semantic_pass_rate_percent', 0.0) or 0.0):.1f} | "
+                f"{int(item.get('cases_with_regression_rejections', 0) or 0)} |"
+            )
+        lines.append("")
+
+    top_tags = summary.get("top_tags", [])
+    if isinstance(top_tags, list) and top_tags:
+        lines.append("## Top Tags")
+        for item in top_tags[:15]:
+            if not isinstance(item, dict):
+                continue
+            tag = str(item.get("tag", "")).strip()
+            count = int(item.get("count", 0) or 0)
+            if tag:
+                lines.append(f"- {tag}: {count}")
+        lines.append("")
+
     failed_cases = [case for case in cases if isinstance(case, dict) and not bool(case.get("solved", False))]
     if failed_cases:
         lines.extend(
             [
                 "## Failed Cases",
                 "",
-                "| # | Theorem | Steps | Time (s) | Error Kind |",
-                "| --- | --- | ---: | ---: | --- |",
+                "| # | Theorem | Dataset | Split | Steps | Time (s) | Error Kind |",
+                "| --- | --- | --- | --- | ---: | ---: | --- |",
             ]
         )
         for case in failed_cases[:25]:
             theorem = str(case.get("theorem", "")).replace("|", "\\|")
+            dataset = str(case.get("dataset", "")).replace("|", "\\|")
+            split = str(case.get("split", "")).replace("|", "\\|")
             lines.append(
                 "| "
-                + f"{case.get('index', '')} | {theorem} | {case.get('steps', 0)} | "
+                + f"{case.get('index', '')} | {theorem} | {dataset} | {split} | {case.get('steps', 0)} | "
                 + f"{float(case.get('duration_s', 0.0)):.2f} | {case.get('error_kind', '')} |"
             )
         if len(failed_cases) > 25:
-            lines.append(f"| ... | ({len(failed_cases) - 25} more) |  |  |  |")
+            lines.append(f"| ... | ({len(failed_cases) - 25} more) |  |  |  |  |  |")
         lines.append("")
     return "\n".join(lines).rstrip()
 

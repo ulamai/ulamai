@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "suites": [
+    {
+      "name": "regression",
+      "path": "bench/regression.jsonl",
+      "description": "Legacy smoke regression suite.",
+      "target_cases": 1,
+      "kind": "fixed"
+    },
+    {
+      "name": "internal_regression",
+      "path": "bench/suites/internal_regression.jsonl",
+      "description": "Internal smoke regression suite.",
+      "target_cases": 1,
+      "kind": "fixed"
+    },
+    {
+      "name": "minif2f_dev",
+      "path": "bench/suites/minif2f_dev.jsonl",
+      "description": "Development placeholder miniF2F suite.",
+      "target_cases": 1,
+      "kind": "dev"
+    },
+    {
+      "name": "putnambench_sample",
+      "path": "bench/suites/putnambench_sample.jsonl",
+      "description": "Optional PutnamBench placeholder sample.",
+      "target_cases": 1,
+      "kind": "sample"
+    },
+    {
+      "name": "regression100",
+      "path": "bench/suites/regression100.jsonl",
+      "description": "Fixed-size 100-case regression suite.",
+      "target_cases": 100,
+      "kind": "fixed",
+      "generator_hint": "python3 -m ulam bench-make-regression100 --source bench/suites/minif2f_valid.jsonl --out bench/suites/regression100.jsonl --size 100 --seed 0"
+    }
+  ]
+}

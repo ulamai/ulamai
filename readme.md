@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.1.19)
-This repo contains a **first working scaffold** of the CLI and search loop. It is intentionally thin but runnable:
+## Status (v0.2.0)
+This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.1.19 highlights:** unified LLM runtime controls across providers: `llm.timeout_s` and `llm.heartbeat_s` now apply consistently to Ollama/API providers as well as CLI providers (including formalize path)
+- **v0.2.0 highlights:** optional Lean LSP backend for LLM/formalize typecheck loops, parity-gate automation in `bench-compare`, improved state/retrieval heuristics, suite alias registry, and deterministic `regression100` suite generation tooling
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -230,6 +230,8 @@ Run the regression suite (mock by default):
 
 ```bash
 python3 -m ulam bench --suite bench/regression.jsonl
+# alias form also works
+python3 -m ulam bench --suite regression
 ```
 
 Run the suite with machine-readable reports:
@@ -242,6 +244,8 @@ Validate a benchmark suite before running:
 
 ```bash
 python3 -m ulam bench-validate --suite bench/suites/internal_regression.jsonl
+# alias form
+python3 -m ulam bench-validate --suite internal_regression
 ```
 
 Build a miniF2F suite from a local checkout:
@@ -249,6 +253,23 @@ Build a miniF2F suite from a local checkout:
 ```bash
 python3 -m ulam bench-make-minif2f --root /path/to/miniF2F --split valid --out bench/suites/minif2f_valid.jsonl
 python3 -m ulam bench-validate --suite bench/suites/minif2f_valid.jsonl
+```
+
+List known suite aliases and status:
+
+```bash
+python3 -m ulam bench-list-suites
+```
+
+Build fixed `regression100` from a larger source suite:
+
+```bash
+python3 -m ulam bench-make-regression100 \
+  --source bench/suites/minif2f_valid.jsonl \
+  --out bench/suites/regression100.jsonl \
+  --size 100 \
+  --seed 0
+python3 -m ulam bench-validate --suite regression100
 ```
 
 Compare two benchmark reports:
@@ -280,6 +301,7 @@ scripts/run_bench_campaign.sh --suite bench/suites/internal_regression.jsonl -- 
 Notes:
 - Campaign runs default to local repo code (`python3 -m ulam`) for version consistency.
 - The wrapper now fails if report artifacts are missing or if report metadata version/commit does not match the repo checkout.
+- Bench report JSON/Markdown now include dataset/split breakdowns and top tags when suite rows provide that metadata.
 
 Build a retrieval index from local project + mathlib declarations:
 
@@ -558,7 +580,7 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 2. Strengthen parity-gate automation for LSP promotion (runner semantics, replay/cache stability, non-regression on internal + miniF2F slices).
 3. Continue improving proof-state canonicalization and scoring heuristics.
 4. Continue improving retrieval ranking/formatting quality for injected premises.
-5. Expand regression-suite management and reporting (including larger fixed suites such as `regression100`).
+5. Continue expanding regression-suite management and reporting (suite aliases/registry, fixed `regression100`, dataset/split/tag report breakdowns).
 
 ### v0.2 — “Feels powerful” baseline
 - Optional Lean LSP backend track for interactive goal/diagnostic loops in LLM/formalize mode (`Dojo` remains default for tactic search until parity gate).
@@ -567,7 +589,7 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Better scoring heuristic / lightweight value model (non-RL)
 - More robust retrieval formatting (names + one-line statements)
 - Stronger action constraints and cost controls (e.g., `aesop` budgeted)
-- Regression suite management (`ulam bench --suite regression100`)
+- Regression suite management (`ulam bench-list-suites`, fixed-suite builder, and `ulam bench --suite regression100` after generation)
 
 ### v0.3 — SFT training loop
 - Trace extraction into JSONL
