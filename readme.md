@@ -64,10 +64,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.0)
+## Status (v0.2.1)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.0 highlights:** optional Lean LSP backend for LLM/formalize typecheck loops, parity-gate automation in `bench-compare`, improved state/retrieval heuristics, suite alias registry, and deterministic `regression100` suite generation tooling
+- **v0.2.1 highlights:** inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, and baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`)
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
