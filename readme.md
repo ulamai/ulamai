@@ -263,6 +263,10 @@ Run a reproducible benchmark campaign (timestamped artifacts + env snapshot):
 scripts/run_bench_campaign.sh --suite bench/suites/internal_regression.jsonl -- --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
 ```
 
+Notes:
+- Campaign runs default to local repo code (`python3 -m ulam`) for version consistency.
+- The wrapper now fails if report artifacts are missing or if report metadata version/commit does not match the repo checkout.
+
 Build a retrieval index from local project + mathlib declarations:
 
 ```bash
@@ -520,12 +524,21 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Minimal regression suite (`ulam bench`)
 
 ### Next Version Mini-Pipeline (benchmark-ready gate)
-- Status: Phase 1-4 implemented (bench reports, suite validation/registry, anti-cheat metrics, comparison/campaign tooling).
+- Status:
+  - Completed: Phase 1-4 (bench reports, suite validation/registry, anti-cheat metrics, comparison/campaign tooling).
+  - Wrapped for now: Phase 5 campaign kickoff runs with `gpt-5.3-codex` have been executed; continue tuning as needed, but roadmap focus now moves to v0.2.
 - Harden `ulam bench` with machine-readable reports and reproducible metadata.
 - Package/validate benchmark suites (`miniF2F`, internal regression, optional PutnamBench sample).
 - Add anti-cheat benchmark metrics (semantic pass/fail, deterministic issue counts, regression rejections).
 - Add run-comparison tooling for model-vs-model and config-vs-config analysis.
 - Full implementation plan: `docs/benchmark_pipeline.md`
+
+### Next Up (Post Mini-Pipeline)
+1. Optional Lean LSP backend track for `prove --prove-mode llm` and formalize edit/typecheck loops (additive; Dojo remains default for tactic search).
+2. Define and automate the parity gate for any LSP promotion (runner semantics, replay/cache stability, non-regression on internal + miniF2F slices).
+3. Improve proof-state canonicalization and scoring heuristics.
+4. Improve retrieval ranking/formatting quality for injected premises.
+5. Expand regression-suite management and reporting (including larger fixed suites such as `regression100`).
 
 ### v0.2 — “Feels powerful” baseline
 - Optional Lean LSP backend track for interactive goal/diagnostic loops in LLM/formalize mode (`Dojo` remains default for tactic search until parity gate).
