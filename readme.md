@@ -565,23 +565,6 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Deterministic replay baseline with pinned metadata + strict execute/alignment checks (hardening ongoing)
 - Minimal regression suite (`ulam bench`)
 
-### Next Version Mini-Pipeline (benchmark-ready gate)
-- Status:
-  - Completed: Phase 1-4 (bench reports, suite validation/registry, anti-cheat metrics, comparison/campaign tooling).
-  - Wrapped for now: Phase 5 campaign kickoff runs with `gpt-5.3-codex` have been executed; continue tuning as needed, but roadmap focus now moves to v0.2.
-- Harden `ulam bench` with machine-readable reports and reproducible metadata.
-- Package/validate benchmark suites (`miniF2F`, internal regression, optional PutnamBench sample).
-- Add anti-cheat benchmark metrics (semantic pass/fail, deterministic issue counts, regression rejections).
-- Add run-comparison tooling for model-vs-model and config-vs-config analysis.
-- Full implementation plan: `docs/benchmark_pipeline.md`
-
-### Next Up (Post Mini-Pipeline)
-1. Harden and iterate on the new optional Lean LSP backend track for `prove --prove-mode llm` and formalize typecheck loops (additive; Dojo remains default for tactic search).
-2. Strengthen parity-gate automation for LSP promotion (runner semantics, replay/cache stability, non-regression on internal + miniF2F slices).
-3. Continue improving proof-state canonicalization and scoring heuristics.
-4. Continue improving retrieval ranking/formatting quality for injected premises.
-5. Continue expanding regression-suite management and reporting (suite aliases/registry, fixed `regression100`, dataset/split/tag report breakdowns).
-
 ### v0.2 — “Feels powerful” baseline
 - Optional Lean LSP backend track for interactive goal/diagnostic loops in LLM/formalize mode (`Dojo` remains default for tactic search until parity gate).
 - Define parity gate for any LSP promotion: runner `start/apply` semantics, replay/cache stability, and non-regression on internal + miniF2F slice.
