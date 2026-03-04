@@ -92,12 +92,29 @@ Deliverables:
   - pins model name
   - writes reports and traces into timestamped run dirs
   - captures environment snapshot
+  - optional baseline parity gate (`--compare-to`) for release checks
 - Add comparison utility:
   - compare two report JSON files by solved count, semantic pass rate, and median time.
 
 Acceptance criteria:
 - Two runs with same config produce comparable reports.
 - Regression checks can be automated in CI for selected suites.
+
+Release/CI gate command (recommended):
+
+```bash
+scripts/run_bench_campaign.sh \
+  --suite bench/suites/internal_regression.jsonl \
+  --compare-to runs/bench_campaigns/baseline/report.json \
+  --max-solved-drop 0 \
+  --max-success-rate-drop 0 \
+  --max-semantic-pass-rate-drop 0 \
+  --max-regression-rejection-rate-increase 0 \
+  --max-median-time-increase-pct 25 \
+  --max-planner-replan-triggers-increase 0 \
+  --max-planner-cached-tactic-tries-drop 0 \
+  -- --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
+```
 
 ## Phase 5: GPT-5.3-Codex Campaign Gate
 

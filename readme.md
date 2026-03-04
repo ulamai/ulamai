@@ -240,6 +240,14 @@ Run the suite with machine-readable reports:
 python3 -m ulam bench --suite bench/regression.jsonl --report-json runs/bench/latest.json --report-markdown runs/bench/latest.md
 ```
 
+Run with an inference profile (budgeted generate/rank/verify loop):
+
+```bash
+python3 -m ulam bench --suite internal_regression --llm codex_cli --openai-model gpt-5.3-codex --lean dojo --inference-profile balanced
+# optional explicit overrides
+python3 -m ulam bench --suite internal_regression --inference-profile verify --gen-k 8 --exec-k 3 --verify-level strict
+```
+
 Validate a benchmark suite before running:
 
 ```bash
@@ -289,8 +297,14 @@ python3 -m ulam bench-compare \
   --max-success-rate-drop 0 \
   --max-semantic-pass-rate-drop 0 \
   --max-regression-rejection-rate-increase 0 \
-  --max-median-time-increase-pct 25
+  --max-median-time-increase-pct 25 \
+  --max-planner-replan-triggers-increase 0 \
+  --max-planner-cached-tactic-tries-drop 0
 ```
+
+Notes:
+- `--gate` now also checks comparability by default: same suite SHA256 and same inference profile/budgets.
+- If you intentionally compare different suites or profile settings, pass `--allow-suite-mismatch` and/or `--allow-profile-mismatch`.
 
 Run a reproducible benchmark campaign (timestamped artifacts + env snapshot):
 
@@ -298,9 +312,27 @@ Run a reproducible benchmark campaign (timestamped artifacts + env snapshot):
 scripts/run_bench_campaign.sh --suite bench/suites/internal_regression.jsonl -- --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
 ```
 
+Run a gated campaign against a baseline report (release/CI style):
+
+```bash
+scripts/run_bench_campaign.sh \
+  --suite bench/suites/internal_regression.jsonl \
+  --compare-to runs/bench_campaigns/baseline/report.json \
+  --max-solved-drop 0 \
+  --max-success-rate-drop 0 \
+  --max-semantic-pass-rate-drop 0 \
+  --max-regression-rejection-rate-increase 0 \
+  --max-median-time-increase-pct 25 \
+  --max-planner-replan-triggers-increase 0 \
+  --max-planner-cached-tactic-tries-drop 0 \
+  -- --llm codex_cli --openai-model gpt-5.3-codex --lean dojo
+```
+
 Notes:
 - Campaign runs default to local repo code (`python3 -m ulam`) for version consistency.
 - The wrapper now fails if report artifacts are missing or if report metadata version/commit does not match the repo checkout.
+- When `--compare-to` is provided, the wrapper runs `bench-compare --gate` with strict non-regression defaults (including planner counters and profile/suite comparability checks).
+- Use `--allow-profile-mismatch` and/or `--allow-suite-mismatch` only for intentional cross-profile or cross-suite comparisons.
 - Bench report JSON/Markdown now include dataset/split breakdowns and top tags when suite rows provide that metadata.
 
 Build a retrieval index from local project + mathlib declarations:
@@ -573,6 +605,7 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - More robust retrieval formatting (names + one-line statements)
 - Stronger action constraints and cost controls (e.g., `aesop` budgeted)
 - Regression suite management (`ulam bench-list-suites`, fixed-suite builder, and `ulam bench --suite regression100` after generation)
+- Execution plan for next patch release: `docs/v0.2.1_plan.md`
 
 ### v0.3 — SFT training loop
 - Trace extraction into JSONL

@@ -26,6 +26,7 @@ class SearchResult:
     proof: list[str]
     steps: int
     error: Optional[str]
+    stats: dict[str, int] = field(default_factory=dict)
 
 
 def best_first_search(
@@ -48,33 +49,70 @@ def best_first_search(
     step_cache: dict[tuple[str, str], TacticResult] = {}
     tactic_head_attempts: dict[tuple[str, str], int] = {}
     repair_error_attempts: dict[tuple[str, str], int] = {}
+    plan_cache: dict[str, list[str]] = {}
+    stagnant_expansions = 0
+    planner_stats = _init_planner_stats()
     steps = 0
     best_progress: list[str] = []
     search_instruction = _search_instruction(config.instruction, config.theorem)
 
     while frontier and steps < config.max_steps:
         node = heapq.heappop(frontier)
+        made_progress = False
         _log(config, f"[state] {node.state.key} {_summarize_state(node.state.pretty)}")
+        round_instruction = search_instruction
+        if stagnant_expansions >= _STAGNATION_REPLAN_THRESHOLD:
+            _log(config, "[planner] stagnation detected; requesting replan-focused suggestions")
+            planner_stats["planner_replan_triggers"] += 1
+            round_instruction = _with_replan_hint(
+                base_instruction=search_instruction,
+                best_progress=best_progress,
+                current_state=node.state.pretty,
+            )
         retrieved = retriever.retrieve(node.state, k=config.retriever_k)
         if retrieved:
             _log(config, f"[retriever] {len(retrieved)} premises")
-        _log(config, f"[llm] requesting {config.suggestions_per_state} suggestions")
+        cached_tactics = _cached_plan_tactics(plan_cache, node.state.pretty)
+        if cached_tactics:
+            _log(config, f"[planner] cached tactics: {', '.join(cached_tactics[:4])}")
+            planner_stats["planner_cache_hit_states"] += 1
+            planner_stats["planner_cached_tactic_candidates"] += len(cached_tactics)
+        cached_tactic_set = set(cached_tactics)
+        request_k = max(
+            1,
+            int(
+                config.generation_budget_per_state
+                if config.generation_budget_per_state > 0
+                else config.suggestions_per_state
+            ),
+        )
+        _log(config, f"[llm] requesting {request_k} suggestions")
         suggestions = llm.propose(
             node.state,
             retrieved,
-            config.suggestions_per_state,
-            instruction=search_instruction,
+            request_k,
+            instruction=round_instruction,
             context=config.context,
             mode=mode,
         )
+        if cached_tactics:
+            suggestions = _merge_suggestions(cached_tactics, suggestions)
         if config.autop:
             suggestions = _merge_suggestions(suggestions, _autop_tactics())
         suggestions = _sanitize_suggestions(suggestions, theorem=config.theorem)
+        suggestions = _rank_and_limit_suggestions(
+            suggestions,
+            cached_tactics=cached_tactics,
+            execution_budget_per_state=config.execution_budget_per_state,
+            verification_level=config.verification_level,
+        )
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
         for tactic in suggestions:
             if steps >= config.max_steps:
                 break
+            if tactic in cached_tactic_set:
+                planner_stats["planner_cached_tactic_tries"] += 1
             if not _consume_state_tactic_budget(tactic_head_attempts, node.state.key, tactic):
                 _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
                 continue
@@ -103,8 +141,15 @@ def best_first_search(
             if result.ok and result.is_solved:
                 final_proof = node.proof + [tactic]
                 _emit_progress(config, final_proof)
-                return SearchResult(True, final_proof, steps, None)
+                return _with_planner_stats(
+                    SearchResult(True, final_proof, steps, None),
+                    planner_stats,
+                    plan_cache,
+                )
             if result.ok and result.new_state is not None:
+                made_progress = True
+                if _remember_plan_tactic(plan_cache, node.state.pretty, tactic, result.new_state.pretty):
+                    planner_stats["planner_remembered_tactics"] += 1
                 new_proof = node.proof + [tactic]
                 if len(new_proof) > len(best_progress):
                     best_progress = new_proof
@@ -150,8 +195,20 @@ def best_first_search(
                 if repaired.solved:
                     final_proof = node.proof + [repaired.tactic]
                     _emit_progress(config, final_proof)
-                    return SearchResult(True, final_proof, steps, None)
+                    return _with_planner_stats(
+                        SearchResult(True, final_proof, steps, None),
+                        planner_stats,
+                        plan_cache,
+                    )
                 if repaired.new_state is not None:
+                    made_progress = True
+                    if _remember_plan_tactic(
+                        plan_cache,
+                        node.state.pretty,
+                        repaired.tactic,
+                        repaired.new_state.pretty,
+                    ):
+                        planner_stats["planner_remembered_tactics"] += 1
                     new_proof = node.proof + [repaired.tactic]
                     if len(new_proof) > len(best_progress):
                         best_progress = new_proof
@@ -166,7 +223,16 @@ def best_first_search(
                         heapq.heappush(frontier, _Node(score=score, state=repaired.new_state, proof=new_proof))
                         _cap_frontier(frontier, config.beam_width)
 
-    return SearchResult(False, [], steps, "Search exhausted or max steps reached")
+        if made_progress:
+            stagnant_expansions = 0
+        else:
+            stagnant_expansions += 1
+
+    return _with_planner_stats(
+        SearchResult(False, [], steps, "Search exhausted or max steps reached"),
+        planner_stats,
+        plan_cache,
+    )
 
 
 @dataclass(frozen=True)
@@ -208,6 +274,12 @@ def _attempt_repair(
         suggestions,
         theorem=theorem,
         reject={failed_tactic},
+    )
+    suggestions = _rank_and_limit_suggestions(
+        suggestions,
+        cached_tactics=[],
+        execution_budget_per_state=config.execution_budget_per_state,
+        verification_level=config.verification_level,
     )
     steps_used = 0
     for tactic in suggestions:
@@ -265,12 +337,38 @@ def scripted_search(
     search_instruction = _search_instruction(config.instruction, config.theorem)
     tactic_head_attempts: dict[tuple[str, str], int] = {}
     repair_error_attempts: dict[tuple[str, str], int] = {}
+    plan_cache: dict[str, list[str]] = {}
+    stagnant_turns = 0
+    planner_stats = _init_planner_stats()
 
     while steps < config.max_steps:
         _log(config, f"[state] {state.key} {_summarize_state(state.pretty)}")
         retrieved = retriever.retrieve(state, k=config.retriever_k)
         if retrieved:
             _log(config, f"[retriever] {len(retrieved)} premises")
+        round_instruction = search_instruction
+        if stagnant_turns >= _STAGNATION_REPLAN_THRESHOLD:
+            _log(config, "[planner] stagnation detected; requesting replan-focused script")
+            planner_stats["planner_replan_triggers"] += 1
+            round_instruction = _with_replan_hint(
+                base_instruction=search_instruction,
+                best_progress=proof,
+                current_state=state.pretty,
+            )
+        cached_tactics = _cached_plan_tactics(plan_cache, state.pretty)
+        if cached_tactics:
+            _log(config, f"[planner] cached script heads: {', '.join(cached_tactics[:4])}")
+            planner_stats["planner_cache_hit_states"] += 1
+            planner_stats["planner_cached_tactic_candidates"] += len(cached_tactics)
+        cached_tactic_set = set(cached_tactics)
+        request_k = max(
+            1,
+            int(
+                config.generation_budget_per_state
+                if config.generation_budget_per_state > 0
+                else config.suggestions_per_state
+            ),
+        )
         if last_error and repair_budget > 0:
             error_kind = _error_kind(last_error) or "other"
             if _allow_repair_for_error_kind(repair_error_attempts, state.key, error_kind):
@@ -280,8 +378,8 @@ def scripted_search(
                     retrieved,
                     last_tactic or "",
                     last_error,
-                    config.suggestions_per_state,
-                    instruction=search_instruction,
+                    request_k,
+                    instruction=round_instruction,
                     context=config.context,
                     mode="script",
                 )
@@ -290,21 +388,29 @@ def scripted_search(
                 _log(config, f"[repair] skipped repeated error kind: {error_kind}")
                 suggestions = []
         else:
-            _log(config, f"[llm] requesting script ({config.suggestions_per_state} lines)")
+            _log(config, f"[llm] requesting script ({request_k} lines)")
             suggestions = llm.propose(
                 state,
                 retrieved,
-                config.suggestions_per_state,
-                instruction=search_instruction,
+                request_k,
+                instruction=round_instruction,
                 context=config.context,
                 mode="script",
             )
             repair_budget = config.repair_attempts
+        if cached_tactics:
+            suggestions = _merge_suggestions(cached_tactics, suggestions)
 
         suggestions = _sanitize_suggestions(
             suggestions,
             theorem=config.theorem,
             reject={last_tactic} if last_tactic else None,
+        )
+        suggestions = _rank_and_limit_suggestions(
+            suggestions,
+            cached_tactics=cached_tactics,
+            execution_budget_per_state=config.execution_budget_per_state,
+            verification_level=config.verification_level,
         )
         if suggestions:
             _log(config, f"[llm] suggestions: {', '.join(suggestions)}")
@@ -313,14 +419,24 @@ def scripted_search(
             if config.autop:
                 _log(config, "[policy] no valid script suggestions after filtering")
             else:
-                return SearchResult(False, proof, steps, "LLM returned no tactics")
+                return _with_planner_stats(
+                    SearchResult(False, proof, steps, "LLM returned no tactics"),
+                    planner_stats,
+                    plan_cache,
+                )
         else:
-            return SearchResult(False, proof, steps, "LLM returned no tactics")
+            return _with_planner_stats(
+                SearchResult(False, proof, steps, "LLM returned no tactics"),
+                planner_stats,
+                plan_cache,
+            )
 
         progressed = False
         for tactic in suggestions:
             if steps >= config.max_steps:
                 break
+            if tactic in cached_tactic_set:
+                planner_stats["planner_cached_tactic_tries"] += 1
             if not _consume_state_tactic_budget(tactic_head_attempts, state.key, tactic):
                 _log(config, f"[policy] skipped over-budget tactic head: {tactic}")
                 continue
@@ -342,10 +458,16 @@ def scripted_search(
             if result.ok and result.is_solved:
                 proof.append(tactic)
                 _emit_progress(config, proof)
-                return SearchResult(True, proof, steps, None)
+                return _with_planner_stats(
+                    SearchResult(True, proof, steps, None),
+                    planner_stats,
+                    plan_cache,
+                )
             if result.ok and result.new_state is not None:
                 proof.append(tactic)
                 _emit_progress(config, proof)
+                if _remember_plan_tactic(plan_cache, state.pretty, tactic, result.new_state.pretty):
+                    planner_stats["planner_remembered_tactics"] += 1
                 state = result.new_state
                 last_error = None
                 last_tactic = None
@@ -382,10 +504,16 @@ def scripted_search(
                 if result.ok and result.is_solved:
                     proof.append(tactic)
                     _emit_progress(config, proof)
-                    return SearchResult(True, proof, steps, None)
+                    return _with_planner_stats(
+                        SearchResult(True, proof, steps, None),
+                        planner_stats,
+                        plan_cache,
+                    )
                 if result.ok and result.new_state is not None:
                     proof.append(tactic)
                     _emit_progress(config, proof)
+                    if _remember_plan_tactic(plan_cache, state.pretty, tactic, result.new_state.pretty):
+                        planner_stats["planner_remembered_tactics"] += 1
                     state = result.new_state
                     last_error = None
                     last_tactic = None
@@ -394,10 +522,23 @@ def scripted_search(
                 last_error = result.error or "unknown error"
                 last_tactic = tactic
 
-        if not progressed and last_error and repair_budget <= 0:
-            return SearchResult(False, proof, steps, last_error)
+        if progressed:
+            stagnant_turns = 0
+        else:
+            stagnant_turns += 1
 
-    return SearchResult(False, proof, steps, "Search exhausted or max steps reached")
+        if not progressed and last_error and repair_budget <= 0:
+            return _with_planner_stats(
+                SearchResult(False, proof, steps, last_error),
+                planner_stats,
+                plan_cache,
+            )
+
+    return _with_planner_stats(
+        SearchResult(False, proof, steps, "Search exhausted or max steps reached"),
+        planner_stats,
+        plan_cache,
+    )
 
 
 def _step_from_result(
@@ -491,6 +632,75 @@ def _merge_suggestions(suggestions: list[str], extras: list[str]) -> list[str]:
     return merged
 
 
+_TACTIC_HEAD_RANK_PRIORITIES: dict[str, int] = {
+    "rfl": 0,
+    "exact": 0,
+    "simpa": 0,
+    "assumption": 0,
+    "constructor": 1,
+    "intro": 1,
+    "apply": 1,
+    "refine": 1,
+    "cases": 2,
+    "rcases": 2,
+    "rw": 2,
+    "simp": 3,
+    "ring_nf": 3,
+    "norm_num": 3,
+    "linarith": 4,
+    "nlinarith": 5,
+    "aesop": 6,
+}
+
+_STRICT_VERIFY_BLOCK_FRAGMENTS = (
+    "all_goals",
+    "repeat",
+    "<;>",
+    "first |",
+)
+
+
+def _rank_and_limit_suggestions(
+    suggestions: list[str],
+    *,
+    cached_tactics: list[str],
+    execution_budget_per_state: int,
+    verification_level: str,
+) -> list[str]:
+    verify = (verification_level or "light").strip().lower()
+    verified = [
+        tactic
+        for tactic in suggestions
+        if _verify_tactic_for_level(tactic, verify)
+    ]
+    cached_set = set(cached_tactics)
+    ranked = sorted(verified, key=lambda tactic: _tactic_rank_key(tactic, cached_set))
+    if execution_budget_per_state > 0:
+        ranked = ranked[:execution_budget_per_state]
+    return ranked
+
+
+def _verify_tactic_for_level(tactic: str, level: str) -> bool:
+    verify = (level or "light").strip().lower()
+    if verify in {"", "none", "light"}:
+        return True
+    lowered = tactic.lower()
+    if ";" in lowered:
+        return False
+    for fragment in _STRICT_VERIFY_BLOCK_FRAGMENTS:
+        if fragment in lowered:
+            return False
+    return True
+
+
+def _tactic_rank_key(tactic: str, cached_tactics: set[str]) -> tuple[int, int, int, int, str]:
+    head = _tactic_head(tactic)
+    priority = _TACTIC_HEAD_RANK_PRIORITIES.get(head, 7)
+    cached_rank = 0 if tactic in cached_tactics else 1
+    token_count = len(tactic.split())
+    return (cached_rank, priority, token_count, len(tactic), tactic)
+
+
 def _node_score(proof_len: int, state: ProofState) -> int:
     # Prefer shorter proofs, then states that look simpler.
     return proof_len * 1000 + _state_complexity(state.pretty)
@@ -560,6 +770,10 @@ _BLOCKED_TACTIC_HEADS: set[str] = {
     "aesop?",
 }
 
+_STAGNATION_REPLAN_THRESHOLD = 3
+_MAX_PLAN_CACHE_ENTRIES = 2000
+_MAX_PLAN_TACTICS_PER_STATE = 6
+
 
 def _search_instruction(instruction: str | None, theorem: str) -> str:
     theorem = theorem.strip()
@@ -571,6 +785,85 @@ def _search_instruction(instruction: str | None, theorem: str) -> str:
     if base:
         return base + "\n\n" + extra
     return extra
+
+
+def _init_planner_stats() -> dict[str, int]:
+    return {
+        "planner_cache_hit_states": 0,
+        "planner_cached_tactic_candidates": 0,
+        "planner_cached_tactic_tries": 0,
+        "planner_replan_triggers": 0,
+        "planner_remembered_tactics": 0,
+    }
+
+
+def _with_planner_stats(
+    result: SearchResult,
+    stats: dict[str, int],
+    plan_cache: dict[str, list[str]],
+) -> SearchResult:
+    merged = dict(stats)
+    merged["planner_cache_entries"] = len(plan_cache)
+    return SearchResult(
+        solved=result.solved,
+        proof=result.proof,
+        steps=result.steps,
+        error=result.error,
+        stats=merged,
+    )
+
+
+def _with_replan_hint(
+    *,
+    base_instruction: str,
+    best_progress: list[str],
+    current_state: str,
+) -> str:
+    hints = [
+        "Replan from the current goal state.",
+        "If the previous tactic family stalls, switch to a different tactic family.",
+        f"Current goal summary: {_summarize_state(current_state, max_chars=260)}",
+    ]
+    if best_progress:
+        recent = ", ".join(best_progress[-6:])
+        hints.append(f"Recent progress tactics: {recent}")
+    hints.append("Prefer short, composable tactics over one-shot expensive tactics.")
+    return base_instruction.rstrip() + "\n\n" + "\n".join(hints)
+
+
+def _cached_plan_tactics(plan_cache: dict[str, list[str]], state_pretty: str) -> list[str]:
+    return list(plan_cache.get(state_hash(state_pretty), []))
+
+
+def _remember_plan_tactic(
+    plan_cache: dict[str, list[str]],
+    state_pretty: str,
+    tactic: str,
+    new_state_pretty: str,
+) -> bool:
+    head = _tactic_head(tactic)
+    if not head:
+        return False
+    parent_complexity = _state_complexity(state_pretty)
+    child_complexity = _state_complexity(new_state_pretty)
+    # Keep tactics that usually maintain or simplify the state.
+    if child_complexity > parent_complexity + 20:
+        return False
+    key = state_hash(state_pretty)
+    cached = list(plan_cache.get(key, []))
+    if tactic in cached:
+        return False
+    if len(cached) >= _MAX_PLAN_TACTICS_PER_STATE:
+        return False
+    cached.append(tactic)
+    plan_cache[key] = cached
+    # Bound memory growth in long runs.
+    while len(plan_cache) > _MAX_PLAN_CACHE_ENTRIES:
+        oldest = next(iter(plan_cache))
+        if oldest == key:
+            break
+        plan_cache.pop(oldest, None)
+    return True
 
 
 def _sanitize_suggestions(

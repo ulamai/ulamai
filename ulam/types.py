@@ -52,3 +52,7 @@ class RunConfig:
     context: Optional[list[str]] = None
     verbose: bool = False
     on_progress: Optional[Callable[[list[str]], None]] = None
+    inference_profile: str = "default"
+    generation_budget_per_state: int = 0
+    execution_budget_per_state: int = 0
+    verification_level: str = "light"

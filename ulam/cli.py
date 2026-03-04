@@ -159,6 +159,30 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument("--max-steps", type=int, default=64)
     prove.add_argument("--beam", type=int, default=4)
     prove.add_argument("--k", type=int, default=1, help="suggestions per state")
+    prove.add_argument(
+        "--inference-profile",
+        choices=["default", "balanced", "explore", "verify"],
+        default="default",
+        help="inference preset for generate/rank/verify budgets",
+    )
+    prove.add_argument(
+        "--gen-k",
+        type=int,
+        default=0,
+        help="candidate generation budget per state (0 = profile default)",
+    )
+    prove.add_argument(
+        "--exec-k",
+        type=int,
+        default=0,
+        help="max executed tactics per state after ranking (0 = profile default/unlimited)",
+    )
+    prove.add_argument(
+        "--verify-level",
+        choices=["auto", "none", "light", "strict"],
+        default="auto",
+        help="tactic verification strictness before execution",
+    )
     prove.add_argument("--llm-rounds", type=int, default=4, help="LLM-only max rounds")
     prove.add_argument(
         "--llm-cycle-patience",
@@ -465,6 +489,30 @@ def main(argv: list[str] | None = None) -> None:
     bench.add_argument("--max-steps", type=int, default=64)
     bench.add_argument("--beam", type=int, default=4)
     bench.add_argument("--k", type=int, default=1, help="suggestions per state")
+    bench.add_argument(
+        "--inference-profile",
+        choices=["default", "balanced", "explore", "verify"],
+        default="default",
+        help="inference preset for generate/rank/verify budgets",
+    )
+    bench.add_argument(
+        "--gen-k",
+        type=int,
+        default=0,
+        help="candidate generation budget per state (0 = profile default)",
+    )
+    bench.add_argument(
+        "--exec-k",
+        type=int,
+        default=0,
+        help="max executed tactics per state after ranking (0 = profile default/unlimited)",
+    )
+    bench.add_argument(
+        "--verify-level",
+        choices=["auto", "none", "light", "strict"],
+        default="auto",
+        help="tactic verification strictness before execution",
+    )
     bench.add_argument("--timeout", type=float, default=5.0)
     bench.add_argument("--repair", type=int, default=2)
     bench.add_argument(
@@ -602,6 +650,28 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=25.0,
         help="maximum allowed increase in median duration percent (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-planner-replan-triggers-increase",
+        type=float,
+        default=0.0,
+        help="maximum allowed increase in planner replan triggers (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-planner-cached-tactic-tries-drop",
+        type=float,
+        default=0.0,
+        help="maximum allowed drop in planner cached tactic tries (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--allow-profile-mismatch",
+        action="store_true",
+        help="allow parity gate to pass even when inference profile/budgets differ",
+    )
+    bench_compare.add_argument(
+        "--allow-suite-mismatch",
+        action="store_true",
+        help="allow parity gate to pass even when suite SHA256 differs or is unavailable",
     )
     bench_make_minif2f = sub.add_parser(
         "bench-make-minif2f",
@@ -782,8 +852,14 @@ def run_prove(args: argparse.Namespace) -> None:
     config_data = load_config()
     profile = _resolve_proof_profile(args, config_data)
     _apply_proof_profile_to_args(args, profile)
+    inf_profile, gen_k, exec_k, verify_level = _apply_inference_runtime_to_args(args)
     if getattr(args, "verbose", False):
         print(f"[policy] profile={profile}")
+        exec_text = "all" if exec_k <= 0 else str(exec_k)
+        print(
+            f"[policy] inference_profile={inf_profile} "
+            f"(gen_k={gen_k}, exec_k={exec_text}, verify={verify_level})"
+        )
     if args.prove_mode != "llm" and args.lean in {"cli", "lsp"}:
         print("Lean backend `cli|lsp` is only supported with `--prove-mode llm`.")
         print("Use `--lean dojo` (or `--lean mock`) for tactic/lemma search modes.")
@@ -809,6 +885,10 @@ def run_prove(args: argparse.Namespace) -> None:
         context=context,
         verbose=bool(args.verbose),
         on_progress=_proof_progress_callback(args.file, args.theorem, verbose=bool(args.verbose)),
+        inference_profile=inf_profile,
+        generation_budget_per_state=gen_k,
+        execution_budget_per_state=exec_k,
+        verification_level=verify_level,
     )
     _preflight_lean_alignment(args)
 
@@ -837,6 +917,12 @@ def run_prove(args: argparse.Namespace) -> None:
             print(f"[run] trace={config.trace_path}")
             print(f"[run] solver={solver}")
             print(f"[run] autop={'on' if config.autop else 'off'}")
+            exec_text = "all" if config.execution_budget_per_state <= 0 else str(config.execution_budget_per_state)
+            print(
+                f"[run] inference_profile={config.inference_profile} "
+                f"gen_k={config.generation_budget_per_state} exec_k={exec_text} "
+                f"verify={config.verification_level}"
+            )
 
         _write_trace_metadata(
             config.trace_path,
@@ -853,7 +939,9 @@ def run_prove(args: argparse.Namespace) -> None:
         retriever = _make_retriever(args)
         trace = TraceLogger(config.trace_path)
         try:
-            return _run_with_solver(solver, runner, llm, retriever, trace, config)
+            result = _run_with_solver(solver, runner, llm, retriever, trace, config)
+            _write_trace_result_metadata(config.trace_path, result)
+            return result
         finally:
             trace.close()
             runner.close()
@@ -942,8 +1030,18 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
 
     error: str | None = None
     error_counts: dict[str, int] = {}
+    failure_cluster_counts: dict[str, int] = {}
     best_score = _llm_round_score(text, args.theorem)
     stalled_rounds = 0
+
+    def _assign_error(reason: str) -> str:
+        nonlocal error
+        pivot_hint = _llm_strategy_pivot_error(
+            reason=reason,
+            cluster_counts=failure_cluster_counts,
+        )
+        error = pivot_hint if pivot_hint else reason
+        return error
 
     def _bump_cycle(current_text: str, reason: str) -> None:
         nonlocal error, best_score, stalled_rounds
@@ -1004,8 +1102,10 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             edit_scope=edit_scope,
         )
         if scope_error:
-            error = scope_error
+            assigned = _assign_error(scope_error)
             print(f"[scope] {scope_error}")
+            if assigned != scope_error:
+                print("[cycle] repeated scope-error cluster; forcing strategy pivot.")
             count = _record_error_count(error_counts, scope_error)
             if count >= 3:
                 print("[stagnation] same scope error repeated multiple rounds; stopping.")
@@ -1018,13 +1118,16 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
         args.file.write_text(updated, encoding="utf-8")
         text = updated
         if _decl_has_placeholder(updated, args.theorem):
-            error = f"Declaration `{args.theorem}` still contains sorry/admit."
-            print(f"[typecheck] {error}")
-            count = _record_error_count(error_counts, error)
+            placeholder_error = f"Declaration `{args.theorem}` still contains sorry/admit."
+            assigned = _assign_error(placeholder_error)
+            print(f"[typecheck] {placeholder_error}")
+            if assigned != placeholder_error:
+                print("[cycle] repeated placeholder-error cluster; forcing strategy pivot.")
+            count = _record_error_count(error_counts, placeholder_error)
             if count >= 3:
                 print("[stagnation] same error repeated multiple rounds; stopping.")
                 break
-            _bump_cycle(updated, error)
+            _bump_cycle(updated, placeholder_error)
             continue
         check_error = _llm_typecheck_error(
             file_path=args.file,
@@ -1033,8 +1136,10 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             backend=llm_lean_backend,
         )
         if check_error:
-            error = check_error
+            assigned = _assign_error(check_error)
             print(f"[typecheck] error: {check_error[:200]}")
+            if assigned != check_error:
+                print("[cycle] repeated typecheck-error cluster; forcing strategy pivot.")
             count = _record_error_count(error_counts, check_error)
             if count >= 3:
                 print("[stagnation] same typecheck error repeated multiple rounds; stopping.")
@@ -1043,8 +1148,10 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             continue
         axiom_error = _axiom_guardrail_error(updated, allow_axioms)
         if axiom_error:
-            error = axiom_error
+            assigned = _assign_error(axiom_error)
             print(f"[axiom] {axiom_error}")
+            if assigned != axiom_error:
+                print("[cycle] repeated axiom-error cluster; forcing strategy pivot.")
             count = _record_error_count(error_counts, axiom_error)
             if count >= 3:
                 print("[stagnation] same axiom guardrail error repeated multiple rounds; stopping.")
@@ -1077,6 +1184,51 @@ def _llm_replan_hint(reason: str) -> str:
         "- Avoid repeating the same failing tactic/script pattern.\n"
         f"- Last blocker: {short}"
     )
+
+
+def _llm_strategy_pivot_error(
+    *,
+    reason: str,
+    cluster_counts: dict[str, int],
+) -> str:
+    cluster = _llm_error_cluster(reason)
+    count = cluster_counts.get(cluster, 0) + 1
+    cluster_counts[cluster] = count
+    if count < 2:
+        return reason
+    return (
+        reason.rstrip()
+        + "\n\n"
+        + "STRATEGY PIVOT REQUIRED:\n"
+        + f"- Failure cluster repeated ({cluster}, count={count}).\n"
+        + "- Change tactic family and intermediate lemmas.\n"
+        + "- Do not repeat previous failing script shape.\n"
+        + "- Prefer short compositional steps and validate each change."
+    )
+
+
+def _llm_error_cluster(reason: str) -> str:
+    text = (reason or "").strip()
+    if not text:
+        return "empty"
+    head = text.splitlines()[0].strip().lower()
+    head = re.sub(r":[0-9]+:[0-9]+", ":#:#", head)
+    head = re.sub(r"\b[0-9]{2,}\b", "#", head)
+    if "still contains sorry" in head or "admit" in head:
+        return "placeholder"
+    if "unknown identifier" in head:
+        return "unknown_identifier"
+    if "type mismatch" in head:
+        return "type_mismatch"
+    if "unsolved goals" in head:
+        return "unsolved_goals"
+    if "timeout" in head or "timed out" in head:
+        return "timeout"
+    if "axiom" in head:
+        return "axiom"
+    if "scope guardrail" in head or "edit scope" in head:
+        return "scope"
+    return head[:120]
 
 
 def _append_context_block(base: str, title: str, body: str) -> str:
@@ -1689,6 +1841,7 @@ def _print_available_lean_files(root: Path, max_items: int = 20) -> None:
 
 
 def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchResult | None:
+    inf_profile, gen_k, exec_k, verify_level = _apply_inference_runtime_to_args(args)
     context = _read_context_files(args.context)
     trace_path = _trace_path_for_theorem(args, theorem)
     solver = _resolve_solver(args)
@@ -1708,6 +1861,10 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         context=context,
         verbose=bool(args.verbose),
         on_progress=_proof_progress_callback(args.file, theorem, verbose=bool(args.verbose)),
+        inference_profile=inf_profile,
+        generation_budget_per_state=gen_k,
+        execution_budget_per_state=exec_k,
+        verification_level=verify_level,
     )
 
     def _run_once() -> SearchResult:
@@ -1733,6 +1890,12 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
                 print(f"[run] context_files={len(args.context)}")
             print(f"[run] trace={config.trace_path}")
             print(f"[run] solver={solver}")
+            exec_text = "all" if config.execution_budget_per_state <= 0 else str(config.execution_budget_per_state)
+            print(
+                f"[run] inference_profile={config.inference_profile} "
+                f"gen_k={config.generation_budget_per_state} exec_k={exec_text} "
+                f"verify={config.verification_level}"
+            )
 
         _write_trace_metadata(
             config.trace_path,
@@ -1749,7 +1912,9 @@ def _run_search_for_theorem(args: argparse.Namespace, theorem: str) -> SearchRes
         retriever = _make_retriever(args)
         trace = TraceLogger(config.trace_path)
         try:
-            return _run_with_solver(solver, runner, llm, retriever, trace, config)
+            result = _run_with_solver(solver, runner, llm, retriever, trace, config)
+            _write_trace_result_metadata(config.trace_path, result)
+            return result
         finally:
             trace.close()
             runner.close()
@@ -1786,6 +1951,42 @@ def _resolve_solver(args: argparse.Namespace) -> str:
     return solver
 
 
+def _resolve_inference_runtime(args: argparse.Namespace) -> tuple[str, int, int, str]:
+    profile = str(getattr(args, "inference_profile", "default") or "default").strip().lower()
+    if profile not in {"default", "balanced", "explore", "verify"}:
+        profile = "default"
+    base_k = max(1, int(getattr(args, "k", 1) or 1))
+    raw_gen_k = max(0, int(getattr(args, "gen_k", 0) or 0))
+    raw_exec_k = max(0, int(getattr(args, "exec_k", 0) or 0))
+    verify_raw = str(getattr(args, "verify_level", "auto") or "auto").strip().lower()
+    if verify_raw not in {"auto", "none", "light", "strict"}:
+        verify_raw = "auto"
+
+    defaults = {
+        "default": (base_k, 0, "light"),
+        "balanced": (max(base_k, 6), 3, "strict"),
+        "explore": (max(base_k, 10), 5, "light"),
+        "verify": (max(base_k, 5), 2, "strict"),
+    }
+    gen_k, exec_k, verify_level = defaults[profile]
+    if raw_gen_k > 0:
+        gen_k = raw_gen_k
+    if raw_exec_k > 0:
+        exec_k = raw_exec_k
+    if verify_raw != "auto":
+        verify_level = verify_raw
+    return profile, int(gen_k), int(exec_k), str(verify_level)
+
+
+def _apply_inference_runtime_to_args(args: argparse.Namespace) -> tuple[str, int, int, str]:
+    profile, gen_k, exec_k, verify_level = _resolve_inference_runtime(args)
+    args.inference_profile = profile
+    args.effective_gen_k = gen_k
+    args.effective_exec_k = exec_k
+    args.effective_verify_level = verify_level
+    return profile, gen_k, exec_k, verify_level
+
+
 def _run_with_solver(
     solver: str,
     runner,
@@ -1819,10 +2020,41 @@ def _portfolio_search(
         return first
     second_cfg = replace(config, max_steps=remaining)
     second = best_first_search(runner, llm, retriever, trace, second_cfg)
+    merged_stats = _merge_search_stats(first.stats, second.stats)
     if second.solved:
-        return SearchResult(True, second.proof, first.steps + second.steps, None)
+        return SearchResult(True, second.proof, first.steps + second.steps, None, stats=merged_stats)
     error = second.error or first.error or "portfolio exhausted"
-    return SearchResult(False, [], first.steps + second.steps, error)
+    return SearchResult(False, [], first.steps + second.steps, error, stats=merged_stats)
+
+
+def _merge_search_stats(*stats_rows: dict[str, int] | None) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for row in stats_rows:
+        if not isinstance(row, dict):
+            continue
+        for key, value in row.items():
+            try:
+                amount = int(value)
+            except Exception:
+                continue
+            merged[key] = merged.get(key, 0) + amount
+    return merged
+
+
+def _planner_case_metrics(result: SearchResult) -> dict[str, int]:
+    allowed = {
+        "planner_cache_hit_states",
+        "planner_cached_tactic_candidates",
+        "planner_cached_tactic_tries",
+        "planner_replan_triggers",
+        "planner_remembered_tactics",
+    }
+    out: dict[str, int] = {}
+    for key, value in _merge_search_stats(result.stats).items():
+        if key not in allowed:
+            continue
+        out[key] = int(value)
+    return out
 
 
 def _bench_error_kind(error: str | None) -> str | None:
@@ -2099,6 +2331,28 @@ def _write_trace_metadata(trace_path: Path | None, metadata: dict | None) -> Non
     meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
+def _write_trace_result_metadata(trace_path: Path | None, result: SearchResult) -> None:
+    if trace_path is None or str(trace_path) == "-":
+        return
+    meta_path = _trace_meta_path(trace_path)
+    payload: dict[str, object] = {}
+    if meta_path.exists():
+        try:
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload = loaded
+    payload["search_result"] = {
+        "solved": bool(result.solved),
+        "steps": int(result.steps),
+        "error": str(result.error or ""),
+    }
+    payload["search_stats"] = _merge_search_stats(result.stats)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
 def _load_trace_metadata(trace_path: Path, explicit: Path | None) -> dict:
     path = explicit if explicit is not None else _trace_meta_path(trace_path)
     if not path.exists():
@@ -2147,6 +2401,12 @@ def _trace_metadata_payload(
         "max_steps": int(getattr(args, "max_steps", 0)),
         "beam": int(getattr(args, "beam", 0)),
         "k": int(getattr(args, "k", 0)),
+        "inference_profile": str(getattr(args, "inference_profile", "default") or "default"),
+        "generation_budget_per_state": int(
+            getattr(args, "effective_gen_k", getattr(args, "k", 1)) or 1
+        ),
+        "execution_budget_per_state": int(getattr(args, "effective_exec_k", 0) or 0),
+        "verification_level": str(getattr(args, "effective_verify_level", "light") or "light"),
         "timeout_s": float(getattr(args, "timeout", 0.0)),
         "typecheck_timeout_s": float(_resolve_typecheck_timeout(args)),
         "repair_attempts": int(getattr(args, "repair", 0)),
@@ -4236,6 +4496,7 @@ def run_bench_list_suites(args: argparse.Namespace) -> None:
 
 
 def run_bench(args: argparse.Namespace) -> None:
+    inf_profile, gen_k, exec_k, verify_level = _apply_inference_runtime_to_args(args)
     try:
         suite_path, suite_entry = _resolve_bench_suite_input(args.suite)
     except Exception as exc:
@@ -4252,6 +4513,12 @@ def run_bench(args: argparse.Namespace) -> None:
     if not cases:
         print(f"Suite has no cases: {suite_path}")
         return
+    if bool(getattr(args, "verbose", False)):
+        exec_text = "all" if exec_k <= 0 else str(exec_k)
+        print(
+            f"[policy] inference_profile={inf_profile} "
+            f"(gen_k={gen_k}, exec_k={exec_text}, verify={verify_level})"
+        )
 
     llm = _make_llm(args)
     started_at_epoch = time.time()
@@ -4274,6 +4541,7 @@ def run_bench(args: argparse.Namespace) -> None:
         if isinstance(tags_raw, list):
             tags = [str(item).strip() for item in tags_raw if str(item).strip()]
         case_args = argparse.Namespace(**vars(args))
+        _apply_inference_runtime_to_args(case_args)
         case_args.premises = premises if premises is not None else args.premises
         context = _read_context_files(case_args.context)
         solver = _resolve_solver(case_args)
@@ -4297,6 +4565,18 @@ def run_bench(args: argparse.Namespace) -> None:
             instruction=args.instruction.strip() if args.instruction else None,
             context=context,
             verbose=bool(args.verbose),
+            inference_profile=str(getattr(case_args, "inference_profile", "default") or "default"),
+            generation_budget_per_state=max(
+                1,
+                int(getattr(case_args, "effective_gen_k", getattr(case_args, "k", 1)) or 1),
+            ),
+            execution_budget_per_state=max(
+                0,
+                int(getattr(case_args, "effective_exec_k", 0) or 0),
+            ),
+            verification_level=str(
+                getattr(case_args, "effective_verify_level", "light") or "light"
+            ),
         )
         _write_trace_metadata(
             trace_path,
@@ -4324,6 +4604,7 @@ def run_bench(args: argparse.Namespace) -> None:
                 trace.close()
             if runner is not None:
                 runner.close()
+        _write_trace_result_metadata(trace_path, result)
         duration_s = time.perf_counter() - start
         durations_s.append(duration_s)
         step_counts.append(result.steps)
@@ -4337,6 +4618,7 @@ def run_bench(args: argparse.Namespace) -> None:
             semantic_report=semantic_report if isinstance(semantic_report, Path) else None,
             artifact_dir=artifact_dir if isinstance(artifact_dir, Path) else None,
         )
+        planner = _planner_case_metrics(result)
         results.append(
             {
                 "index": idx,
@@ -4359,6 +4641,13 @@ def run_bench(args: argparse.Namespace) -> None:
                 "deterministic_issues_medium": int(semantic.get("medium", 0) or 0),
                 "deterministic_issues_low": int(semantic.get("low", 0) or 0),
                 "regression_rejections": int(semantic.get("regression_rejections", 0) or 0),
+                "planner_cache_hit_states": int(planner.get("planner_cache_hit_states", 0)),
+                "planner_cached_tactic_candidates": int(
+                    planner.get("planner_cached_tactic_candidates", 0)
+                ),
+                "planner_cached_tactic_tries": int(planner.get("planner_cached_tactic_tries", 0)),
+                "planner_replan_triggers": int(planner.get("planner_replan_triggers", 0)),
+                "planner_remembered_tactics": int(planner.get("planner_remembered_tactics", 0)),
             }
         )
         if result.solved:
@@ -4418,6 +4707,16 @@ def run_bench(args: argparse.Namespace) -> None:
         f"({int(summary_payload.get('cases_with_regression_rejections', 0) or 0)}/{len(results)} cases)",
         flush=True,
     )
+    planner_replans = int(summary_payload.get("planner_replan_triggers_total", 0) or 0)
+    planner_hits = int(summary_payload.get("planner_cache_hit_states_total", 0) or 0)
+    if planner_replans or planner_hits:
+        print(
+            "Planner stats: "
+            f"replans={planner_replans}, "
+            f"cache_hit_states={planner_hits}, "
+            f"cached_tactic_tries={int(summary_payload.get('planner_cached_tactic_tries_total', 0) or 0)}",
+            flush=True,
+        )
     report_payload = {
         "schema": 1,
         "metadata": _build_bench_metadata(
@@ -5057,11 +5356,16 @@ def run_bench_compare(args: argparse.Namespace) -> None:
     meta_b = report_b.get("metadata", {}) if isinstance(report_b.get("metadata"), dict) else {}
     label_a = _report_label(meta_a)
     label_b = _report_label(meta_b)
+    inference_a = _inference_signature(meta_a)
+    inference_b = _inference_signature(meta_b)
     suite_a = str(meta_a.get("suite_alias") or meta_a.get("suite_path") or "").strip()
     suite_b = str(meta_b.get("suite_alias") or meta_b.get("suite_path") or "").strip()
     suite_sha_a = str(meta_a.get("suite_sha256", "") or "").strip()
     suite_sha_b = str(meta_b.get("suite_sha256", "") or "").strip()
-    same_suite_sha = bool(suite_sha_a and suite_sha_a == suite_sha_b)
+    comparable_suite_sha = bool(suite_sha_a and suite_sha_b)
+    same_suite_sha = bool(comparable_suite_sha and suite_sha_a == suite_sha_b)
+    comparable_inference = bool(inference_a and inference_b)
+    same_inference = bool(comparable_inference and inference_a == inference_b)
 
     delta = _bench_metrics_delta(metrics_a, metrics_b)
     payload = {
@@ -5071,16 +5375,29 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         "report_b": str(path_b),
         "label_a": label_a,
         "label_b": label_b,
+        "inference_a": inference_a,
+        "inference_b": inference_b,
         "suite_a": suite_a,
         "suite_b": suite_b,
         "suite_sha_a": suite_sha_a,
         "suite_sha_b": suite_sha_b,
+        "comparable_suite_sha": comparable_suite_sha,
         "same_suite_sha": same_suite_sha,
+        "comparable_inference": comparable_inference,
+        "same_inference": same_inference,
         "metrics_a": metrics_a,
         "metrics_b": metrics_b,
         "delta": delta,
     }
-    gate = _evaluate_bench_parity_gate(metrics_a, metrics_b, args)
+    gate = _evaluate_bench_parity_gate(
+        metrics_a,
+        metrics_b,
+        args,
+        comparable_suite_sha=comparable_suite_sha,
+        same_suite_sha=same_suite_sha,
+        comparable_inference=comparable_inference,
+        same_inference=same_inference,
+    )
     payload["gate"] = gate
 
     print(f"Benchmark comparison: A={path_a} ({label_a}) vs B={path_b} ({label_b})")
@@ -5110,10 +5427,27 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         metrics_b["regression_rejection_rate_percent"],
         as_percent=True,
     )
+    _print_metric_delta(
+        "Planner replan triggers",
+        metrics_a["planner_replan_triggers_total"],
+        metrics_b["planner_replan_triggers_total"],
+        as_percent=False,
+    )
+    _print_metric_delta(
+        "Planner cached tactic tries",
+        metrics_a["planner_cached_tactic_tries_total"],
+        metrics_b["planner_cached_tactic_tries_total"],
+        as_percent=False,
+    )
     if suite_a or suite_b:
         print(f"- Suite A: {suite_a or '(unknown)'}")
         print(f"- Suite B: {suite_b or '(unknown)'}")
-    if suite_sha_a and suite_sha_b and not same_suite_sha:
+    if inference_a or inference_b:
+        print(f"- Inference A: {inference_a or '(unknown)'}")
+        print(f"- Inference B: {inference_b or '(unknown)'}")
+        if inference_a and inference_b and inference_a != inference_b:
+            print("- NOTE: inference profile/budgets differ between A and B.")
+    if comparable_suite_sha and not same_suite_sha:
         print("- WARNING: suite SHA256 differs between A and B; parity comparison may be invalid.")
     if bool(getattr(args, "gate", False)):
         print(f"Parity gate: {'PASS' if gate['passed'] else 'FAIL'}")
@@ -5139,6 +5473,11 @@ def _evaluate_bench_parity_gate(
     metrics_a: dict[str, float],
     metrics_b: dict[str, float],
     args: argparse.Namespace,
+    *,
+    comparable_suite_sha: bool,
+    same_suite_sha: bool,
+    comparable_inference: bool,
+    same_inference: bool,
 ) -> dict[str, object]:
     max_solved_drop = max(0.0, float(getattr(args, "max_solved_drop", 0.0)))
     max_success_rate_drop = max(0.0, float(getattr(args, "max_success_rate_drop", 0.0)))
@@ -5150,6 +5489,14 @@ def _evaluate_bench_parity_gate(
     max_median_time_increase_pct = max(
         0.0,
         float(getattr(args, "max_median_time_increase_pct", 25.0)),
+    )
+    max_planner_replan_increase = max(
+        0.0,
+        float(getattr(args, "max_planner_replan_triggers_increase", 0.0)),
+    )
+    max_planner_cached_drop = max(
+        0.0,
+        float(getattr(args, "max_planner_cached_tactic_tries_drop", 0.0)),
     )
 
     solved_drop = max(0.0, float(metrics_a.get("solved", 0.0)) - float(metrics_b.get("solved", 0.0)))
@@ -5174,6 +5521,19 @@ def _evaluate_bench_parity_gate(
         median_time_increase_pct = 0.0 if median_b <= 0.0 else float("inf")
     else:
         median_time_increase_pct = max(0.0, ((median_b - median_a) / median_a) * 100.0)
+    planner_replan_increase = max(
+        0.0,
+        float(metrics_b.get("planner_replan_triggers_total", 0.0))
+        - float(metrics_a.get("planner_replan_triggers_total", 0.0)),
+    )
+    planner_cached_tries_drop = max(
+        0.0,
+        float(metrics_a.get("planner_cached_tactic_tries_total", 0.0))
+        - float(metrics_b.get("planner_cached_tactic_tries_total", 0.0)),
+    )
+    allow_profile_mismatch = bool(getattr(args, "allow_profile_mismatch", False))
+    allow_suite_mismatch = bool(getattr(args, "allow_suite_mismatch", False))
+    gate_enabled = bool(getattr(args, "gate", False))
 
     reasons: list[str] = []
     if solved_drop > max_solved_drop:
@@ -5200,9 +5560,41 @@ def _evaluate_bench_parity_gate(
         reasons.append(
             f"median-time increase {value} exceeds allowed {max_median_time_increase_pct:.2f}%"
         )
+    if planner_replan_increase > max_planner_replan_increase:
+        reasons.append(
+            "planner-replan-trigger increase "
+            f"{planner_replan_increase:.2f} exceeds allowed {max_planner_replan_increase:.2f}"
+        )
+    if planner_cached_tries_drop > max_planner_cached_drop:
+        reasons.append(
+            "planner-cached-tactic-tries drop "
+            f"{planner_cached_tries_drop:.2f} exceeds allowed {max_planner_cached_drop:.2f}"
+        )
+    if gate_enabled and not allow_profile_mismatch:
+        if not comparable_inference:
+            reasons.append(
+                "inference profile metadata missing in one or both reports "
+                "(use --allow-profile-mismatch to bypass)"
+            )
+        elif not same_inference:
+            reasons.append(
+                "inference profile/budgets mismatch between A and B "
+                "(use --allow-profile-mismatch to bypass)"
+            )
+    if gate_enabled and not allow_suite_mismatch:
+        if not comparable_suite_sha:
+            reasons.append(
+                "suite SHA256 missing in one or both reports "
+                "(use --allow-suite-mismatch to bypass)"
+            )
+        elif not same_suite_sha:
+            reasons.append(
+                "suite SHA256 mismatch between A and B "
+                "(use --allow-suite-mismatch to bypass)"
+            )
 
     return {
-        "enabled": bool(getattr(args, "gate", False)),
+        "enabled": gate_enabled,
         "passed": len(reasons) == 0,
         "thresholds": {
             "max_solved_drop": max_solved_drop,
@@ -5210,6 +5602,10 @@ def _evaluate_bench_parity_gate(
             "max_semantic_pass_rate_drop": max_semantic_pass_drop,
             "max_regression_rejection_rate_increase": max_regression_increase,
             "max_median_time_increase_pct": max_median_time_increase_pct,
+            "max_planner_replan_triggers_increase": max_planner_replan_increase,
+            "max_planner_cached_tactic_tries_drop": max_planner_cached_drop,
+            "allow_profile_mismatch": allow_profile_mismatch,
+            "allow_suite_mismatch": allow_suite_mismatch,
         },
         "actual": {
             "solved_drop": solved_drop,
@@ -5217,6 +5613,12 @@ def _evaluate_bench_parity_gate(
             "semantic_pass_rate_drop": semantic_pass_drop,
             "regression_rejection_rate_increase": regression_rejection_increase,
             "median_time_increase_pct": median_time_increase_pct,
+            "planner_replan_triggers_increase": planner_replan_increase,
+            "planner_cached_tactic_tries_drop": planner_cached_tries_drop,
+            "comparable_inference": comparable_inference,
+            "same_inference": same_inference,
+            "comparable_suite_sha": comparable_suite_sha,
+            "same_suite_sha": same_suite_sha,
         },
         "reasons": reasons,
     }
@@ -5225,11 +5627,32 @@ def _evaluate_bench_parity_gate(
 def _report_label(metadata: dict) -> str:
     llm_backend = str(metadata.get("llm_backend", "")).strip()
     llm_model = str(metadata.get("llm_model", "")).strip()
+    inference = _inference_signature(metadata)
     if llm_backend and llm_model:
-        return f"{llm_backend}:{llm_model}"
+        base = f"{llm_backend}:{llm_model}"
+        return f"{base} [{inference}]" if inference else base
     if llm_backend:
-        return llm_backend
-    return "unknown"
+        return f"{llm_backend} [{inference}]" if inference else llm_backend
+    return f"unknown [{inference}]" if inference else "unknown"
+
+
+def _inference_signature(metadata: dict) -> str:
+    profile = str(metadata.get("inference_profile", "") or "").strip()
+    verify = str(metadata.get("verification_level", "") or "").strip()
+    try:
+        gen = int(metadata.get("generation_budget_per_state", 0) or 0)
+    except Exception:
+        gen = 0
+    try:
+        exec_k = int(metadata.get("execution_budget_per_state", 0) or 0)
+    except Exception:
+        exec_k = 0
+    if not profile and not verify and gen <= 0 and exec_k <= 0:
+        return ""
+    exec_text = "all" if exec_k <= 0 else str(exec_k)
+    profile_text = profile if profile else "default"
+    verify_text = verify if verify else "light"
+    return f"profile={profile_text}, gen={max(1, gen)}, exec={exec_text}, verify={verify_text}"
 
 
 def _extract_bench_report_metrics(report: dict) -> dict[str, float]:
@@ -5246,6 +5669,12 @@ def _extract_bench_report_metrics(report: dict) -> dict[str, float]:
         "median_steps": float(summary.get("median_steps", 0.0) or 0.0),
         "regression_rejection_rate_percent": float(
             summary.get("regression_rejection_rate_percent", 0.0) or 0.0
+        ),
+        "planner_replan_triggers_total": float(
+            int(summary.get("planner_replan_triggers_total", 0) or 0)
+        ),
+        "planner_cached_tactic_tries_total": float(
+            int(summary.get("planner_cached_tactic_tries_total", 0) or 0)
         ),
     }
 
@@ -5290,17 +5719,23 @@ def _render_bench_compare_markdown(payload: dict) -> str:
         f"- Report B: {payload.get('report_b', '')}",
         f"- Label A: {payload.get('label_a', '')}",
         f"- Label B: {payload.get('label_b', '')}",
+        f"- Inference A: {payload.get('inference_a', '')}",
+        f"- Inference B: {payload.get('inference_b', '')}",
+        f"- Same inference profile: {'yes' if bool(payload.get('same_inference', False)) else 'no'}",
         f"- Suite A: {payload.get('suite_a', '')}",
         f"- Suite B: {payload.get('suite_b', '')}",
         f"- Same suite SHA256: {'yes' if bool(payload.get('same_suite_sha', False)) else 'no'}",
     ]
     gate = payload.get("gate", {})
     if isinstance(gate, dict):
-        lines.append(f"- Parity gate pass: {'yes' if bool(gate.get('passed', False)) else 'no'}")
-        reasons = gate.get("reasons", [])
-        if isinstance(reasons, list) and reasons:
-            for reason in reasons:
-                lines.append(f"- Gate reason: {reason}")
+        enabled = bool(gate.get("enabled", False))
+        lines.append(f"- Parity gate enabled: {'yes' if enabled else 'no'}")
+        if enabled:
+            lines.append(f"- Parity gate pass: {'yes' if bool(gate.get('passed', False)) else 'no'}")
+            reasons = gate.get("reasons", [])
+            if isinstance(reasons, list) and reasons:
+                for reason in reasons:
+                    lines.append(f"- Gate reason: {reason}")
     lines.extend(
         [
             "",
@@ -5317,6 +5752,8 @@ def _render_bench_compare_markdown(payload: dict) -> str:
         ("median_duration_s", "Median duration (s)"),
         ("median_steps", "Median steps"),
         ("regression_rejection_rate_percent", "Regression rejection rate (%)"),
+        ("planner_replan_triggers_total", "Planner replan triggers"),
+        ("planner_cached_tactic_tries_total", "Planner cached tactic tries"),
     ]
     for key, label in ordered:
         a_val = float(metrics_a.get(key, 0.0) or 0.0)
@@ -5411,6 +5848,11 @@ def _build_bench_summary(
     dataset_breakdown: dict[str, dict[str, int]] = {}
     split_breakdown: dict[str, dict[str, int]] = {}
     tag_counts: Counter[str] = Counter()
+    planner_cache_hit_states_total = 0
+    planner_cached_tactic_candidates_total = 0
+    planner_cached_tactic_tries_total = 0
+    planner_replan_triggers_total = 0
+    planner_remembered_tactics_total = 0
     for case in results:
         if not isinstance(case, dict):
             continue
@@ -5421,6 +5863,13 @@ def _build_bench_summary(
         if regressions > 0:
             regression_cases += 1
         regression_total += regressions
+        planner_cache_hit_states_total += int(case.get("planner_cache_hit_states", 0) or 0)
+        planner_cached_tactic_candidates_total += int(
+            case.get("planner_cached_tactic_candidates", 0) or 0
+        )
+        planner_cached_tactic_tries_total += int(case.get("planner_cached_tactic_tries", 0) or 0)
+        planner_replan_triggers_total += int(case.get("planner_replan_triggers", 0) or 0)
+        planner_remembered_tactics_total += int(case.get("planner_remembered_tactics", 0) or 0)
         solved_case = bool(case.get("solved", False))
         semantic_available_case = bool(case.get("semantic_available", False))
         semantic_verdict_case = _normalize_semantic_verdict(case.get("semantic_verdict"))
@@ -5482,6 +5931,14 @@ def _build_bench_summary(
         "cases_with_regression_rejections": regression_cases,
         "regression_rejections_total": regression_total,
         "regression_rejection_rate_percent": regression_rate,
+        "planner_cache_hit_states_total": planner_cache_hit_states_total,
+        "planner_cached_tactic_candidates_total": planner_cached_tactic_candidates_total,
+        "planner_cached_tactic_tries_total": planner_cached_tactic_tries_total,
+        "planner_replan_triggers_total": planner_replan_triggers_total,
+        "planner_remembered_tactics_total": planner_remembered_tactics_total,
+        "planner_replan_triggers_per_case": (
+            float(planner_replan_triggers_total) / float(total) if total else 0.0
+        ),
         "dataset_breakdown": _finalize_group_breakdown(dataset_breakdown, "dataset"),
         "split_breakdown": _finalize_group_breakdown(split_breakdown, "split"),
         "top_tags": [
@@ -5541,6 +5998,12 @@ def _build_bench_metadata(
         "max_steps": int(getattr(args, "max_steps", 0)),
         "beam": int(getattr(args, "beam", 0)),
         "k": int(getattr(args, "k", 0)),
+        "inference_profile": str(getattr(args, "inference_profile", "default") or "default"),
+        "generation_budget_per_state": int(
+            getattr(args, "effective_gen_k", getattr(args, "k", 1)) or 1
+        ),
+        "execution_budget_per_state": int(getattr(args, "effective_exec_k", 0) or 0),
+        "verification_level": str(getattr(args, "effective_verify_level", "light") or "light"),
         "timeout_s": float(getattr(args, "timeout", 0.0)),
         "repair_attempts": int(getattr(args, "repair", 0)),
         "autop": _autop_enabled(args),
@@ -5623,6 +6086,13 @@ def _render_bench_markdown(report_payload: dict[str, object]) -> str:
         summary = {}
     if not isinstance(cases, list):
         cases = []
+    exec_budget = "all"
+    try:
+        exec_budget_raw = int(metadata.get("execution_budget_per_state", 0) or 0)
+        if exec_budget_raw > 0:
+            exec_budget = str(exec_budget_raw)
+    except Exception:
+        exec_budget = str(metadata.get("execution_budget_per_state", "all") or "all")
 
     lines: list[str] = [
         "# Ulam Bench Report",
@@ -5650,6 +6120,14 @@ def _render_bench_markdown(report_payload: dict[str, object]) -> str:
         f"- Regression rejections: {summary.get('regression_rejections_total', 0)}",
         f"- Regression rejection rate: {float(summary.get('regression_rejection_rate_percent', 0.0)):.1f}%",
         "",
+        "## Planner Metrics",
+        f"- Planner cache-hit states: {summary.get('planner_cache_hit_states_total', 0)}",
+        f"- Planner cached tactic candidates: {summary.get('planner_cached_tactic_candidates_total', 0)}",
+        f"- Planner cached tactic tries: {summary.get('planner_cached_tactic_tries_total', 0)}",
+        f"- Planner replan triggers: {summary.get('planner_replan_triggers_total', 0)}",
+        f"- Planner remembered tactics: {summary.get('planner_remembered_tactics_total', 0)}",
+        f"- Planner replan triggers per case: {float(summary.get('planner_replan_triggers_per_case', 0.0)):.2f}",
+        "",
         "## Run Metadata",
         f"- Started (UTC): {metadata.get('run_started_utc', '')}",
         f"- Finished (UTC): {metadata.get('run_finished_utc', '')}",
@@ -5667,6 +6145,10 @@ def _render_bench_markdown(report_payload: dict[str, object]) -> str:
         f"- Mathlib commit: {metadata.get('mathlib_commit', '')}",
         f"- Solver: {metadata.get('solver', '')}",
         f"- Retriever: {metadata.get('retriever', '')}/{metadata.get('retriever_source', '')}",
+        f"- Inference profile: {metadata.get('inference_profile', 'default')}",
+        f"- Generation budget per state: {metadata.get('generation_budget_per_state', metadata.get('k', 1))}",
+        f"- Execution budget per state: {exec_budget}",
+        f"- Verification level: {metadata.get('verification_level', 'light')}",
         "",
     ]
 
