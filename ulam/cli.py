@@ -21,6 +21,7 @@ from . import __version__
 from .lean.base import LeanRunner
 from .lean.dojo import LeanDojoRunner
 from .lean.lsp import lean_lsp_check, lean_lsp_diagnostics
+from .lean.lsp_runner import LeanLspRunner
 from .lean.mock import MockLeanRunner
 from .llm import (
     AnthropicClient,
@@ -440,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
         ],
         default="mock",
     )
-    bench.add_argument("--lean", choices=["mock", "dojo"], default="mock")
+    bench.add_argument("--lean", choices=["mock", "dojo", "lsp"], default="mock")
     bench.add_argument(
         "--lean-project",
         type=Path,
@@ -860,9 +861,9 @@ def run_prove(args: argparse.Namespace) -> None:
             f"[policy] inference_profile={inf_profile} "
             f"(gen_k={gen_k}, exec_k={exec_text}, verify={verify_level})"
         )
-    if args.prove_mode != "llm" and args.lean in {"cli", "lsp"}:
-        print("Lean backend `cli|lsp` is only supported with `--prove-mode llm`.")
-        print("Use `--lean dojo` (or `--lean mock`) for tactic/lemma search modes.")
+    if args.prove_mode != "llm" and args.lean == "cli":
+        print("Lean backend `cli` is only supported with `--prove-mode llm`.")
+        print("Use `--lean dojo` (default) or `--lean lsp` for tactic/lemma search modes.")
         return
     if args.prove_mode == "llm" and args.lean == "mock":
         # LLM mode always runs a Lean typecheck loop; map `mock` to CLI checks.
@@ -6265,10 +6266,12 @@ def _make_runner(args: argparse.Namespace) -> LeanRunner:
     if args.lean == "dojo":
         imports = args.lean_import if args.lean_import else None
         return LeanDojoRunner(project_path=args.lean_project, imports=imports)
-    if args.lean in {"cli", "lsp"}:
+    if args.lean == "lsp":
+        return LeanLspRunner(project_path=args.lean_project)
+    if args.lean == "cli":
         raise RuntimeError(
-            f"Lean backend `{args.lean}` is not a tactic runner backend. "
-            "Use `--prove-mode llm` with this backend, or switch to `--lean dojo`."
+            "Lean backend `cli` is not a tactic runner backend. "
+            "Use `--prove-mode llm` with this backend, or switch to `--lean dojo|lsp`."
         )
     raise RuntimeError(f"unknown Lean backend: {args.lean}")
 

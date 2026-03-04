@@ -291,7 +291,13 @@ class _LSPClient:
         self._reader.push_back_many(buffered)
         raise RuntimeError(f"Lean LSP request timed out: {method}")
 
-    def wait_for_diagnostics(self, *, uri: str, timeout_s: float) -> list[dict[str, Any]]:
+    def wait_for_diagnostics(
+        self,
+        *,
+        uri: str,
+        timeout_s: float,
+        version: int | None = None,
+    ) -> list[dict[str, Any]]:
         deadline = time.time() + max(0.5, timeout_s)
         buffered: list[dict[str, Any]] = []
         while time.time() < deadline:
@@ -308,6 +314,11 @@ class _LSPClient:
             if str(params.get("uri", "")).strip() != uri:
                 buffered.append(msg)
                 continue
+            if version is not None:
+                payload_version = params.get("version")
+                if isinstance(payload_version, int) and payload_version != version:
+                    buffered.append(msg)
+                    continue
             rows = params.get("diagnostics", [])
             self._reader.push_back_many(buffered)
             if isinstance(rows, list):

@@ -61,13 +61,14 @@ Proof modes:
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
 - `cli`: `lake env lean` typecheck. **Pros:** simple, works with any toolchain. **Cons:** no goal-state feedback.
+- `lsp`: Lean language server. **Pros:** goal/diagnostic loop without Pantograph, usable in `llm` and optional tactic/lemma search. **Cons:** still experimental for search parity vs Dojo.
 
 ---
 
-## Status (v0.2.1)
+## Status (v0.2.2)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.1 highlights:** inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, and baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`)
+- **v0.2.2 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, and baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`)
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

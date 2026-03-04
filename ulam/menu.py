@@ -294,6 +294,13 @@ def _configure_prover_all(config: dict) -> None:
     if llm_typecheck_backend_raw not in {"cli", "lsp"}:
         llm_typecheck_backend_raw = "cli"
     prove["llm_typecheck_backend"] = llm_typecheck_backend_raw
+    search_lean_backend_raw = _prompt(
+        "Tactic/Lemma search Lean backend (dojo|lsp)",
+        default=str(prove.get("search_lean_backend", "dojo")),
+    ).strip().lower()
+    if search_lean_backend_raw not in {"dojo", "lsp"}:
+        search_lean_backend_raw = "dojo"
+    prove["search_lean_backend"] = search_lean_backend_raw
     llm_section = config.setdefault("llm", {})
     timeout_default = str(llm_section.get("timeout_s", 0))
     timeout_raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=timeout_default).strip()
@@ -431,6 +438,7 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.llm_edit_scope", "LLM mode edit scope"),
         ("prove.typecheck_timeout_s", "LLM mode typecheck timeout"),
         ("prove.llm_typecheck_backend", "LLM mode typecheck backend"),
+        ("prove.search_lean_backend", "Tactic/Lemma search Lean backend"),
         ("llm.timeout_s", "LLM request timeout"),
         ("llm.heartbeat_s", "LLM heartbeat interval"),
         ("prove.lemma_max", "Lemma max count"),
@@ -508,6 +516,11 @@ def _prover_setting_value(config: dict, key: str) -> str:
         value = str(prove.get("llm_typecheck_backend", "cli")).strip().lower()
         if value not in {"cli", "lsp"}:
             value = "cli"
+        return value
+    if key == "prove.search_lean_backend":
+        value = str(prove.get("search_lean_backend", "dojo")).strip().lower()
+        if value not in {"dojo", "lsp"}:
+            value = "dojo"
         return value
     if key == "llm.timeout_s":
         return str(int(llm.get("timeout_s", 0)))
@@ -661,6 +674,15 @@ def _update_prover_setting(config: dict, key: str) -> None:
         if raw not in {"cli", "lsp"}:
             raw = "cli"
         prove["llm_typecheck_backend"] = raw
+        return
+    if key == "prove.search_lean_backend":
+        raw = _prompt(
+            "Tactic/Lemma search Lean backend (dojo|lsp)",
+            default=str(prove.get("search_lean_backend", "dojo")),
+        ).strip().lower()
+        if raw not in {"dojo", "lsp"}:
+            raw = "dojo"
+        prove["search_lean_backend"] = raw
         return
     if key == "llm.timeout_s":
         raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=str(llm.get("timeout_s", 0))).strip()
@@ -923,8 +945,14 @@ def _menu_prove(config: dict) -> None:
         print("LLM not configured. Saved task only; configure an LLM to run.")
         return
 
+    search_lean_backend = str(config.get("prove", {}).get("search_lean_backend", "dojo")).strip().lower()
+    if search_lean_backend not in {"dojo", "lsp"}:
+        search_lean_backend = "dojo"
+    require_dojo = prove_mode != "llm" and search_lean_backend == "dojo"
     proceed, lean_project = _ensure_lean_backend(
-        config, Path(file_path), require_dojo=(prove_mode != "llm")
+        config,
+        Path(file_path),
+        require_dojo=require_dojo,
     )
     if not proceed:
         return
@@ -942,7 +970,7 @@ def _menu_prove(config: dict) -> None:
         args.lean_project = None
         print("Running with mock Lean backend (no Lean project configured).")
     else:
-        args.lean = "dojo"
+        args.lean = search_lean_backend
         args.lean_project = lean_project
     try:
         print("Starting prover...")

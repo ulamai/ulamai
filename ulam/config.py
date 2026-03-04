@@ -51,6 +51,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "llm_allow_helper_lemmas": True,
         "llm_edit_scope": "full",
         "llm_typecheck_backend": "cli",
+        "search_lean_backend": "dojo",
         "lemma_max": 60,
         "lemma_depth": 60,
         "allow_axioms": True,
