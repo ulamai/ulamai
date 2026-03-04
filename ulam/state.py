@@ -12,6 +12,11 @@ def canonical_state_text(pretty: str) -> str:
             continue
         line = re.sub(r"\s+", " ", line)
         line = re.sub(r"0x[0-9a-fA-F]+", "0x#", line)
+        # Lean goal states often include unstable generated identifiers.
+        line = re.sub(r"\?m(?:_[0-9]+|[0-9]+)", "?m#", line)
+        line = re.sub(r"\bmvarId!?[0-9]+\b", "mvarId#", line)
+        line = re.sub(r"\bfvarId!?[0-9]+\b", "fvarId#", line)
+        line = re.sub(r"\b(_uniq|_proof|_inst)\.[0-9]+\b", r"\1.#", line)
         lines.append(line)
     return "\n".join(lines)
 

@@ -13,6 +13,7 @@ from typing import Optional
 from .llm import FormalizationLLM
 from .segment import segment_tex, collect_segment_hints, attach_proofs
 from .types import FormalizationConfig, FormalizationResult
+from ..lean.lsp import lean_lsp_check
 from ..search import best_first_search, scripted_search
 from ..trace import TraceLogger
 from ..types import RunConfig
@@ -1027,11 +1028,15 @@ def _resolve_llm_runtime_settings(cfg: dict) -> tuple[float | None, float | None
 
 def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
     project_path = config.lean_project or _find_lean_project(config.output_path)
-    if config.lean_backend == "cli":
-        from ..lean.cli_check import lean_cli_check
+    if config.lean_backend in {"cli", "lsp"}:
+        if config.lean_backend == "lsp":
+            checker = lean_lsp_check
+        else:
+            from ..lean.cli_check import lean_cli_check
 
+            checker = lean_cli_check
         try:
-            error = lean_cli_check(
+            error = checker(
                 config.output_path,
                 project_path=project_path,
                 timeout_s=config.typecheck_timeout_s,
@@ -1042,7 +1047,7 @@ def _typecheck(lean_code: str, config: FormalizationConfig) -> Optional[str]:
                 and _looks_like_missing_olean_error(error)
                 and _attempt_project_rebuild(project_path, timeout_s=config.typecheck_timeout_s)
             ):
-                return lean_cli_check(
+                return checker(
                     config.output_path,
                     project_path=project_path,
                     timeout_s=config.typecheck_timeout_s,

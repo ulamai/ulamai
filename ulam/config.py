@@ -50,6 +50,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "llm_cycle_patience": 2,
         "llm_allow_helper_lemmas": True,
         "llm_edit_scope": "full",
+        "llm_typecheck_backend": "cli",
         "lemma_max": 60,
         "lemma_depth": 60,
         "allow_axioms": True,

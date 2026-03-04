@@ -154,8 +154,8 @@ Formalization options:
 - `--llm-check-timing end|mid+end` to choose when semantic checks run.
 - `--llm-check-repairs N` to set semantic repair attempts.
 - `--artifacts-dir` to store per-round artifacts (defaults to `runs/formalize_YYYYMMDD_HHMMSS`).
-- `--proof-backend` (`dojo|llm`) to choose proof backend.
-- `--lean-backend` (`dojo|cli`) to choose typecheck backend.
+- `--proof-backend` (`tactic|lemma|llm|dojo`) to choose proof backend.
+- `--lean-backend` (`dojo|cli|lsp`) to choose typecheck backend.
 - `--segment` and `--segment-words` to formalize long TeX piece‑wise.
 - Local declaration retrieval is enabled by default during formalize proof search;
   set `ULAM_FORMALIZE_LOCAL_RETRIEVER=0` to disable it.
@@ -257,6 +257,20 @@ Compare two benchmark reports:
 python3 -m ulam bench-compare --a runs/bench/a.json --b runs/bench/b.json --out-markdown runs/bench/compare.md
 ```
 
+Compare with an automated parity gate (non-regression thresholds):
+
+```bash
+python3 -m ulam bench-compare \
+  --a runs/bench/a.json \
+  --b runs/bench/b.json \
+  --gate \
+  --max-solved-drop 0 \
+  --max-success-rate-drop 0 \
+  --max-semantic-pass-rate-drop 0 \
+  --max-regression-rejection-rate-increase 0 \
+  --max-median-time-increase-pct 25
+```
+
 Run a reproducible benchmark campaign (timestamped artifacts + env snapshot):
 
 ```bash
@@ -300,7 +314,13 @@ python3 -m ulam formalize paper.tex --out paper.lean
 Formalize with LLM-only proof attempts:
 
 ```bash
-python3 -m ulam formalize paper.tex --proof-backend llm --lean-backend cli
+python3 -m ulam formalize paper.tex --proof-backend llm --lean-backend lsp
+```
+
+LLM-only proving with Lean LSP diagnostics:
+
+```bash
+python3 -m ulam prove path/to/File.lean --theorem MyTheorem --prove-mode llm --lean lsp
 ```
 
 Install the CLI entrypoint if you want `ulam` directly:
@@ -534,10 +554,10 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Full implementation plan: `docs/benchmark_pipeline.md`
 
 ### Next Up (Post Mini-Pipeline)
-1. Optional Lean LSP backend track for `prove --prove-mode llm` and formalize edit/typecheck loops (additive; Dojo remains default for tactic search).
-2. Define and automate the parity gate for any LSP promotion (runner semantics, replay/cache stability, non-regression on internal + miniF2F slices).
-3. Improve proof-state canonicalization and scoring heuristics.
-4. Improve retrieval ranking/formatting quality for injected premises.
+1. Harden and iterate on the new optional Lean LSP backend track for `prove --prove-mode llm` and formalize typecheck loops (additive; Dojo remains default for tactic search).
+2. Strengthen parity-gate automation for LSP promotion (runner semantics, replay/cache stability, non-regression on internal + miniF2F slices).
+3. Continue improving proof-state canonicalization and scoring heuristics.
+4. Continue improving retrieval ranking/formatting quality for injected premises.
 5. Expand regression-suite management and reporting (including larger fixed suites such as `regression100`).
 
 ### v0.2 — “Feels powerful” baseline

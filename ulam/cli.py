@@ -20,6 +20,7 @@ from pathlib import Path
 from . import __version__
 from .lean.base import LeanRunner
 from .lean.dojo import LeanDojoRunner
+from .lean.lsp import lean_lsp_check, lean_lsp_diagnostics
 from .lean.mock import MockLeanRunner
 from .llm import (
     AnthropicClient,
@@ -90,7 +91,7 @@ def main(argv: list[str] | None = None) -> None:
         ],
         default="mock",
     )
-    prove.add_argument("--lean", choices=["mock", "dojo", "cli"], default="mock")
+    prove.add_argument("--lean", choices=["mock", "dojo", "cli", "lsp"], default="mock")
     prove.add_argument(
         "--lean-project",
         type=Path,
@@ -364,13 +365,13 @@ def main(argv: list[str] | None = None) -> None:
         "--proof-backend",
         choices=["tactic", "lemma", "llm", "dojo"],
         default="tactic",
-        help="proof backend (tactic/lemma use LeanDojo, llm uses Lean CLI)",
+        help="proof backend (tactic/lemma use LeanDojo, llm uses Lean typecheck loop)",
     )
     formalize.add_argument(
         "--lean-backend",
-        choices=["dojo", "cli"],
+        choices=["dojo", "cli", "lsp"],
         default="dojo",
-        help="typecheck backend (dojo uses Pantograph, cli uses lake/lean)",
+        help="typecheck backend (dojo uses Pantograph, cli/lsp use Lean tooling)",
     )
     formalize.add_argument("--no-equivalence", action="store_true", help="skip equivalence checks")
     formalize.add_argument(
@@ -549,6 +550,41 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="optional path to write comparison Markdown",
     )
+    bench_compare.add_argument(
+        "--gate",
+        action="store_true",
+        help="enforce parity gate and exit non-zero on metric regressions",
+    )
+    bench_compare.add_argument(
+        "--max-solved-drop",
+        type=float,
+        default=0.0,
+        help="maximum allowed drop in solved count (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-success-rate-drop",
+        type=float,
+        default=0.0,
+        help="maximum allowed drop in success rate percentage points (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-semantic-pass-rate-drop",
+        type=float,
+        default=0.0,
+        help="maximum allowed drop in semantic pass rate percentage points (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-regression-rejection-rate-increase",
+        type=float,
+        default=0.0,
+        help="maximum allowed increase in regression rejection rate percentage points (B vs A)",
+    )
+    bench_compare.add_argument(
+        "--max-median-time-increase-pct",
+        type=float,
+        default=25.0,
+        help="maximum allowed increase in median duration percent (B vs A)",
+    )
     bench_make_minif2f = sub.add_parser(
         "bench-make-minif2f",
         help="build a miniF2F benchmark suite JSONL from a local checkout",
@@ -680,6 +716,13 @@ def run_prove(args: argparse.Namespace) -> None:
     _apply_proof_profile_to_args(args, profile)
     if getattr(args, "verbose", False):
         print(f"[policy] profile={profile}")
+    if args.prove_mode != "llm" and args.lean in {"cli", "lsp"}:
+        print("Lean backend `cli|lsp` is only supported with `--prove-mode llm`.")
+        print("Use `--lean dojo` (or `--lean mock`) for tactic/lemma search modes.")
+        return
+    if args.prove_mode == "llm" and args.lean == "mock":
+        # LLM mode always runs a Lean typecheck loop; map `mock` to CLI checks.
+        args.lean = "cli"
     allow_axioms = _resolve_allow_axioms(args)
     context = _read_context_files(args.context)
     config = RunConfig(
@@ -821,12 +864,13 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
     context = "\n\n".join(_read_context_files(args.context))
     max_rounds = max(1, int(getattr(args, "llm_rounds", 4)))
     project = args.lean_project or _find_lean_project_for_file(args.file)
+    typecheck_timeout_s = _resolve_typecheck_timeout(args)
+    llm_lean_backend = _resolve_llm_typecheck_backend(args)
     if project:
         print(f"[llm] using Lean project: {project}")
     else:
-        print("[llm] no Lean project detected; attempting Lean CLI directly.")
-
-    from .lean.cli_check import lean_cli_check
+        print("[llm] no Lean project detected; attempting Lean tooling directly.")
+    print(f"[llm] typecheck backend: {llm_lean_backend}")
 
     error: str | None = None
     error_counts: dict[str, int] = {}
@@ -858,10 +902,13 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
             theorem=args.theorem,
             lean_project=project,
             lean_imports=list(getattr(args, "lean_import", []) or []),
+            lean_backend=llm_lean_backend,
+            timeout_s=typecheck_timeout_s,
         )
         if goal_context:
-            round_context = _append_context_block(round_context, "Current Lean goal state", goal_context)
-            print("[llm] attached current Lean goal state context.")
+            title, snippet = goal_context
+            round_context = _append_context_block(round_context, title, snippet)
+            print(f"[llm] attached {title.lower()} context.")
         print("[llm] requesting proof update...")
         try:
             updated = llm.prove(
@@ -911,10 +958,11 @@ def run_prove_llm(args: argparse.Namespace) -> bool:
                 break
             _bump_cycle(updated, error)
             continue
-        check_error = lean_cli_check(
-            args.file,
+        check_error = _llm_typecheck_error(
+            file_path=args.file,
             project_path=project,
-            timeout_s=_resolve_typecheck_timeout(args),
+            timeout_s=typecheck_timeout_s,
+            backend=llm_lean_backend,
         )
         if check_error:
             error = check_error
@@ -975,17 +1023,61 @@ def _append_context_block(base: str, title: str, body: str) -> str:
     return base.rstrip() + "\n\n" + block
 
 
+def _resolve_llm_typecheck_backend(args: argparse.Namespace) -> str:
+    raw = str(getattr(args, "lean", "") or "").strip().lower()
+    if raw == "lsp":
+        return "lsp"
+    return "cli"
+
+
+def _llm_typecheck_error(
+    *,
+    file_path: Path,
+    project_path: Path | None,
+    timeout_s: float,
+    backend: str,
+) -> str | None:
+    if backend == "lsp":
+        return lean_lsp_check(file_path, project_path=project_path, timeout_s=timeout_s)
+    from .lean.cli_check import lean_cli_check
+
+    return lean_cli_check(file_path, project_path=project_path, timeout_s=timeout_s)
+
+
 def _maybe_query_goal_state_context(
     text: str,
     file_path: Path,
     theorem: str,
     lean_project: Path | None,
     lean_imports: list[str],
-) -> str | None:
+    lean_backend: str,
+    timeout_s: float,
+) -> tuple[str, str] | None:
     if lean_project is None:
         return None
     if not _decl_has_placeholder(text, theorem):
         return None
+    if lean_backend == "lsp":
+        rows, error = lean_lsp_diagnostics(
+            file_path,
+            project_path=lean_project,
+            timeout_s=max(5.0, timeout_s),
+        )
+        if error:
+            return None
+        errors = [row for row in rows if str(row.get("severity", "")).lower() == "error"]
+        if not errors:
+            return None
+        lines = []
+        for row in errors[:4]:
+            line = int(row.get("line", 1) or 1)
+            col = int(row.get("col", 1) or 1)
+            msg = str(row.get("message", "")).strip()
+            if msg:
+                lines.append(f"{line}:{col}: {msg}")
+        if not lines:
+            return None
+        return ("Current Lean diagnostics", "\n".join(lines))
     if importlib.util.find_spec("pantograph") is None:
         return None
     try:
@@ -999,7 +1091,7 @@ def _maybe_query_goal_state_context(
         pretty = (state.pretty or "").strip()
         if not pretty:
             return None
-        return pretty
+        return ("Current Lean goal state", pretty)
     except Exception:
         return None
     finally:
@@ -3822,7 +3914,7 @@ def run_formalize(args: argparse.Namespace) -> None:
     if proof_backend == "dojo":
         proof_backend = "tactic"
     lean_backend = args.lean_backend
-    if proof_backend == "llm":
+    if proof_backend == "llm" and lean_backend == "dojo":
         lean_backend = "cli"
     if lean_project is None and proof_backend in {"tactic", "lemma"}:
         print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
@@ -4562,6 +4654,8 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         "metrics_b": metrics_b,
         "delta": delta,
     }
+    gate = _evaluate_bench_parity_gate(metrics_a, metrics_b, args)
+    payload["gate"] = gate
 
     print(f"Benchmark comparison: A={path_a} ({label_a}) vs B={path_b} ({label_b})")
     _print_metric_delta("Solved", metrics_a["solved"], metrics_b["solved"], as_percent=False)
@@ -4590,6 +4684,11 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         metrics_b["regression_rejection_rate_percent"],
         as_percent=True,
     )
+    if bool(getattr(args, "gate", False)):
+        print(f"Parity gate: {'PASS' if gate['passed'] else 'FAIL'}")
+        if gate["reasons"]:
+            for reason in gate["reasons"]:
+                print(f"- {reason}")
 
     if args.out_json:
         out_json = Path(args.out_json).expanduser().resolve()
@@ -4601,6 +4700,95 @@ def run_bench_compare(args: argparse.Namespace) -> None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(_render_bench_compare_markdown(payload) + "\n", encoding="utf-8")
         print(f"Comparison Markdown: {out_md}")
+    if bool(getattr(args, "gate", False)) and not bool(gate["passed"]):
+        sys.exit(1)
+
+
+def _evaluate_bench_parity_gate(
+    metrics_a: dict[str, float],
+    metrics_b: dict[str, float],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    max_solved_drop = max(0.0, float(getattr(args, "max_solved_drop", 0.0)))
+    max_success_rate_drop = max(0.0, float(getattr(args, "max_success_rate_drop", 0.0)))
+    max_semantic_pass_drop = max(0.0, float(getattr(args, "max_semantic_pass_rate_drop", 0.0)))
+    max_regression_increase = max(
+        0.0,
+        float(getattr(args, "max_regression_rejection_rate_increase", 0.0)),
+    )
+    max_median_time_increase_pct = max(
+        0.0,
+        float(getattr(args, "max_median_time_increase_pct", 25.0)),
+    )
+
+    solved_drop = max(0.0, float(metrics_a.get("solved", 0.0)) - float(metrics_b.get("solved", 0.0)))
+    success_rate_drop = max(
+        0.0,
+        float(metrics_a.get("success_rate_percent", 0.0))
+        - float(metrics_b.get("success_rate_percent", 0.0)),
+    )
+    semantic_pass_drop = max(
+        0.0,
+        float(metrics_a.get("semantic_pass_rate_percent", 0.0))
+        - float(metrics_b.get("semantic_pass_rate_percent", 0.0)),
+    )
+    regression_rejection_increase = max(
+        0.0,
+        float(metrics_b.get("regression_rejection_rate_percent", 0.0))
+        - float(metrics_a.get("regression_rejection_rate_percent", 0.0)),
+    )
+    median_a = float(metrics_a.get("median_duration_s", 0.0))
+    median_b = float(metrics_b.get("median_duration_s", 0.0))
+    if median_a <= 0.0:
+        median_time_increase_pct = 0.0 if median_b <= 0.0 else float("inf")
+    else:
+        median_time_increase_pct = max(0.0, ((median_b - median_a) / median_a) * 100.0)
+
+    reasons: list[str] = []
+    if solved_drop > max_solved_drop:
+        reasons.append(
+            f"solved drop {solved_drop:.2f} exceeds allowed {max_solved_drop:.2f}"
+        )
+    if success_rate_drop > max_success_rate_drop:
+        reasons.append(
+            "success-rate drop "
+            f"{success_rate_drop:.2f}% exceeds allowed {max_success_rate_drop:.2f}%"
+        )
+    if semantic_pass_drop > max_semantic_pass_drop:
+        reasons.append(
+            "semantic-pass-rate drop "
+            f"{semantic_pass_drop:.2f}% exceeds allowed {max_semantic_pass_drop:.2f}%"
+        )
+    if regression_rejection_increase > max_regression_increase:
+        reasons.append(
+            "regression-rejection-rate increase "
+            f"{regression_rejection_increase:.2f}% exceeds allowed {max_regression_increase:.2f}%"
+        )
+    if median_time_increase_pct > max_median_time_increase_pct:
+        value = "inf" if median_time_increase_pct == float("inf") else f"{median_time_increase_pct:.2f}%"
+        reasons.append(
+            f"median-time increase {value} exceeds allowed {max_median_time_increase_pct:.2f}%"
+        )
+
+    return {
+        "enabled": bool(getattr(args, "gate", False)),
+        "passed": len(reasons) == 0,
+        "thresholds": {
+            "max_solved_drop": max_solved_drop,
+            "max_success_rate_drop": max_success_rate_drop,
+            "max_semantic_pass_rate_drop": max_semantic_pass_drop,
+            "max_regression_rejection_rate_increase": max_regression_increase,
+            "max_median_time_increase_pct": max_median_time_increase_pct,
+        },
+        "actual": {
+            "solved_drop": solved_drop,
+            "success_rate_drop": success_rate_drop,
+            "semantic_pass_rate_drop": semantic_pass_drop,
+            "regression_rejection_rate_increase": regression_rejection_increase,
+            "median_time_increase_pct": median_time_increase_pct,
+        },
+        "reasons": reasons,
+    }
 
 
 def _report_label(metadata: dict) -> str:
@@ -4671,10 +4859,21 @@ def _render_bench_compare_markdown(payload: dict) -> str:
         f"- Report B: {payload.get('report_b', '')}",
         f"- Label A: {payload.get('label_a', '')}",
         f"- Label B: {payload.get('label_b', '')}",
-        "",
-        "| Metric | A | B | Delta (B-A) |",
-        "| --- | ---: | ---: | ---: |",
     ]
+    gate = payload.get("gate", {})
+    if isinstance(gate, dict):
+        lines.append(f"- Parity gate pass: {'yes' if bool(gate.get('passed', False)) else 'no'}")
+        reasons = gate.get("reasons", [])
+        if isinstance(reasons, list) and reasons:
+            for reason in reasons:
+                lines.append(f"- Gate reason: {reason}")
+    lines.extend(
+        [
+            "",
+            "| Metric | A | B | Delta (B-A) |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
     ordered = [
         ("solved", "Solved"),
         ("total", "Total"),
@@ -4981,6 +5180,11 @@ def _make_runner(args: argparse.Namespace) -> LeanRunner:
     if args.lean == "dojo":
         imports = args.lean_import if args.lean_import else None
         return LeanDojoRunner(project_path=args.lean_project, imports=imports)
+    if args.lean in {"cli", "lsp"}:
+        raise RuntimeError(
+            f"Lean backend `{args.lean}` is not a tactic runner backend. "
+            "Use `--prove-mode llm` with this backend, or switch to `--lean dojo`."
+        )
     raise RuntimeError(f"unknown Lean backend: {args.lean}")
 
 

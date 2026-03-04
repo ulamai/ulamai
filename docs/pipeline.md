@@ -144,7 +144,7 @@ Draft → Typecheck → Proof Search → Validate Equivalence
 - Informal vs formal **equivalence checks** are implemented.
 - **Recursive statement/proof repair** loops are implemented.
 
-## Optional Lean LSP Track (Planned, Additive)
+## Optional Lean LSP Track (In Progress, Additive)
 
 Goal: add `lean-lsp` as an optional backend without disrupting existing LeanDojo search reliability.
 
@@ -152,6 +152,10 @@ Scope boundary:
 - Phase 1: use Lean LSP for `prove --prove-mode llm` and formalize edit/typecheck loops.
 - Phase 2: evaluate Lean LSP as a tactic backend only after parity checks.
 - LeanDojo remains default backend for tactic search/bench until parity is proven.
+
+Current implementation snapshot:
+- `prove --prove-mode llm --lean lsp` supports Lean LSP diagnostics in the edit/typecheck loop.
+- `formalize --lean-backend lsp` supports Lean LSP diagnostics for formalization typecheck loops.
 
 Parity criteria (before promoting beyond optional):
 - Supports runner-style `start/apply/close` semantics at theorem scope.

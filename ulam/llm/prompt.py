@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Iterable
 
@@ -14,7 +15,8 @@ def build_prompt(
     context: Iterable[str] | None = None,
     mode: str = "tactic",
 ) -> tuple[str, str]:
-    retrieved_text = "\n".join(f"- {item}" for item in retrieved)
+    retrieved_rows = _format_retrieved_rows(retrieved)
+    retrieved_text = "\n".join(f"- {item}" for item in retrieved_rows)
     if not retrieved_text:
         retrieved_text = "- (none)"
     instruction_text = instruction.strip() if instruction else ""
@@ -51,6 +53,56 @@ def build_prompt(
             f"Return exactly {k} line(s), one tactic per line."
         )
     return system, user
+
+
+def _format_retrieved_rows(retrieved: Iterable[str], max_chars: int = 320) -> list[str]:
+    rows: list[str] = []
+    seen: set[str] = set()
+    for item in retrieved:
+        text = _format_retrieved_item(item, max_chars=max_chars)
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        rows.append(text)
+    return rows
+
+
+def _format_retrieved_item(item: str, max_chars: int = 320) -> str:
+    text = str(item or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            name = str(payload.get("name", "")).strip()
+            statement = " ".join(str(payload.get("statement", "")).split())
+            premise = " ".join(str(payload.get("premise", "")).split())
+            source = str(payload.get("path", "")).strip()
+            line = payload.get("line")
+            if not premise:
+                if name and statement:
+                    premise = f"{name}: {statement}"
+                elif name:
+                    premise = name
+            text = premise or text
+            if source:
+                source_loc = source
+                try:
+                    line_no = int(line)
+                except Exception:
+                    line_no = 0
+                if line_no > 0:
+                    source_loc = f"{source}:{line_no}"
+                text = f"{text} [{source_loc}]"
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text
 
 
 def parse_tactics(text: str, k: int) -> list[str]:

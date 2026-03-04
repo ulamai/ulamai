@@ -503,8 +503,17 @@ def _state_complexity(pretty: str) -> int:
     goals = sum(1 for line in lines if "⊢" in line)
     hyps = sum(1 for line in lines if ":" in line and "⊢" not in line)
     text = " ".join(lines)
-    char_penalty = min(400, len(text) // 8)
-    return goals * 120 + hyps * 8 + char_penalty
+    # Prefer states with fewer goals/hypotheses and fewer unresolved metavariables.
+    meta_vars = len(re.findall(r"\?m(?:_[0-9]+|[0-9]+)", text))
+    existential_count = text.count("∃")
+    char_penalty = min(500, len(text) // 8)
+    return (
+        goals * 140
+        + hyps * 10
+        + meta_vars * 30
+        + existential_count * 12
+        + char_penalty
+    )
 
 
 def _error_kind(error: str | None) -> str | None:

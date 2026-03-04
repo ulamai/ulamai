@@ -287,6 +287,13 @@ def _configure_prover_all(config: dict) -> None:
         prove["typecheck_timeout_s"] = max(5, int(float(typecheck_timeout_raw)))
     except Exception:
         prove["typecheck_timeout_s"] = 60
+    llm_typecheck_backend_raw = _prompt(
+        "LLM mode typecheck backend (cli|lsp)",
+        default=str(prove.get("llm_typecheck_backend", "cli")),
+    ).strip().lower()
+    if llm_typecheck_backend_raw not in {"cli", "lsp"}:
+        llm_typecheck_backend_raw = "cli"
+    prove["llm_typecheck_backend"] = llm_typecheck_backend_raw
     llm_section = config.setdefault("llm", {})
     timeout_default = str(llm_section.get("timeout_s", 0))
     timeout_raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=timeout_default).strip()
@@ -346,10 +353,10 @@ def _configure_prover_all(config: dict) -> None:
         "lean_backend", "cli" if effective_mode == "llm" else "dojo"
     )
     lean_backend = _prompt(
-        "Formalize typecheck backend (dojo|cli)",
+        "Formalize typecheck backend (dojo|cli|lsp)",
         default=lean_backend_default,
     ).strip().lower()
-    if lean_backend not in {"dojo", "cli"}:
+    if lean_backend not in {"dojo", "cli", "lsp"}:
         lean_backend = "dojo"
     formalize["lean_backend"] = lean_backend
     formalize_max_rounds_raw = _prompt(
@@ -423,6 +430,7 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.llm_allow_helper_lemmas", "LLM mode allow helper lemmas"),
         ("prove.llm_edit_scope", "LLM mode edit scope"),
         ("prove.typecheck_timeout_s", "LLM mode typecheck timeout"),
+        ("prove.llm_typecheck_backend", "LLM mode typecheck backend"),
         ("llm.timeout_s", "LLM request timeout"),
         ("llm.heartbeat_s", "LLM heartbeat interval"),
         ("prove.lemma_max", "Lemma max count"),
@@ -496,6 +504,11 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(prove.get("llm_edit_scope", "full"))
     if key == "prove.typecheck_timeout_s":
         return str(int(prove.get("typecheck_timeout_s", 60)))
+    if key == "prove.llm_typecheck_backend":
+        value = str(prove.get("llm_typecheck_backend", "cli")).strip().lower()
+        if value not in {"cli", "lsp"}:
+            value = "cli"
+        return value
     if key == "llm.timeout_s":
         return str(int(llm.get("timeout_s", 0)))
     if key == "llm.heartbeat_s":
@@ -640,6 +653,15 @@ def _update_prover_setting(config: dict, key: str) -> None:
         except Exception:
             prove["typecheck_timeout_s"] = 60
         return
+    if key == "prove.llm_typecheck_backend":
+        raw = _prompt(
+            "LLM mode typecheck backend (cli|lsp)",
+            default=str(prove.get("llm_typecheck_backend", "cli")),
+        ).strip().lower()
+        if raw not in {"cli", "lsp"}:
+            raw = "cli"
+        prove["llm_typecheck_backend"] = raw
+        return
     if key == "llm.timeout_s":
         raw = _prompt("LLM request timeout (seconds, 0 = no timeout)", default=str(llm.get("timeout_s", 0))).strip()
         try:
@@ -698,10 +720,10 @@ def _update_prover_setting(config: dict, key: str) -> None:
         return
     if key == "formalize.lean_backend":
         backend = _prompt(
-            "Formalize typecheck backend (dojo|cli)",
+            "Formalize typecheck backend (dojo|cli|lsp)",
             default=str(formalize.get("lean_backend", "dojo")),
         ).strip().lower()
-        if backend not in {"dojo", "cli"}:
+        if backend not in {"dojo", "cli", "lsp"}:
             backend = "dojo"
         formalize["lean_backend"] = backend
         return
@@ -910,7 +932,10 @@ def _menu_prove(config: dict) -> None:
     args = _build_args_from_config(config, file_path, theorem, instruction, context_files)
     args.prove_mode = prove_mode
     if prove_mode == "llm":
-        args.lean = "cli"
+        llm_typecheck_backend = str(config.get("prove", {}).get("llm_typecheck_backend", "cli")).strip().lower()
+        if llm_typecheck_backend not in {"cli", "lsp"}:
+            llm_typecheck_backend = "cli"
+        args.lean = llm_typecheck_backend
         args.lean_project = lean_project
     elif lean_project is None:
         args.lean = "mock"
