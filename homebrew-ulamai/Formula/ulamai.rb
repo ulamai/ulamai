@@ -3,8 +3,8 @@ class Ulamai < Formula
 
   desc "Ulam AI prover CLI for Lean 4"
   homepage "https://github.com/ulamai/ulamai"
-  url "https://github.com/ulamai/ulamai/archive/refs/tags/v0.2.2.tar.gz"
-  sha256 "b8b82ef892ad35d0a647d3923338b6d2ef0bb3edc92cae0237e98adef4b069a9"
+  url "https://github.com/ulamai/ulamai/archive/refs/tags/v0.2.3.tar.gz"
+  sha256 "66f16cb1b71028c9fa530c34dbac5264174554495a6390c493c4e70442ded247"
   license "MIT"
 
   depends_on "python@3.12"
