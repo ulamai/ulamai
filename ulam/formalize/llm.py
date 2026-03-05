@@ -149,6 +149,132 @@ class FormalizationLLM:
         raw = self._call(prompt)
         return _parse_tex_plan(raw)
 
+    def tex_claim_draft(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        claim: dict,
+        accepted_claims: list[dict],
+        ledger: dict,
+        prior_draft: str,
+        prior_feedback: str,
+        context: str,
+        round_idx: int,
+        worker_id: int,
+    ) -> dict:
+        prompt = _build_tex_claim_worker_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            claim=claim,
+            accepted_claims=accepted_claims,
+            ledger=ledger,
+            prior_draft=prior_draft,
+            prior_feedback=prior_feedback,
+            context=context,
+            round_idx=round_idx,
+            worker_id=worker_id,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_claim_draft(raw, fallback_claim_id=str(claim.get("id", "C1")))
+
+    def tex_claim_judge(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        claim: dict,
+        candidate: dict,
+        accepted_claims: list[dict],
+        ledger: dict,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_claim_judge_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            claim=claim,
+            candidate=candidate,
+            accepted_claims=accepted_claims,
+            ledger=ledger,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_claim_judge(raw)
+
+    def tex_claim_verifier(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        claim: dict,
+        candidate: dict,
+        accepted_claims: list[dict],
+        ledger: dict,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_claim_verifier_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            claim=claim,
+            candidate=candidate,
+            accepted_claims=accepted_claims,
+            ledger=ledger,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_claim_verifier(raw)
+
+    def tex_claim_domain_check(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        plan: dict,
+        claim: dict,
+        candidate: dict,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_claim_checker_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            plan=plan,
+            claim=claim,
+            candidate=candidate,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_claim_checker(raw)
+
+    def tex_compose(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        accepted_claims: list[dict],
+        ledger: dict,
+        context: str,
+    ) -> str:
+        prompt = _build_tex_compose_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            accepted_claims=accepted_claims,
+            ledger=ledger,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _extract_tex_document(raw)
+
     def tex_worker_draft(
         self,
         theorem_name: str,
@@ -534,8 +660,20 @@ def _build_tex_plan_prompt(
         '  "strategy": "short summary",\n'
         '  "outline": ["step 1", "step 2", "..."],\n'
         '  "key_lemmas": ["lemma/fact 1", "..."],\n'
-        '  "checks": ["what must be validated", "..."]\n'
+        '  "checks": ["what must be validated", "..."],\n'
+        '  "claims": [\n'
+        "    {\n"
+        '      "id": "C1",\n'
+        '      "goal": "subclaim statement",\n'
+        '      "depends_on": ["Ck"],\n'
+        '      "assumptions": ["explicit assumption 1"],\n'
+        '      "required_facts": ["fact/lemma to cite"],\n'
+        '      "acceptance_checks": ["what makes this subclaim complete"]\n'
+        "    }\n"
+        "  ]\n"
         "}\n\n"
+        "Use at most 8 claims. Keep dependencies acyclic.\n"
+        "Every claim goal must be precise enough for downstream verification.\n\n"
         f"Theorem name: {theorem_name}\n"
         f"Theorem statement:\n{theorem_statement}\n\n"
     )
@@ -543,6 +681,252 @@ def _build_tex_plan_prompt(
         prompt += "User guidance:\n" + instruction.strip() + "\n\n"
     if context:
         prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_claim_worker_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    claim: dict,
+    accepted_claims: list[dict],
+    ledger: dict,
+    prior_draft: str,
+    prior_feedback: str,
+    context: str,
+    round_idx: int,
+    worker_id: int,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    claim_json = json.dumps(claim, ensure_ascii=True, indent=2)
+    accepted_json = json.dumps(accepted_claims, ensure_ascii=True, indent=2)
+    ledger_json = json.dumps(ledger, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are writing one subclaim proof for an informal LaTeX theorem.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "claim_id": "C1",\n'
+        '  "proof_tex": "proof text for this claim only (plain LaTeX, no markdown fences)",\n'
+        '  "assumptions_used": ["explicit assumptions used in this subproof"],\n'
+        '  "depends_on_used": ["claim ids used from accepted claims"],\n'
+        '  "cited_facts": ["facts/lemmas cited in this subproof"],\n'
+        '  "confidence": 0,\n'
+        '  "notes": "short notes"\n'
+        "}\n\n"
+        "Constraints:\n"
+        "- Focus only on the provided claim goal.\n"
+        "- Be explicit about implications and avoid hidden assumptions.\n"
+        "- If a dependency claim is used, list it in depends_on_used.\n"
+        "- If a required fact is used, list it in cited_facts.\n"
+        "- Do not include Lean code.\n\n"
+        f"Round: {round_idx}\n"
+        f"Worker id: {worker_id}\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Global plan:\n"
+        f"{plan_json}\n\n"
+        "Target claim:\n"
+        f"{claim_json}\n\n"
+        "Accepted claims so far:\n"
+        f"{_truncate_block(accepted_json, 12000)}\n\n"
+        "Assumption/dependency ledger:\n"
+        f"{_truncate_block(ledger_json, 12000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if prior_draft.strip():
+        prompt += "Previous draft for this claim:\n" + _truncate_block(prior_draft, 12000) + "\n\n"
+    if prior_feedback.strip():
+        prompt += "Feedback to address:\n" + _truncate_block(prior_feedback, 7000) + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_claim_judge_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    claim: dict,
+    candidate: dict,
+    accepted_claims: list[dict],
+    ledger: dict,
+    context: str,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    claim_json = json.dumps(claim, ensure_ascii=True, indent=2)
+    candidate_json = json.dumps(candidate, ensure_ascii=True, indent=2)
+    accepted_json = json.dumps(accepted_claims, ensure_ascii=True, indent=2)
+    ledger_json = json.dumps(ledger, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are a strict mathematical judge for one subclaim.\n"
+        "Evaluate correctness and formalization-readiness.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "verdict": "pass|revise|fail",\n'
+        '  "score": 0,\n'
+        '  "summary": "short diagnosis",\n'
+        '  "required_changes": ["must-fix issue"],\n'
+        '  "missing_assumptions": ["assumption that was used but not stated"],\n'
+        '  "citation_issues": ["missing or incorrect citation"],\n'
+        '  "polished_proof_tex": "optional corrected claim proof text or empty"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- `pass` only if this claim is mathematically coherent and dependency-safe.\n"
+        "- Reject hidden assumptions and circular dependencies.\n"
+        "- Keep feedback concrete.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Global plan:\n"
+        f"{plan_json}\n\n"
+        "Target claim:\n"
+        f"{claim_json}\n\n"
+        "Candidate claim proof:\n"
+        f"{_truncate_block(candidate_json, 18000)}\n\n"
+        "Accepted claims:\n"
+        f"{_truncate_block(accepted_json, 12000)}\n\n"
+        "Assumption/dependency ledger:\n"
+        f"{_truncate_block(ledger_json, 12000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_claim_verifier_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    claim: dict,
+    candidate: dict,
+    accepted_claims: list[dict],
+    ledger: dict,
+    context: str,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    claim_json = json.dumps(claim, ensure_ascii=True, indent=2)
+    candidate_json = json.dumps(candidate, ensure_ascii=True, indent=2)
+    accepted_json = json.dumps(accepted_claims, ensure_ascii=True, indent=2)
+    ledger_json = json.dumps(ledger, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are an adversarial mathematical verifier.\n"
+        "Try to break the candidate claim proof.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "verdict": "pass|revise|fail",\n'
+        '  "score": 0,\n'
+        '  "summary": "short verifier summary",\n'
+        '  "critical_issues": ["logical gap or contradiction"],\n'
+        '  "counterexample_attempt": "short attempt or empty",\n'
+        '  "suggested_repairs": ["repair direction"]\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Assume the proof is wrong until convinced otherwise.\n"
+        "- Search for missing quantifier conditions, hidden case splits, circularity.\n"
+        "- `pass` only when you cannot identify a material flaw.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Global plan:\n"
+        f"{plan_json}\n\n"
+        "Target claim:\n"
+        f"{claim_json}\n\n"
+        "Candidate claim proof:\n"
+        f"{_truncate_block(candidate_json, 18000)}\n\n"
+        "Accepted claims:\n"
+        f"{_truncate_block(accepted_json, 12000)}\n\n"
+        "Assumption/dependency ledger:\n"
+        f"{_truncate_block(ledger_json, 12000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_claim_checker_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    plan: dict,
+    claim: dict,
+    candidate: dict,
+    context: str,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    claim_json = json.dumps(claim, ensure_ascii=True, indent=2)
+    candidate_json = json.dumps(candidate, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are a symbolic/domain consistency checker for informal math proofs.\n"
+        "Do not rewrite the proof. Identify objective consistency issues.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "status": "ok|issues",\n'
+        '  "score": 0,\n'
+        '  "issues": ["concrete consistency issue"],\n'
+        '  "warnings": ["non-fatal concern"],\n'
+        '  "sanity_checks": ["checks attempted"]\n'
+        "}\n\n"
+        "Focus on:\n"
+        "- contradiction between stated assumptions and conclusions,\n"
+        "- invalid algebraic transformations,\n"
+        "- unjustified leaps in equalities/inequalities,\n"
+        "- quantifier/domain mismatch.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Global plan:\n"
+        f"{plan_json}\n\n"
+        "Target claim:\n"
+        f"{claim_json}\n\n"
+        "Candidate claim proof:\n"
+        f"{_truncate_block(candidate_json, 18000)}\n\n"
+    )
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_compose_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    accepted_claims: list[dict],
+    ledger: dict,
+    context: str,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    claims_json = json.dumps(accepted_claims, ensure_ascii=True, indent=2)
+    ledger_json = json.dumps(ledger, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are composing a final informal LaTeX theorem proof from verified subclaims.\n"
+        "Return ONLY LaTeX text (no markdown fences).\n"
+        "Output shape:\n"
+        "\\begin{theorem}[<name>] ... \\end{theorem}\n"
+        "\\begin{proof} ... \\end{proof}\n\n"
+        "Rules:\n"
+        "- Use accepted subclaims consistently and respect dependency order.\n"
+        "- Keep assumptions explicit.\n"
+        "- Do not introduce new major lemmas that are not in the accepted claim set.\n"
+        "- Ensure the final proof is coherent as a single narrative.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Global plan:\n"
+        f"{plan_json}\n\n"
+        "Accepted claim proofs:\n"
+        f"{_truncate_block(claims_json, 22000)}\n\n"
+        "Assumption/dependency ledger:\n"
+        f"{_truncate_block(ledger_json, 12000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    prompt += "Return ONLY LaTeX."
     return prompt
 
 
@@ -997,6 +1381,16 @@ def _parse_tex_plan(raw: str) -> dict:
             "outline": [],
             "key_lemmas": [],
             "checks": [],
+            "claims": [
+                {
+                    "id": "C1",
+                    "goal": "Prove the theorem statement directly.",
+                    "depends_on": [],
+                    "assumptions": [],
+                    "required_facts": [],
+                    "acceptance_checks": [],
+                }
+            ],
         }
     text = raw.strip()
     payload: dict | None = None
@@ -1013,23 +1407,36 @@ def _parse_tex_plan(raw: str) -> dict:
             "outline": lines[1:7],
             "key_lemmas": [],
             "checks": [],
+            "claims": [
+                {
+                    "id": "C1",
+                    "goal": lines[0] if lines else "Prove the theorem statement directly.",
+                    "depends_on": [],
+                    "assumptions": [],
+                    "required_facts": [],
+                    "acceptance_checks": [],
+                }
+            ],
         }
 
     strategy = str(payload.get("strategy", "direct proof")).strip() or "direct proof"
     outline = payload.get("outline", [])
     key_lemmas = payload.get("key_lemmas", [])
     checks = payload.get("checks", [])
+    claims = payload.get("claims", [])
     if not isinstance(outline, list):
         outline = []
     if not isinstance(key_lemmas, list):
         key_lemmas = []
     if not isinstance(checks, list):
         checks = []
+    normalized_claims = _normalize_tex_claims(claims, outline)
     return {
         "strategy": strategy[:400],
         "outline": [str(item).strip()[:300] for item in outline[:12] if str(item).strip()],
         "key_lemmas": [str(item).strip()[:200] for item in key_lemmas[:12] if str(item).strip()],
         "checks": [str(item).strip()[:200] for item in checks[:12] if str(item).strip()],
+        "claims": normalized_claims,
     }
 
 
@@ -1089,6 +1496,297 @@ def _parse_tex_judge(raw: str) -> dict:
             str(item).strip()[:300] for item in style_notes[:16] if str(item).strip()
         ],
         "polished_tex": polished_tex,
+    }
+
+
+def _normalize_tex_claims(raw_claims, outline: list) -> list[dict]:
+    fallback_goal = " ; ".join(str(item).strip() for item in outline[:4] if str(item).strip())
+    if not fallback_goal:
+        fallback_goal = "Prove the theorem statement directly."
+    if not isinstance(raw_claims, list):
+        raw_claims = []
+    claims: list[dict] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw_claims, start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_id = str(item.get("id", "")).strip() or f"C{idx}"
+        claim_id = raw_id.replace(" ", "_")[:24]
+        if not claim_id:
+            claim_id = f"C{idx}"
+        if claim_id in seen:
+            claim_id = f"C{idx}"
+        seen.add(claim_id)
+        goal = str(
+            item.get("goal", "")
+            or item.get("statement", "")
+            or item.get("claim", "")
+        ).strip()
+        if not goal:
+            goal = fallback_goal
+        depends_on = item.get("depends_on", [])
+        assumptions = item.get("assumptions", [])
+        required_facts = item.get("required_facts", [])
+        acceptance_checks = item.get("acceptance_checks", [])
+        if not isinstance(depends_on, list):
+            depends_on = []
+        if not isinstance(assumptions, list):
+            assumptions = []
+        if not isinstance(required_facts, list):
+            required_facts = []
+        if not isinstance(acceptance_checks, list):
+            acceptance_checks = []
+        claims.append(
+            {
+                "id": claim_id,
+                "goal": goal[:800],
+                "depends_on": [str(dep).strip()[:24] for dep in depends_on[:8] if str(dep).strip()],
+                "assumptions": [str(v).strip()[:240] for v in assumptions[:16] if str(v).strip()],
+                "required_facts": [str(v).strip()[:240] for v in required_facts[:16] if str(v).strip()],
+                "acceptance_checks": [
+                    str(v).strip()[:240] for v in acceptance_checks[:16] if str(v).strip()
+                ],
+            }
+        )
+    if not claims:
+        claims = [
+            {
+                "id": "C1",
+                "goal": fallback_goal,
+                "depends_on": [],
+                "assumptions": [],
+                "required_facts": [],
+                "acceptance_checks": [],
+            }
+        ]
+
+    claim_ids = {c["id"] for c in claims}
+    for claim in claims:
+        claim["depends_on"] = [
+            dep for dep in claim.get("depends_on", []) if dep in claim_ids and dep != claim["id"]
+        ]
+    return claims[:8]
+
+
+def _parse_tex_claim_draft(raw: str, fallback_claim_id: str) -> dict:
+    if not raw.strip():
+        return {
+            "claim_id": fallback_claim_id,
+            "proof_tex": "",
+            "assumptions_used": [],
+            "depends_on_used": [],
+            "cited_facts": [],
+            "confidence": 0,
+            "notes": "empty draft response",
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            "claim_id": fallback_claim_id,
+            "proof_tex": _extract_tex_document(text),
+            "assumptions_used": [],
+            "depends_on_used": [],
+            "cited_facts": [],
+            "confidence": 25,
+            "notes": "unparsed draft response",
+        }
+    claim_id = str(payload.get("claim_id", "")).strip() or fallback_claim_id
+    proof_tex = _extract_tex_document(str(payload.get("proof_tex", "")))
+    assumptions = payload.get("assumptions_used", [])
+    depends_on = payload.get("depends_on_used", [])
+    cited_facts = payload.get("cited_facts", [])
+    if not isinstance(assumptions, list):
+        assumptions = []
+    if not isinstance(depends_on, list):
+        depends_on = []
+    if not isinstance(cited_facts, list):
+        cited_facts = []
+    confidence_raw = payload.get("confidence", 0)
+    try:
+        confidence = int(float(confidence_raw))
+    except Exception:
+        confidence = 0
+    confidence = max(0, min(100, confidence))
+    return {
+        "claim_id": claim_id[:24],
+        "proof_tex": proof_tex,
+        "assumptions_used": [str(v).strip()[:240] for v in assumptions[:20] if str(v).strip()],
+        "depends_on_used": [str(v).strip()[:24] for v in depends_on[:12] if str(v).strip()],
+        "cited_facts": [str(v).strip()[:240] for v in cited_facts[:20] if str(v).strip()],
+        "confidence": confidence,
+        "notes": str(payload.get("notes", "")).strip()[:800],
+    }
+
+
+def _parse_tex_claim_judge(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "verdict": "revise",
+            "score": 0,
+            "summary": "empty judge response",
+            "required_changes": ["Judge returned empty output."],
+            "missing_assumptions": [],
+            "citation_issues": [],
+            "polished_proof_tex": "",
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            "verdict": "revise",
+            "score": 20,
+            "summary": "unparsed judge response",
+            "required_changes": [text[:300]],
+            "missing_assumptions": [],
+            "citation_issues": [],
+            "polished_proof_tex": "",
+        }
+    verdict = str(payload.get("verdict", "revise")).strip().lower()
+    if verdict not in {"pass", "revise", "fail"}:
+        verdict = "revise"
+    score_raw = payload.get("score", 0)
+    try:
+        score = int(float(score_raw))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    required_changes = payload.get("required_changes", [])
+    missing_assumptions = payload.get("missing_assumptions", [])
+    citation_issues = payload.get("citation_issues", [])
+    if not isinstance(required_changes, list):
+        required_changes = []
+    if not isinstance(missing_assumptions, list):
+        missing_assumptions = []
+    if not isinstance(citation_issues, list):
+        citation_issues = []
+    polished = _extract_tex_document(str(payload.get("polished_proof_tex", "")))
+    return {
+        "verdict": verdict,
+        "score": score,
+        "summary": str(payload.get("summary", "")).strip()[:1200],
+        "required_changes": [str(v).strip()[:500] for v in required_changes[:20] if str(v).strip()],
+        "missing_assumptions": [
+            str(v).strip()[:500] for v in missing_assumptions[:20] if str(v).strip()
+        ],
+        "citation_issues": [str(v).strip()[:500] for v in citation_issues[:20] if str(v).strip()],
+        "polished_proof_tex": polished,
+    }
+
+
+def _parse_tex_claim_verifier(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "verdict": "revise",
+            "score": 0,
+            "summary": "empty verifier response",
+            "critical_issues": ["Verifier returned empty output."],
+            "counterexample_attempt": "",
+            "suggested_repairs": [],
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            "verdict": "revise",
+            "score": 20,
+            "summary": "unparsed verifier response",
+            "critical_issues": [text[:300]],
+            "counterexample_attempt": "",
+            "suggested_repairs": [],
+        }
+    verdict = str(payload.get("verdict", "revise")).strip().lower()
+    if verdict not in {"pass", "revise", "fail"}:
+        verdict = "revise"
+    score_raw = payload.get("score", 0)
+    try:
+        score = int(float(score_raw))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    issues = payload.get("critical_issues", [])
+    repairs = payload.get("suggested_repairs", [])
+    if not isinstance(issues, list):
+        issues = []
+    if not isinstance(repairs, list):
+        repairs = []
+    return {
+        "verdict": verdict,
+        "score": score,
+        "summary": str(payload.get("summary", "")).strip()[:1200],
+        "critical_issues": [str(v).strip()[:500] for v in issues[:20] if str(v).strip()],
+        "counterexample_attempt": str(payload.get("counterexample_attempt", "")).strip()[:1000],
+        "suggested_repairs": [str(v).strip()[:500] for v in repairs[:20] if str(v).strip()],
+    }
+
+
+def _parse_tex_claim_checker(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "status": "issues",
+            "score": 0,
+            "issues": ["empty checker response"],
+            "warnings": [],
+            "sanity_checks": [],
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            "status": "issues",
+            "score": 20,
+            "issues": [text[:300]],
+            "warnings": [],
+            "sanity_checks": [],
+        }
+    status = str(payload.get("status", "issues")).strip().lower()
+    if status not in {"ok", "issues"}:
+        status = "issues"
+    score_raw = payload.get("score", 0)
+    try:
+        score = int(float(score_raw))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    issues = payload.get("issues", [])
+    warnings = payload.get("warnings", [])
+    checks = payload.get("sanity_checks", [])
+    if not isinstance(issues, list):
+        issues = []
+    if not isinstance(warnings, list):
+        warnings = []
+    if not isinstance(checks, list):
+        checks = []
+    return {
+        "status": status,
+        "score": score,
+        "issues": [str(v).strip()[:500] for v in issues[:20] if str(v).strip()],
+        "warnings": [str(v).strip()[:400] for v in warnings[:20] if str(v).strip()],
+        "sanity_checks": [str(v).strip()[:240] for v in checks[:20] if str(v).strip()],
     }
 
 

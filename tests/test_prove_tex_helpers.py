@@ -6,9 +6,18 @@ from pathlib import Path
 from ulam.cli import (
     _normalize_tex_proof,
     _resolve_prove_output_format,
+    _resolve_tex_claim_graph,
     _resolve_tex_output_path,
+    _tex_static_claim_issues,
 )
-from ulam.formalize.llm import _parse_tex_judge, _parse_tex_plan
+from ulam.formalize.llm import (
+    _parse_tex_claim_checker,
+    _parse_tex_claim_draft,
+    _parse_tex_claim_judge,
+    _parse_tex_claim_verifier,
+    _parse_tex_judge,
+    _parse_tex_plan,
+)
 
 
 def test_resolve_prove_output_format_prefers_explicit_arg() -> None:
@@ -56,3 +65,76 @@ def test_parse_tex_judge_fallback_on_plain_text() -> None:
     assert parsed["verdict"] == "revise"
     assert parsed["score"] == 20
     assert parsed["required_changes"]
+
+
+def test_parse_tex_plan_claim_graph_included() -> None:
+    parsed = _parse_tex_plan(
+        """
+        {"strategy":"split into cases",
+         "outline":["set up","derive contradiction"],
+         "claims":[
+           {"id":"A 1","goal":"show P","depends_on":[]},
+           {"id":"A 2","goal":"show Q","depends_on":["A_1","A 1","missing"]}
+         ]}
+        """
+    )
+    claims = parsed.get("claims", [])
+    assert isinstance(claims, list)
+    assert len(claims) == 2
+    assert claims[0]["id"] == "A_1"
+    assert claims[1]["depends_on"] == ["A_1"]
+
+
+def test_resolve_tex_claim_graph_removes_forward_dependencies() -> None:
+    plan = {
+        "claims": [
+            {"id": "C1", "goal": "g1", "depends_on": ["C2"]},
+            {"id": "C2", "goal": "g2", "depends_on": []},
+        ]
+    }
+    claims = _resolve_tex_claim_graph(plan, "goal")
+    assert claims[0]["depends_on"] == []
+    assert claims[1]["depends_on"] == []
+
+
+def test_parse_tex_claim_json_helpers() -> None:
+    draft = _parse_tex_claim_draft(
+        '{"claim_id":"C1","proof_tex":"By contradiction.","assumptions_used":["h"],"depends_on_used":["C0"],"cited_facts":["Euclid"],"confidence":88}',
+        fallback_claim_id="C1",
+    )
+    judge = _parse_tex_claim_judge(
+        '{"verdict":"pass","score":91,"summary":"ok","required_changes":[],"missing_assumptions":[],"citation_issues":[],"polished_proof_tex":"Refined."}'
+    )
+    verifier = _parse_tex_claim_verifier(
+        '{"verdict":"pass","score":85,"summary":"no material flaw","critical_issues":[],"counterexample_attempt":"","suggested_repairs":[]}'
+    )
+    checker = _parse_tex_claim_checker(
+        '{"status":"ok","score":90,"issues":[],"warnings":[],"sanity_checks":["checked quantifiers"]}'
+    )
+    assert draft["confidence"] == 88
+    assert judge["verdict"] == "pass"
+    assert verifier["verdict"] == "pass"
+    assert checker["status"] == "ok"
+
+
+def test_tex_static_claim_issues_flags_missing_dependencies_and_facts() -> None:
+    claim = {
+        "id": "C2",
+        "goal": "goal",
+        "depends_on": ["C1"],
+        "assumptions": [],
+        "required_facts": ["Euclid lemma"],
+    }
+    candidate = {
+        "claim_id": "C2",
+        "proof_tex": "This is TODO.",
+        "depends_on_used": [],
+        "assumptions_used": [],
+        "cited_facts": [],
+    }
+    accepted = {"C1": {"assumptions_used": []}}
+    issues = _tex_static_claim_issues(claim, candidate, accepted)
+    joined = " | ".join(issues).lower()
+    assert "missing dependency citation" in joined
+    assert "required fact not cited" in joined
+    assert "placeholder text found" in joined

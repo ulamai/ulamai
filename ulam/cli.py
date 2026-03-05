@@ -1101,91 +1101,249 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     if strategy:
         print(f"[tex] plan strategy: {strategy}")
 
-    best_draft = ""
-    best_score = -1
-    best_judge: dict | None = None
-    judge_feedback = ""
+    claims = _resolve_tex_claim_graph(plan, statement)
+    print(f"[tex] planned claims={len(claims)}")
+
+    accepted_claims: dict[str, dict] = {}
+    best_claim_candidates: dict[str, dict] = {}
+    claim_feedback: dict[str, str] = {}
     repairs_used = 0
 
     for round_idx in range(1, rounds + 1):
         print(f"[tex] round {round_idx}/{rounds}")
-        candidates: list[tuple[int, str, dict]] = []
-        for worker_idx in range(1, worker_drafts + 1):
-            draft = llm.tex_worker_draft(
-                theorem_name=theorem,
-                theorem_statement=statement,
-                instruction=instruction,
-                plan=plan,
-                prior_draft=best_draft,
-                judge_feedback=judge_feedback,
-                context=context,
-                worker_id=worker_idx,
-            )
-            normalized = _normalize_tex_proof(draft, theorem=theorem, theorem_statement=statement)
-            if not normalized:
+        progressed = False
+        for claim in claims:
+            claim_id = str(claim.get("id", "")).strip()
+            if not claim_id or claim_id in accepted_claims:
                 continue
-            judge = llm.tex_judge(
-                theorem_name=theorem,
-                theorem_statement=statement,
-                instruction=instruction,
-                plan=plan,
-                draft_tex=normalized,
-                context=context,
-            )
-            score = int(judge.get("score", 0) or 0)
-            polished = str(judge.get("polished_tex", "") or "").strip()
-            candidate_tex = _normalize_tex_proof(
-                polished if polished else normalized,
-                theorem=theorem,
-                theorem_statement=statement,
-            )
-            candidates.append((score, candidate_tex, judge))
-            verdict = str(judge.get("verdict", "revise"))
-            print(f"[tex] worker={worker_idx} verdict={verdict} score={score}")
+            deps = [str(dep).strip() for dep in list(claim.get("depends_on", []) or []) if str(dep).strip()]
+            missing_deps = [dep for dep in deps if dep not in accepted_claims]
+            if missing_deps:
+                continue
 
-        if not candidates:
-            print("[tex] no valid drafts produced this round.")
-            continue
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        score, candidate_tex, judge = candidates[0]
-        if score >= best_score:
-            best_score = score
-            best_draft = candidate_tex
-            best_judge = judge
-        verdict = str(judge.get("verdict", "revise")).strip().lower()
-        if verdict == "pass":
-            print("[tex] judge accepted the proof.")
-            break
-        required_changes = judge.get("required_changes", [])
-        if not isinstance(required_changes, list):
-            required_changes = []
-        judge_feedback = "\n".join(
-            f"- {str(item).strip()}"
-            for item in required_changes[:10]
-            if str(item).strip()
-        )
-        if judge_feedback:
-            print("[tex] judge requested revisions.")
-        repairs_used += 1
-        if repairs_used > judge_repairs:
-            print("[tex] reached judge-directed repair limit; keeping best draft.")
-            break
+            ledger = _build_tex_claim_ledger(accepted_claims)
+            prior_candidate = best_claim_candidates.get(claim_id, {})
+            prior_draft = ""
+            if isinstance(prior_candidate.get("draft"), dict):
+                prior_draft = str(prior_candidate["draft"].get("proof_tex", "") or "")
+            prior_feedback = claim_feedback.get(claim_id, "")
 
-    if not best_draft.strip():
+            best_candidate: dict | None = None
+            for worker_idx in range(1, worker_drafts + 1):
+                draft = llm.tex_claim_draft(
+                    theorem_name=theorem,
+                    theorem_statement=statement,
+                    instruction=instruction,
+                    plan=plan,
+                    claim=claim,
+                    accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                    ledger=ledger,
+                    prior_draft=prior_draft,
+                    prior_feedback=prior_feedback,
+                    context=context,
+                    round_idx=round_idx,
+                    worker_id=worker_idx,
+                )
+                proof_tex = _extract_tex_snippet_for_claim(draft, claim=claim)
+                if not proof_tex:
+                    continue
+                draft["proof_tex"] = proof_tex
+                static_issues = _tex_static_claim_issues(
+                    claim=claim,
+                    candidate=draft,
+                    accepted_claims=accepted_claims,
+                )
+                judge = llm.tex_claim_judge(
+                    theorem_name=theorem,
+                    theorem_statement=statement,
+                    instruction=instruction,
+                    plan=plan,
+                    claim=claim,
+                    candidate=draft,
+                    accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                    ledger=ledger,
+                    context=context,
+                )
+                verifier = llm.tex_claim_verifier(
+                    theorem_name=theorem,
+                    theorem_statement=statement,
+                    instruction=instruction,
+                    plan=plan,
+                    claim=claim,
+                    candidate=draft,
+                    accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                    ledger=ledger,
+                    context=context,
+                )
+                checker = llm.tex_claim_domain_check(
+                    theorem_name=theorem,
+                    theorem_statement=statement,
+                    plan=plan,
+                    claim=claim,
+                    candidate=draft,
+                    context=context,
+                )
+                candidate_score = _tex_claim_candidate_score(
+                    draft=draft,
+                    judge=judge,
+                    verifier=verifier,
+                    checker=checker,
+                    static_issues=static_issues,
+                )
+                pass_gate = _tex_claim_pass_gate(
+                    judge=judge,
+                    verifier=verifier,
+                    checker=checker,
+                    static_issues=static_issues,
+                )
+                candidate = {
+                    "claim_id": claim_id,
+                    "draft": draft,
+                    "judge": judge,
+                    "verifier": verifier,
+                    "checker": checker,
+                    "static_issues": static_issues,
+                    "score": candidate_score,
+                    "pass_gate": pass_gate,
+                }
+                if best_candidate is None or candidate_score > float(best_candidate.get("score", -1e9)):
+                    best_candidate = candidate
+                print(
+                    f"[tex] claim={claim_id} worker={worker_idx} "
+                    f"judge={judge.get('verdict','revise')} verifier={verifier.get('verdict','revise')} "
+                    f"checker={checker.get('status','issues')} score={candidate_score:.1f}"
+                )
+
+            if not best_candidate:
+                print(f"[tex] claim={claim_id} produced no valid candidate.")
+                continue
+
+            best_claim_candidates[claim_id] = best_candidate
+            if bool(best_candidate.get("pass_gate")):
+                accepted_claims[claim_id] = _finalize_tex_claim(claim, best_candidate)
+                claim_feedback.pop(claim_id, None)
+                progressed = True
+                print(f"[tex] claim={claim_id} accepted.")
+            else:
+                feedback = _build_tex_claim_feedback(best_candidate)
+                if feedback:
+                    claim_feedback[claim_id] = feedback
+                print(f"[tex] claim={claim_id} needs revision.")
+
+        unresolved = [str(claim.get("id", "")).strip() for claim in claims if str(claim.get("id", "")).strip() not in accepted_claims]
+        if not unresolved:
+            print("[tex] all planned claims accepted.")
+            break
+        if progressed:
+            repairs_used = 0
+        else:
+            repairs_used += 1
+            print(f"[tex] no claim accepted this round (repair cycle {repairs_used}/{judge_repairs}).")
+            if repairs_used > judge_repairs:
+                print("[tex] reached repair limit; composing from best available claims.")
+                break
+
+    compose_claims = _claims_for_composition(claims, accepted_claims, best_claim_candidates)
+    compose_ledger = _build_tex_claim_ledger({item["id"]: item for item in compose_claims if item.get("id")})
+    print("[tex] composing final theorem proof...")
+    composed = llm.tex_compose(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        instruction=instruction,
+        plan=plan,
+        accepted_claims=compose_claims,
+        ledger=compose_ledger,
+        context=context,
+    )
+    final_draft = _normalize_tex_proof(composed, theorem=theorem, theorem_statement=statement)
+    if not final_draft:
+        fallback = _fallback_compose_tex(claims, compose_claims)
+        final_draft = _normalize_tex_proof(fallback, theorem=theorem, theorem_statement=statement)
+    if not final_draft:
         print("Failed to produce a TeX proof draft.")
         return False
 
-    out_path.write_text(best_draft.rstrip() + "\n", encoding="utf-8")
-    verdict = "revise"
-    summary = ""
-    if isinstance(best_judge, dict):
-        verdict = str(best_judge.get("verdict", "revise")).strip().lower()
-        summary = str(best_judge.get("summary", "")).strip()
+    final_judge = llm.tex_judge(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        instruction=instruction,
+        plan=plan,
+        draft_tex=final_draft,
+        context=context,
+    )
+    final_claim = {
+        "id": "FINAL",
+        "goal": statement,
+        "depends_on": [str(item.get("id", "")).strip() for item in compose_claims if str(item.get("id", "")).strip()],
+        "assumptions": [],
+        "required_facts": [],
+        "acceptance_checks": list(plan.get("checks", []) or []),
+    }
+    final_candidate = {
+        "claim_id": "FINAL",
+        "proof_tex": final_draft,
+        "assumptions_used": sorted({ass for item in compose_claims for ass in list(item.get("assumptions_used", []) or [])}),
+        "depends_on_used": [str(item.get("id", "")).strip() for item in compose_claims if str(item.get("id", "")).strip()],
+        "cited_facts": sorted({fact for item in compose_claims for fact in list(item.get("cited_facts", []) or [])}),
+        "confidence": 90,
+    }
+    final_verifier = llm.tex_claim_verifier(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        instruction=instruction,
+        plan=plan,
+        claim=final_claim,
+        candidate=final_candidate,
+        accepted_claims=compose_claims,
+        ledger=compose_ledger,
+        context=context,
+    )
+    final_checker = llm.tex_claim_domain_check(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        plan=plan,
+        claim=final_claim,
+        candidate=final_candidate,
+        context=context,
+    )
+    final_static_issues = _tex_static_claim_issues(
+        claim=final_claim,
+        candidate=final_candidate,
+        accepted_claims={item["id"]: item for item in compose_claims if str(item.get("id", "")).strip()},
+    )
+    final_pass = (
+        str(final_judge.get("verdict", "revise")).strip().lower() == "pass"
+        and str(final_verifier.get("verdict", "revise")).strip().lower() == "pass"
+        and str(final_checker.get("status", "issues")).strip().lower() == "ok"
+        and not final_static_issues
+    )
+
+    out_path.write_text(final_draft.rstrip() + "\n", encoding="utf-8")
     print(f"Wrote TeX proof draft to: {out_path}")
-    print(f"Judge verdict: {verdict} (score={max(0, best_score)})")
+    print(
+        f"Judge verdict: {str(final_judge.get('verdict', 'revise')).strip().lower()} "
+        f"(score={int(final_judge.get('score', 0) or 0)})"
+    )
+    print(
+        f"Verifier verdict: {str(final_verifier.get('verdict', 'revise')).strip().lower()} "
+        f"(score={int(final_verifier.get('score', 0) or 0)})"
+    )
+    print(
+        f"Checker status: {str(final_checker.get('status', 'issues')).strip().lower()} "
+        f"(score={int(final_checker.get('score', 0) or 0)})"
+    )
+    if final_static_issues:
+        print("[tex] static issues:")
+        for issue in final_static_issues[:8]:
+            print(f"  - {issue}")
+    summary = str(final_judge.get("summary", "")).strip()
     if summary:
         print(f"Judge summary: {summary}")
-    return verdict == "pass"
+    verifier_summary = str(final_verifier.get("summary", "")).strip()
+    if verifier_summary:
+        print(f"Verifier summary: {verifier_summary}")
+    print(f"[tex] accepted claims: {len(accepted_claims)}/{len(claims)}")
+    return final_pass
 
 
 def run_prove_llm(args: argparse.Namespace) -> bool:
@@ -2486,6 +2644,399 @@ def _normalize_tex_proof(text: str, theorem: str, theorem_statement: str) -> str
         f"{cleaned}\n"
         "\\end{proof}\n"
     )
+
+
+def _resolve_tex_claim_graph(plan: dict, theorem_statement: str) -> list[dict]:
+    raw_claims = plan.get("claims", [])
+    if not isinstance(raw_claims, list):
+        raw_claims = []
+    claims: list[dict] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw_claims, start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_id = str(item.get("id", "")).strip() or f"C{idx}"
+        claim_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id).strip("_")[:24] or f"C{idx}"
+        if claim_id in seen:
+            claim_id = f"C{idx}"
+        seen.add(claim_id)
+        goal = str(item.get("goal", "") or item.get("statement", "") or "").strip()
+        if not goal:
+            goal = theorem_statement.strip() or "Prove the theorem statement."
+        depends_on = item.get("depends_on", [])
+        assumptions = item.get("assumptions", [])
+        required_facts = item.get("required_facts", [])
+        acceptance_checks = item.get("acceptance_checks", [])
+        if not isinstance(depends_on, list):
+            depends_on = []
+        if not isinstance(assumptions, list):
+            assumptions = []
+        if not isinstance(required_facts, list):
+            required_facts = []
+        if not isinstance(acceptance_checks, list):
+            acceptance_checks = []
+        claims.append(
+            {
+                "id": claim_id,
+                "goal": goal[:900],
+                "depends_on": [str(v).strip()[:24] for v in depends_on[:8] if str(v).strip()],
+                "assumptions": [str(v).strip()[:280] for v in assumptions[:20] if str(v).strip()],
+                "required_facts": [str(v).strip()[:280] for v in required_facts[:20] if str(v).strip()],
+                "acceptance_checks": [
+                    str(v).strip()[:280] for v in acceptance_checks[:20] if str(v).strip()
+                ],
+            }
+        )
+    if not claims:
+        return [
+            {
+                "id": "C1",
+                "goal": theorem_statement.strip() or "Prove the theorem statement.",
+                "depends_on": [],
+                "assumptions": [],
+                "required_facts": [],
+                "acceptance_checks": list(plan.get("checks", []) or []),
+            }
+        ]
+    order = {claim["id"]: idx for idx, claim in enumerate(claims)}
+    claim_ids = set(order.keys())
+    for claim in claims:
+        cleaned_deps: list[str] = []
+        for dep in list(claim.get("depends_on", []) or []):
+            dep_id = str(dep).strip()
+            if not dep_id or dep_id == claim["id"]:
+                continue
+            if dep_id not in claim_ids:
+                continue
+            if order[dep_id] >= order[claim["id"]]:
+                continue
+            if dep_id in cleaned_deps:
+                continue
+            cleaned_deps.append(dep_id)
+        claim["depends_on"] = cleaned_deps
+    return claims
+
+
+def _claim_context_for_prompt(claims: list[dict], accepted_claims: dict[str, dict]) -> list[dict]:
+    context_rows: list[dict] = []
+    for claim in claims:
+        claim_id = str(claim.get("id", "")).strip()
+        if not claim_id or claim_id not in accepted_claims:
+            continue
+        item = accepted_claims[claim_id]
+        context_rows.append(
+            {
+                "id": claim_id,
+                "goal": str(item.get("goal", "")).strip(),
+                "depends_on_used": list(item.get("depends_on_used", []) or []),
+                "assumptions_used": list(item.get("assumptions_used", []) or []),
+                "cited_facts": list(item.get("cited_facts", []) or []),
+                "proof_tex": str(item.get("proof_tex", "")).strip()[:5000],
+                "status": str(item.get("status", "accepted")).strip() or "accepted",
+            }
+        )
+    return context_rows
+
+
+def _extract_tex_snippet_for_claim(candidate: dict, claim: dict) -> str:
+    raw = str(candidate.get("proof_tex", "") or "").strip()
+    cleaned = _strip_md_fences(raw).strip()
+    if not cleaned:
+        return ""
+    claim_id = str(claim.get("id", "")).strip()
+    goal = str(claim.get("goal", "")).strip()
+    if "\\begin{proof}" in cleaned and "\\end{proof}" in cleaned:
+        return cleaned
+    if "\\begin{theorem}" in cleaned and "\\end{theorem}" in cleaned:
+        return cleaned
+    header = f"% claim {claim_id}\n" if claim_id else ""
+    if goal:
+        header += f"% goal: {goal[:240]}\n"
+    return (header + cleaned).strip()
+
+
+def _tex_static_claim_issues(claim: dict, candidate: dict, accepted_claims: dict[str, dict]) -> list[str]:
+    issues: list[str] = []
+    proof = str(candidate.get("proof_tex", "") or "").strip()
+    if not proof:
+        return ["missing proof text"]
+    lowered = proof.lower()
+    placeholders = [
+        "todo",
+        "tbd",
+        "???",
+        "to be completed",
+        "left to the reader",
+    ]
+    for marker in placeholders:
+        if marker in lowered:
+            issues.append(f"placeholder text found: {marker}")
+
+    claim_id = str(claim.get("id", "")).strip()
+    used_id = str(candidate.get("claim_id", "")).strip()
+    if claim_id and used_id and claim_id != used_id:
+        issues.append(f"claim id mismatch (expected {claim_id}, got {used_id})")
+
+    expected_deps = [str(dep).strip() for dep in list(claim.get("depends_on", []) or []) if str(dep).strip()]
+    deps_used = [str(dep).strip() for dep in list(candidate.get("depends_on_used", []) or []) if str(dep).strip()]
+    for dep in expected_deps:
+        if dep not in deps_used:
+            issues.append(f"missing dependency citation: {dep}")
+    for dep in deps_used:
+        if dep not in expected_deps and dep not in accepted_claims:
+            issues.append(f"references unknown dependency: {dep}")
+
+    required_facts = [str(v).strip() for v in list(claim.get("required_facts", []) or []) if str(v).strip()]
+    cited_facts = [str(v).strip() for v in list(candidate.get("cited_facts", []) or []) if str(v).strip()]
+    for fact in required_facts:
+        if not _tex_fact_is_covered(fact, cited_facts, proof):
+            issues.append(f"required fact not cited: {fact}")
+
+    known_assumptions = {
+        _normalize_tex_phrase(str(v))
+        for v in list(claim.get("assumptions", []) or [])
+        if str(v).strip()
+    }
+    for dep in expected_deps:
+        dep_claim = accepted_claims.get(dep)
+        if not isinstance(dep_claim, dict):
+            continue
+        for item in list(dep_claim.get("assumptions_used", []) or []):
+            phrase = _normalize_tex_phrase(str(item))
+            if phrase:
+                known_assumptions.add(phrase)
+    used_assumptions = [
+        _normalize_tex_phrase(str(v))
+        for v in list(candidate.get("assumptions_used", []) or [])
+        if str(v).strip()
+    ]
+    unknown_assumptions = [
+        item for item in used_assumptions if item and item not in known_assumptions and known_assumptions
+    ]
+    if len(unknown_assumptions) > 2:
+        issues.append("uses multiple unstated assumptions")
+    return issues[:20]
+
+
+def _normalize_tex_phrase(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _tex_fact_is_covered(fact: str, cited_facts: list[str], proof_tex: str) -> bool:
+    target = _normalize_tex_phrase(fact)
+    if not target:
+        return True
+    cited_norm = {_normalize_tex_phrase(item) for item in cited_facts}
+    if target in cited_norm:
+        return True
+    proof_norm = _normalize_tex_phrase(proof_tex)
+    token = target[:40]
+    return bool(token and token in proof_norm)
+
+
+def _tex_claim_candidate_score(
+    draft: dict,
+    judge: dict,
+    verifier: dict,
+    checker: dict,
+    static_issues: list[str],
+) -> float:
+    judge_score = float(judge.get("score", 0) or 0)
+    verifier_score = float(verifier.get("score", 0) or 0)
+    checker_score = float(checker.get("score", 0) or 0)
+    confidence = float(draft.get("confidence", 0) or 0)
+    score = (
+        0.45 * judge_score
+        + 0.30 * verifier_score
+        + 0.20 * checker_score
+        + 0.05 * confidence
+    )
+    judge_verdict = str(judge.get("verdict", "revise")).strip().lower()
+    verifier_verdict = str(verifier.get("verdict", "revise")).strip().lower()
+    checker_status = str(checker.get("status", "issues")).strip().lower()
+    if judge_verdict == "revise":
+        score -= 10
+    elif judge_verdict == "fail":
+        score -= 28
+    if verifier_verdict == "revise":
+        score -= 12
+    elif verifier_verdict == "fail":
+        score -= 30
+    if checker_status != "ok":
+        score -= 12
+    score -= 7 * len(static_issues)
+    return score
+
+
+def _tex_claim_pass_gate(
+    judge: dict,
+    verifier: dict,
+    checker: dict,
+    static_issues: list[str],
+) -> bool:
+    judge_pass = str(judge.get("verdict", "revise")).strip().lower() == "pass"
+    verifier_pass = str(verifier.get("verdict", "revise")).strip().lower() == "pass"
+    checker_ok = str(checker.get("status", "issues")).strip().lower() == "ok"
+    return judge_pass and verifier_pass and checker_ok and not static_issues
+
+
+def _finalize_tex_claim(claim: dict, best_candidate: dict) -> dict:
+    draft = best_candidate.get("draft", {}) if isinstance(best_candidate.get("draft"), dict) else {}
+    judge = best_candidate.get("judge", {}) if isinstance(best_candidate.get("judge"), dict) else {}
+    polished = _strip_md_fences(str(judge.get("polished_proof_tex", "") or "")).strip()
+    proof_tex = polished or _strip_md_fences(str(draft.get("proof_tex", "") or "")).strip()
+    depends_on_used = [
+        str(v).strip()
+        for v in list(draft.get("depends_on_used", []) or [])
+        if str(v).strip()
+    ]
+    assumptions_used = [
+        str(v).strip()
+        for v in list(draft.get("assumptions_used", []) or [])
+        if str(v).strip()
+    ]
+    cited_facts = [
+        str(v).strip()
+        for v in list(draft.get("cited_facts", []) or [])
+        if str(v).strip()
+    ]
+    if not assumptions_used:
+        assumptions_used = [
+            str(v).strip() for v in list(claim.get("assumptions", []) or []) if str(v).strip()
+        ]
+    return {
+        "id": str(claim.get("id", "")).strip(),
+        "goal": str(claim.get("goal", "")).strip(),
+        "proof_tex": proof_tex,
+        "depends_on_used": depends_on_used,
+        "assumptions_used": assumptions_used,
+        "cited_facts": cited_facts,
+        "status": "accepted",
+        "score": float(best_candidate.get("score", 0.0) or 0.0),
+        "judge": judge,
+        "verifier": best_candidate.get("verifier", {}),
+        "checker": best_candidate.get("checker", {}),
+    }
+
+
+def _build_tex_claim_feedback(best_candidate: dict) -> str:
+    issues: list[str] = []
+    for item in list(best_candidate.get("static_issues", []) or []):
+        text = str(item).strip()
+        if text:
+            issues.append(text)
+    judge = best_candidate.get("judge", {}) if isinstance(best_candidate.get("judge"), dict) else {}
+    verifier = best_candidate.get("verifier", {}) if isinstance(best_candidate.get("verifier"), dict) else {}
+    checker = best_candidate.get("checker", {}) if isinstance(best_candidate.get("checker"), dict) else {}
+    for key in ["required_changes", "missing_assumptions", "citation_issues"]:
+        for item in list(judge.get(key, []) or []):
+            text = str(item).strip()
+            if text:
+                issues.append(text)
+    for key in ["critical_issues", "suggested_repairs"]:
+        for item in list(verifier.get(key, []) or []):
+            text = str(item).strip()
+            if text:
+                issues.append(text)
+    for item in list(checker.get("issues", []) or []):
+        text = str(item).strip()
+        if text:
+            issues.append(text)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in issues:
+        key = _normalize_tex_phrase(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return "\n".join(f"- {item}" for item in deduped[:14])
+
+
+def _claims_for_composition(
+    claims: list[dict],
+    accepted_claims: dict[str, dict],
+    best_claim_candidates: dict[str, dict],
+) -> list[dict]:
+    rows: list[dict] = []
+    for claim in claims:
+        claim_id = str(claim.get("id", "")).strip()
+        if not claim_id:
+            continue
+        accepted = accepted_claims.get(claim_id)
+        if isinstance(accepted, dict):
+            rows.append(accepted)
+            continue
+        best = best_claim_candidates.get(claim_id)
+        if not isinstance(best, dict):
+            continue
+        draft = best.get("draft", {}) if isinstance(best.get("draft"), dict) else {}
+        judge = best.get("judge", {}) if isinstance(best.get("judge"), dict) else {}
+        polished = _strip_md_fences(str(judge.get("polished_proof_tex", "") or "")).strip()
+        proof_tex = polished or _strip_md_fences(str(draft.get("proof_tex", "") or "")).strip()
+        rows.append(
+            {
+                "id": claim_id,
+                "goal": str(claim.get("goal", "")).strip(),
+                "proof_tex": proof_tex,
+                "depends_on_used": list(draft.get("depends_on_used", []) or []),
+                "assumptions_used": list(draft.get("assumptions_used", []) or []),
+                "cited_facts": list(draft.get("cited_facts", []) or []),
+                "status": "draft",
+                "score": float(best.get("score", 0.0) or 0.0),
+            }
+        )
+    return rows
+
+
+def _fallback_compose_tex(claims: list[dict], compose_claims: list[dict]) -> str:
+    if not compose_claims:
+        goals = [str(claim.get("goal", "")).strip() for claim in claims if str(claim.get("goal", "")).strip()]
+        if not goals:
+            return ""
+        return "\n\n".join(goals)
+    parts: list[str] = []
+    for item in compose_claims:
+        claim_id = str(item.get("id", "")).strip()
+        goal = str(item.get("goal", "")).strip()
+        proof_tex = _strip_md_fences(str(item.get("proof_tex", "") or "")).strip()
+        if claim_id:
+            parts.append(f"\\paragraph{{Claim {claim_id}.}} {goal}")
+        if proof_tex:
+            parts.append(proof_tex)
+    parts.append("Combining the established claims yields the theorem.")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _build_tex_claim_ledger(claims_by_id: dict[str, dict]) -> dict:
+    claim_ids = sorted(str(cid).strip() for cid in claims_by_id.keys() if str(cid).strip())
+    dependencies: dict[str, list[str]] = {}
+    assumptions: dict[str, list[str]] = {}
+    citations: dict[str, list[str]] = {}
+    all_assumptions: set[str] = set()
+    all_citations: set[str] = set()
+    for claim_id in claim_ids:
+        item = claims_by_id.get(claim_id, {})
+        if not isinstance(item, dict):
+            continue
+        dep_list = [str(v).strip() for v in list(item.get("depends_on_used", []) or []) if str(v).strip()]
+        asm_list = [str(v).strip() for v in list(item.get("assumptions_used", []) or []) if str(v).strip()]
+        cit_list = [str(v).strip() for v in list(item.get("cited_facts", []) or []) if str(v).strip()]
+        dependencies[claim_id] = dep_list[:24]
+        assumptions[claim_id] = asm_list[:24]
+        citations[claim_id] = cit_list[:24]
+        all_assumptions.update(asm_list)
+        all_citations.update(cit_list)
+    return {
+        "accepted_claim_ids": claim_ids,
+        "dependencies": dependencies,
+        "assumptions_by_claim": assumptions,
+        "citations_by_claim": citations,
+        "all_assumptions": sorted(all_assumptions)[:80],
+        "all_citations": sorted(all_citations)[:80],
+    }
 
 
 def _strip_md_fences(text: str) -> str:

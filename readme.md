@@ -60,7 +60,7 @@ Proof modes:
 
 Prove output formats:
 - `lean` (default): current machine-checked Lean proving pipeline.
-- `tex`: separate planner/worker/judge route that outputs an informal `.tex` proof draft suitable for later `formalize`.
+- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts, runs judge + adversarial verifier + domain checks, then composes a final `.tex` proof draft for later `formalize`.
 
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
@@ -69,10 +69,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.3)
+## Status (v0.2.4)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.3 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and a separate `prove --output-format tex` planner/worker/judge route for informal proof drafting.
+- **v0.2.4 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and an upgraded `prove --output-format tex` informal pipeline with claim-graph solving + judge/verifier/check gates.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -398,9 +398,16 @@ TUI path: `Settings -> Prover settings -> Default prove output format (lean|tex)
 
 TeX mode knobs:
 - `--tex-out` explicit output path for the generated `.tex` draft.
-- `--tex-rounds` max planner/worker/judge rounds.
-- `--tex-worker-drafts` worker candidates generated per round.
-- `--tex-judge-repairs` max judge-directed revision rounds before keeping best draft.
+- `--tex-rounds` max fixed orchestration rounds for claim solving.
+- `--tex-worker-drafts` fixed worker candidates generated per claim per round.
+- `--tex-judge-repairs` max consecutive rounds without accepted claim before composing best available draft.
+
+TeX mode execution model:
+- planner emits a claim graph (`claims`, dependencies, assumptions, required facts),
+- workers draft each claim,
+- each claim is gated by judge + adversarial verifier + domain checker,
+- accepted claims are composed into the final theorem proof.
+- token allocation is fixed by the settings above (no adaptive widening).
 
 Install the CLI entrypoint if you want `ulam` directly:
 
