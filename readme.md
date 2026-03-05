@@ -58,6 +58,10 @@ Proof modes:
 - `lemma`: LLM drafts a lemma plan; each lemma is proved sequentially. **Pros:** decomposes big proofs. **Cons:** depends on plan quality, more scaffolding.
 - `llm`: LLM rewrites the Lean file; Lean CLI typechecks. **Pros:** handles multi-step edits, no Dojo required. **Cons:** slower, less guidance than goals, relies on LLM (requires Lean CLI).
 
+Prove output formats:
+- `lean` (default): current machine-checked Lean proving pipeline.
+- `tex`: separate planner/worker/judge route that outputs an informal `.tex` proof draft suitable for later `formalize`.
+
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
 - `cli`: `lake env lean` typecheck. **Pros:** simple, works with any toolchain. **Cons:** no goal-state feedback.
@@ -65,10 +69,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.2)
+## Status (v0.2.3)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.2 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, and baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`)
+- **v0.2.3 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and a separate `prove --output-format tex` planner/worker/judge route for informal proof drafting.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -377,6 +381,26 @@ LLM-only proving with Lean LSP diagnostics:
 ```bash
 python3 -m ulam prove path/to/File.lean --theorem MyTheorem --prove-mode llm --lean lsp
 ```
+
+Informal TeX proving route (separate from Lean proving):
+
+```bash
+python3 -m ulam prove path/to/File.lean --theorem MyTheorem --output-format tex --tex-rounds 3 --tex-judge-repairs 2
+```
+
+From statement-only input (no Lean file):
+
+```bash
+python3 -m ulam prove --theorem MyTheorem --output-format tex --statement "For all n, ... "
+```
+
+TUI path: `Settings -> Prover settings -> Default prove output format (lean|tex)`.
+
+TeX mode knobs:
+- `--tex-out` explicit output path for the generated `.tex` draft.
+- `--tex-rounds` max planner/worker/judge rounds.
+- `--tex-worker-drafts` worker candidates generated per round.
+- `--tex-judge-repairs` max judge-directed revision rounds before keeping best draft.
 
 Install the CLI entrypoint if you want `ulam` directly:
 

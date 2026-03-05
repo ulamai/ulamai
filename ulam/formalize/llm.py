@@ -133,6 +133,66 @@ class FormalizationLLM:
         )
         return self._call(prompt)
 
+    def tex_plan(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_plan_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_plan(raw)
+
+    def tex_worker_draft(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        prior_draft: str,
+        judge_feedback: str,
+        context: str,
+        worker_id: int,
+    ) -> str:
+        prompt = _build_tex_worker_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            prior_draft=prior_draft,
+            judge_feedback=judge_feedback,
+            context=context,
+            worker_id=worker_id,
+        )
+        raw = self._call(prompt)
+        return _extract_tex_document(raw)
+
+    def tex_judge(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        plan: dict,
+        draft_tex: str,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_judge_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            draft_tex=draft_tex,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_judge(raw)
+
     def _call(self, prompt: str) -> str:
         if self._provider == "openai":
             return _call_openai(self._config, prompt)
@@ -457,6 +517,110 @@ def _build_semantic_repair_prompt(
     if context:
         prompt += "Context files:\n" + _truncate_block(context, 6000) + "\n\n"
     prompt += "Return ONLY the corrected Lean file."
+    return prompt
+
+
+def _build_tex_plan_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    context: str,
+) -> str:
+    prompt = (
+        "You are a mathematical proof planner.\n"
+        "Create a compact proof plan for writing an informal LaTeX proof.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "strategy": "short summary",\n'
+        '  "outline": ["step 1", "step 2", "..."],\n'
+        '  "key_lemmas": ["lemma/fact 1", "..."],\n'
+        '  "checks": ["what must be validated", "..."]\n'
+        "}\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_worker_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    prior_draft: str,
+    judge_feedback: str,
+    context: str,
+    worker_id: int,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are writing an informal mathematical proof in LaTeX.\n"
+        "Return ONLY LaTeX text (no markdown fences).\n"
+        "Output a theorem/proof block using this shape:\n"
+        "\\begin{theorem}[<name>] ... \\end{theorem}\n"
+        "\\begin{proof} ... \\end{proof}\n\n"
+        "Constraints:\n"
+        "- Be mathematically coherent and explicit about key implications.\n"
+        "- Avoid hand-wavy jumps.\n"
+        "- Keep notation consistent.\n"
+        "- Do not include Lean code.\n\n"
+        f"Worker id: {worker_id}\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Proof plan:\n"
+        f"{plan_json}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if prior_draft.strip():
+        prompt += "Previous best draft:\n" + _truncate_block(prior_draft, 14000) + "\n\n"
+    if judge_feedback.strip():
+        prompt += "Judge feedback to address:\n" + _truncate_block(judge_feedback, 6000) + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    prompt += "Return ONLY LaTeX."
+    return prompt
+
+
+def _build_tex_judge_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    draft_tex: str,
+    context: str,
+) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are a strict mathematical proof judge.\n"
+        "Evaluate the candidate informal LaTeX proof for correctness and clarity.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "verdict": "pass|revise|fail",\n'
+        '  "score": 0,\n'
+        '  "summary": "short diagnosis",\n'
+        '  "required_changes": ["must-fix issue", "..."],\n'
+        '  "style_notes": ["optional style note", "..."],\n'
+        '  "polished_tex": "optional improved full LaTeX proof text or empty"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- `pass` only if the proof is mathematically valid and complete enough to formalize.\n"
+        "- `revise` when there are fixable logical gaps or unclear steps.\n"
+        "- `fail` when the approach is fundamentally incorrect.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Proof plan:\n"
+        f"{plan_json}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    prompt += "Candidate LaTeX proof:\n" + _truncate_block(draft_tex, 18000) + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
     return prompt
 
 
@@ -809,6 +973,122 @@ def _parse_semantic_check(raw: str) -> dict:
         "summary": summary or ("ok" if verdict == "pass" else "issues found"),
         "issues": issues[:32],
         "should_repair": should_repair,
+    }
+
+
+def _extract_tex_document(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _parse_tex_plan(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "strategy": "direct proof",
+            "outline": [],
+            "key_lemmas": [],
+            "checks": [],
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        lines = [line.strip("- ").strip() for line in text.splitlines() if line.strip()]
+        return {
+            "strategy": lines[0] if lines else "direct proof",
+            "outline": lines[1:7],
+            "key_lemmas": [],
+            "checks": [],
+        }
+
+    strategy = str(payload.get("strategy", "direct proof")).strip() or "direct proof"
+    outline = payload.get("outline", [])
+    key_lemmas = payload.get("key_lemmas", [])
+    checks = payload.get("checks", [])
+    if not isinstance(outline, list):
+        outline = []
+    if not isinstance(key_lemmas, list):
+        key_lemmas = []
+    if not isinstance(checks, list):
+        checks = []
+    return {
+        "strategy": strategy[:400],
+        "outline": [str(item).strip()[:300] for item in outline[:12] if str(item).strip()],
+        "key_lemmas": [str(item).strip()[:200] for item in key_lemmas[:12] if str(item).strip()],
+        "checks": [str(item).strip()[:200] for item in checks[:12] if str(item).strip()],
+    }
+
+
+def _parse_tex_judge(raw: str) -> dict:
+    if not raw.strip():
+        return {
+            "verdict": "revise",
+            "score": 0,
+            "summary": "empty judge response",
+            "required_changes": ["Judge returned empty output."],
+            "style_notes": [],
+            "polished_tex": "",
+        }
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            "verdict": "revise",
+            "score": 20,
+            "summary": "unparsed judge response",
+            "required_changes": [text[:240]],
+            "style_notes": [],
+            "polished_tex": "",
+            "raw": text[:1200],
+        }
+
+    verdict = str(payload.get("verdict", "revise")).strip().lower()
+    if verdict not in {"pass", "revise", "fail"}:
+        verdict = "revise"
+    score_raw = payload.get("score", 0)
+    try:
+        score = int(float(score_raw))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    required_changes = payload.get("required_changes", [])
+    if not isinstance(required_changes, list):
+        required_changes = []
+    style_notes = payload.get("style_notes", [])
+    if not isinstance(style_notes, list):
+        style_notes = []
+    polished_tex = _extract_tex_document(str(payload.get("polished_tex", "")))
+    return {
+        "verdict": verdict,
+        "score": score,
+        "summary": str(payload.get("summary", "")).strip()[:1200],
+        "required_changes": [
+            str(item).strip()[:500] for item in required_changes[:16] if str(item).strip()
+        ],
+        "style_notes": [
+            str(item).strip()[:300] for item in style_notes[:16] if str(item).strip()
+        ],
+        "polished_tex": polished_tex,
     }
 
 

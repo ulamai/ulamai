@@ -76,8 +76,48 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     prove = sub.add_parser("prove", help="attempt to prove a Lean theorem")
-    prove.add_argument("file", type=Path, help="path to a Lean file")
+    prove.add_argument(
+        "file",
+        nargs="?",
+        type=Path,
+        help="path to a Lean file (required for --output-format lean)",
+    )
     prove.add_argument("--theorem", required=True, help="theorem name to prove")
+    prove.add_argument(
+        "--output-format",
+        choices=["lean", "tex"],
+        default="lean",
+        help="proof output format",
+    )
+    prove.add_argument(
+        "--statement",
+        default="",
+        help="optional informal theorem statement (primarily for --output-format tex)",
+    )
+    prove.add_argument(
+        "--tex-out",
+        type=Path,
+        default=None,
+        help="output .tex path when using --output-format tex",
+    )
+    prove.add_argument(
+        "--tex-rounds",
+        type=int,
+        default=3,
+        help="planner/worker/judge rounds for --output-format tex",
+    )
+    prove.add_argument(
+        "--tex-judge-repairs",
+        type=int,
+        default=2,
+        help="max consecutive judge-directed repair rounds for --output-format tex",
+    )
+    prove.add_argument(
+        "--tex-worker-drafts",
+        type=int,
+        default=2,
+        help="worker drafts per round for --output-format tex",
+    )
     prove.add_argument(
         "--llm",
         choices=[
@@ -851,6 +891,14 @@ def main(argv: list[str] | None = None) -> None:
 
 def run_prove(args: argparse.Namespace) -> None:
     config_data = load_config()
+    output_format = _resolve_prove_output_format(args, config_data)
+    if output_format == "tex":
+        run_prove_tex(args, config_data=config_data)
+        return
+    if getattr(args, "file", None) is None:
+        print("Lean output mode requires a target file.")
+        print("Usage: ulam prove path/to/File.lean --theorem MyTheorem")
+        return
     profile = _resolve_proof_profile(args, config_data)
     _apply_proof_profile_to_args(args, profile)
     inf_profile, gen_k, exec_k, verify_level = _apply_inference_runtime_to_args(args)
@@ -998,6 +1046,146 @@ def run_prove(args: argparse.Namespace) -> None:
     print("Failed to solve.")
     print(result.error or "unknown error")
     _summarize_failed_run(args)
+
+
+def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> bool:
+    cfg = config_data if config_data is not None else load_config()
+    theorem = str(getattr(args, "theorem", "") or "").strip()
+    if not theorem:
+        print("`--theorem` is required for TeX output mode.")
+        return False
+
+    statement = str(getattr(args, "statement", "") or "").strip()
+    file_path = getattr(args, "file", None)
+    if isinstance(file_path, Path) and file_path.exists():
+        extracted_stmt, original_stmt = _extract_theorem_statement(file_path, theorem)
+        statement = statement or original_stmt or extracted_stmt
+        if not statement:
+            block = _decl_block(
+                file_path.read_text(encoding="utf-8", errors="ignore"),
+                theorem,
+            )
+            statement = " ".join(block.split())[:1200] if block else ""
+    if not statement:
+        print(
+            "Could not infer theorem statement. Provide `--statement` "
+            "or point `file` to a Lean file containing the theorem."
+        )
+        return False
+
+    rounds = _resolve_tex_rounds(args, cfg)
+    judge_repairs = _resolve_tex_judge_repairs(args, cfg)
+    worker_drafts = _resolve_tex_worker_drafts(args, cfg)
+    instruction = str(getattr(args, "instruction", "") or "").strip()
+    context_blocks = _read_context_files(list(getattr(args, "context", []) or []))
+    if isinstance(file_path, Path) and file_path.exists():
+        theorem_block = _decl_block(file_path.read_text(encoding="utf-8", errors="ignore"), theorem)
+        if theorem_block:
+            context_blocks.append(f"[theorem source: {file_path}]\n{theorem_block[:5000]}")
+    context = "\n\n".join(context_blocks)
+
+    out_path = _resolve_tex_output_path(args, cfg, theorem, file_path=file_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    llm = FormalizationLLM(args.llm, _llm_config_from_args(args))
+    print(f"[tex] theorem={theorem}")
+    print(f"[tex] rounds={rounds} worker_drafts={worker_drafts} judge_repairs={judge_repairs}")
+    print("[tex] generating proof plan...")
+    plan = llm.tex_plan(
+        theorem_name=theorem,
+        theorem_statement=statement,
+        instruction=instruction,
+        context=context,
+    )
+    strategy = str(plan.get("strategy", "")).strip()
+    if strategy:
+        print(f"[tex] plan strategy: {strategy}")
+
+    best_draft = ""
+    best_score = -1
+    best_judge: dict | None = None
+    judge_feedback = ""
+    repairs_used = 0
+
+    for round_idx in range(1, rounds + 1):
+        print(f"[tex] round {round_idx}/{rounds}")
+        candidates: list[tuple[int, str, dict]] = []
+        for worker_idx in range(1, worker_drafts + 1):
+            draft = llm.tex_worker_draft(
+                theorem_name=theorem,
+                theorem_statement=statement,
+                instruction=instruction,
+                plan=plan,
+                prior_draft=best_draft,
+                judge_feedback=judge_feedback,
+                context=context,
+                worker_id=worker_idx,
+            )
+            normalized = _normalize_tex_proof(draft, theorem=theorem, theorem_statement=statement)
+            if not normalized:
+                continue
+            judge = llm.tex_judge(
+                theorem_name=theorem,
+                theorem_statement=statement,
+                instruction=instruction,
+                plan=plan,
+                draft_tex=normalized,
+                context=context,
+            )
+            score = int(judge.get("score", 0) or 0)
+            polished = str(judge.get("polished_tex", "") or "").strip()
+            candidate_tex = _normalize_tex_proof(
+                polished if polished else normalized,
+                theorem=theorem,
+                theorem_statement=statement,
+            )
+            candidates.append((score, candidate_tex, judge))
+            verdict = str(judge.get("verdict", "revise"))
+            print(f"[tex] worker={worker_idx} verdict={verdict} score={score}")
+
+        if not candidates:
+            print("[tex] no valid drafts produced this round.")
+            continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, candidate_tex, judge = candidates[0]
+        if score >= best_score:
+            best_score = score
+            best_draft = candidate_tex
+            best_judge = judge
+        verdict = str(judge.get("verdict", "revise")).strip().lower()
+        if verdict == "pass":
+            print("[tex] judge accepted the proof.")
+            break
+        required_changes = judge.get("required_changes", [])
+        if not isinstance(required_changes, list):
+            required_changes = []
+        judge_feedback = "\n".join(
+            f"- {str(item).strip()}"
+            for item in required_changes[:10]
+            if str(item).strip()
+        )
+        if judge_feedback:
+            print("[tex] judge requested revisions.")
+        repairs_used += 1
+        if repairs_used > judge_repairs:
+            print("[tex] reached judge-directed repair limit; keeping best draft.")
+            break
+
+    if not best_draft.strip():
+        print("Failed to produce a TeX proof draft.")
+        return False
+
+    out_path.write_text(best_draft.rstrip() + "\n", encoding="utf-8")
+    verdict = "revise"
+    summary = ""
+    if isinstance(best_judge, dict):
+        verdict = str(best_judge.get("verdict", "revise")).strip().lower()
+        summary = str(best_judge.get("summary", "")).strip()
+    print(f"Wrote TeX proof draft to: {out_path}")
+    print(f"Judge verdict: {verdict} (score={max(0, best_score)})")
+    if summary:
+        print(f"Judge summary: {summary}")
+    return verdict == "pass"
 
 
 def run_prove_llm(args: argparse.Namespace) -> bool:
@@ -2193,6 +2381,123 @@ def _resolve_llm_cycle_patience(
         return max(1, int(raw))
     except Exception:
         return 2
+
+
+def _resolve_prove_output_format(args: argparse.Namespace, config: dict | None = None) -> str:
+    explicit = str(getattr(args, "output_format", "") or "").strip().lower()
+    if explicit in {"lean", "tex"}:
+        return explicit
+    cfg = config if config is not None else load_config()
+    raw = str(cfg.get("prove", {}).get("output_format", "lean")).strip().lower()
+    if raw in {"lean", "tex"}:
+        return raw
+    return "lean"
+
+
+def _resolve_tex_rounds(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "tex_rounds", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 3
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("tex_rounds", 3)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 3
+
+
+def _resolve_tex_judge_repairs(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "tex_judge_repairs", None)
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except Exception:
+            return 2
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("tex_judge_repairs", 2)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 2
+
+
+def _resolve_tex_worker_drafts(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "tex_worker_drafts", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 2
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("tex_worker_drafts", 2)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 2
+
+
+def _resolve_tex_output_path(
+    args: argparse.Namespace,
+    config: dict,
+    theorem: str,
+    file_path: Path | None,
+) -> Path:
+    explicit = getattr(args, "tex_out", None)
+    if isinstance(explicit, Path):
+        return explicit.expanduser().resolve()
+    prove_cfg = config.get("prove", {}) if isinstance(config, dict) else {}
+    out_dir = str(prove_cfg.get("tex_out_dir", "proofs") or "proofs").strip()
+    base = Path.cwd()
+    if isinstance(file_path, Path):
+        try:
+            base = file_path.resolve().parent
+        except Exception:
+            base = Path.cwd()
+    out_root = Path(out_dir).expanduser()
+    if not out_root.is_absolute():
+        out_root = base / out_root
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", theorem).strip("._")
+    if not safe:
+        safe = "proof"
+    return (out_root / f"{safe}.tex").resolve()
+
+
+def _normalize_tex_proof(text: str, theorem: str, theorem_statement: str) -> str:
+    cleaned = _strip_md_fences(text).strip()
+    if not cleaned:
+        return ""
+    if "\\begin{theorem}" in cleaned and "\\begin{proof}" in cleaned:
+        return cleaned.rstrip() + "\n"
+    if "\\begin{proof}" in cleaned:
+        theorem_header = (
+            f"\\begin{{theorem}}[{theorem}]\n"
+            f"{theorem_statement}\n"
+            "\\end{theorem}\n\n"
+        )
+        return theorem_header + cleaned.rstrip() + "\n"
+    return (
+        f"\\begin{{theorem}}[{theorem}]\n"
+        f"{theorem_statement}\n"
+        "\\end{theorem}\n\n"
+        "\\begin{proof}\n"
+        f"{cleaned}\n"
+        "\\end{proof}\n"
+    )
+
+
+def _strip_md_fences(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw.startswith("```"):
+        return raw
+    lines = raw.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
 
 def _resolve_formalize_typecheck_timeout(

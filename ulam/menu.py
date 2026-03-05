@@ -205,6 +205,13 @@ def _configure_prover_all(config: dict) -> None:
     policy["proof_profile"] = profile
 
     prove = config.setdefault("prove", {})
+    output_format = _prompt(
+        "Default prove output format (lean|tex)",
+        default=prove.get("output_format", "lean"),
+    ).strip().lower()
+    if output_format not in {"lean", "tex"}:
+        output_format = "lean"
+    prove["output_format"] = output_format
     mode = _prompt("Default proof mode (tactic|lemma|llm)", default=prove.get("mode", "tactic")).strip().lower()
     if mode not in {"tactic", "lemma", "llm"}:
         mode = "tactic"
@@ -225,6 +232,29 @@ def _configure_prover_all(config: dict) -> None:
         prove["k"] = max(1, int(suggestion_raw))
     except Exception:
         prove["k"] = 1
+    tex_out_dir_raw = _prompt("TeX output directory", default=str(prove.get("tex_out_dir", "proofs"))).strip()
+    prove["tex_out_dir"] = tex_out_dir_raw or "proofs"
+    tex_rounds_raw = _prompt("TeX planner/worker rounds", default=str(prove.get("tex_rounds", 3))).strip()
+    try:
+        prove["tex_rounds"] = max(1, int(tex_rounds_raw))
+    except Exception:
+        prove["tex_rounds"] = 3
+    tex_judge_repairs_raw = _prompt(
+        "TeX judge-directed repair rounds",
+        default=str(prove.get("tex_judge_repairs", 2)),
+    ).strip()
+    try:
+        prove["tex_judge_repairs"] = max(0, int(tex_judge_repairs_raw))
+    except Exception:
+        prove["tex_judge_repairs"] = 2
+    tex_worker_drafts_raw = _prompt(
+        "TeX worker drafts per round",
+        default=str(prove.get("tex_worker_drafts", 2)),
+    ).strip()
+    try:
+        prove["tex_worker_drafts"] = max(1, int(tex_worker_drafts_raw))
+    except Exception:
+        prove["tex_worker_drafts"] = 2
     retriever_k_default = str(prove.get("retriever_k", 8))
     retriever_k_raw = _prompt("Retrieved premises per state", default=retriever_k_default).strip()
     try:
@@ -424,10 +454,15 @@ def _configure_prover_all(config: dict) -> None:
 def _configure_prover_single(config: dict) -> None:
     settings: list[tuple[str, str]] = [
         ("policy.proof_profile", "Proof profile"),
+        ("prove.output_format", "Default prove output format"),
         ("prove.mode", "Default proof mode"),
         ("prove.solver", "Default solver"),
         ("prove.autop", "Enable autop tactics"),
         ("prove.k", "LLM suggestions per state"),
+        ("prove.tex_out_dir", "TeX output directory"),
+        ("prove.tex_rounds", "TeX planner/worker rounds"),
+        ("prove.tex_judge_repairs", "TeX judge repair rounds"),
+        ("prove.tex_worker_drafts", "TeX worker drafts per round"),
         ("prove.retriever_k", "Retrieved premises per state"),
         ("prove.retriever_source", "Auto retriever source"),
         ("prove.retriever_build", "Auto retriever index build"),
@@ -486,6 +521,11 @@ def _prover_setting_value(config: dict, key: str) -> str:
     formalize = config.setdefault("formalize", {})
     if key == "policy.proof_profile":
         return _normalize_proof_profile(policy.get("proof_profile", "normal"))
+    if key == "prove.output_format":
+        value = str(prove.get("output_format", "lean")).strip().lower()
+        if value not in {"lean", "tex"}:
+            value = "lean"
+        return value
     if key == "prove.mode":
         return str(prove.get("mode", "tactic"))
     if key == "prove.solver":
@@ -494,6 +534,14 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return "on" if bool(prove.get("autop", True)) else "off"
     if key == "prove.k":
         return str(int(prove.get("k", 1)))
+    if key == "prove.tex_out_dir":
+        return str(prove.get("tex_out_dir", "proofs"))
+    if key == "prove.tex_rounds":
+        return str(int(prove.get("tex_rounds", 3)))
+    if key == "prove.tex_judge_repairs":
+        return str(int(prove.get("tex_judge_repairs", 2)))
+    if key == "prove.tex_worker_drafts":
+        return str(int(prove.get("tex_worker_drafts", 2)))
     if key == "prove.retriever_k":
         return str(int(prove.get("retriever_k", 8)))
     if key == "prove.retriever_source":
@@ -573,6 +621,15 @@ def _update_prover_setting(config: dict, key: str) -> None:
         policy["proof_profile"] = profile
         _apply_proof_profile_config(config, profile)
         return
+    if key == "prove.output_format":
+        raw = _prompt(
+            "Default prove output format (lean|tex)",
+            default=str(prove.get("output_format", "lean")),
+        ).strip().lower()
+        if raw not in {"lean", "tex"}:
+            raw = "lean"
+        prove["output_format"] = raw
+        return
     if key == "prove.mode":
         mode = _prompt("Default proof mode (tactic|lemma|llm)", default=str(prove.get("mode", "tactic"))).strip().lower()
         if mode not in {"tactic", "lemma", "llm"}:
@@ -599,6 +656,37 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["k"] = max(1, int(raw))
         except Exception:
             prove["k"] = 1
+        return
+    if key == "prove.tex_out_dir":
+        raw = _prompt("TeX output directory", default=str(prove.get("tex_out_dir", "proofs"))).strip()
+        prove["tex_out_dir"] = raw or "proofs"
+        return
+    if key == "prove.tex_rounds":
+        raw = _prompt("TeX planner/worker rounds", default=str(prove.get("tex_rounds", 3))).strip()
+        try:
+            prove["tex_rounds"] = max(1, int(raw))
+        except Exception:
+            prove["tex_rounds"] = 3
+        return
+    if key == "prove.tex_judge_repairs":
+        raw = _prompt(
+            "TeX judge-directed repair rounds",
+            default=str(prove.get("tex_judge_repairs", 2)),
+        ).strip()
+        try:
+            prove["tex_judge_repairs"] = max(0, int(raw))
+        except Exception:
+            prove["tex_judge_repairs"] = 2
+        return
+    if key == "prove.tex_worker_drafts":
+        raw = _prompt(
+            "TeX worker drafts per round",
+            default=str(prove.get("tex_worker_drafts", 2)),
+        ).strip()
+        try:
+            prove["tex_worker_drafts"] = max(1, int(raw))
+        except Exception:
+            prove["tex_worker_drafts"] = 2
         return
     if key == "prove.retriever_k":
         raw = _prompt("Retrieved premises per state", default=str(prove.get("retriever_k", 8))).strip()
@@ -875,14 +963,23 @@ def _menu_prove(config: dict) -> None:
     extra_paths = _prompt("Additional context files (.lean/.tex), comma-separated", default="")
     context_files = _parse_paths(extra_paths)
     prove_defaults = config.get("prove", {})
+    output_format = _prompt(
+        "Output format (lean|tex)",
+        default=prove_defaults.get("output_format", "lean"),
+    ).strip().lower()
+    if output_format not in {"lean", "tex"}:
+        output_format = "lean"
     prove_mode = _prompt(
         "Proof mode (tactic|lemma|llm)", default=prove_defaults.get("mode", "tactic")
     ).strip().lower()
     if prove_mode not in {"tactic", "lemma", "llm"}:
         prove_mode = "tactic"
-    config.setdefault("prove", {})["mode"] = prove_mode
+    prove_cfg = config.setdefault("prove", {})
+    prove_cfg["mode"] = prove_mode
+    prove_cfg["output_format"] = output_format
     save_config(config)
 
+    statement = ""
     if file_path:
         theorem = _prompt("Theorem name", default="").strip()
         if not theorem:
@@ -890,32 +987,40 @@ def _menu_prove(config: dict) -> None:
             return
         theorem = _sanitize_lean_name(theorem)
     else:
+        theorem = _prompt("Theorem name", default="ulam_theorem").strip() or "ulam_theorem"
+        theorem = _sanitize_lean_name(theorem)
         statement = _prompt_multiline("Theorem statement (informal or Lean)")
         if not statement:
             _save_task(
-                kind="nl_prove",
+                kind="nl_prove_tex" if output_format == "tex" else "nl_prove",
                 payload={
                     "instruction": instruction,
                     "context_files": [str(p) for p in context_files],
                     "statement": "",
-                },
-            )
-            print("Saved task only. Provide a statement to auto-generate Lean.")
-            return
-        theorem = _prompt("Theorem name", default="ulam_theorem").strip() or "ulam_theorem"
-        theorem = _sanitize_lean_name(theorem)
-        if not _ensure_llm_ready(config, allow_placeholder=False):
-            _save_task(
-                kind="nl_prove",
-                payload={
-                    "instruction": instruction,
-                    "context_files": [str(p) for p in context_files],
-                    "statement": statement,
                     "theorem": theorem,
                 },
             )
-            print("LLM not configured. Saved task only; configure an LLM to run.")
+            if output_format == "tex":
+                print("Saved task only. Provide a statement or Lean file for TeX prove mode.")
+            else:
+                print("Saved task only. Provide a statement to auto-generate Lean.")
             return
+    if not _ensure_llm_ready(config, allow_placeholder=False):
+        _save_task(
+            kind="nl_prove_tex" if output_format == "tex" else "nl_prove",
+            payload={
+                "instruction": instruction,
+                "context_files": [str(p) for p in context_files],
+                "file_path": file_path,
+                "statement": statement,
+                "theorem": theorem,
+                "output_format": output_format,
+            },
+        )
+        print("LLM not configured. Saved task only; configure an LLM to run.")
+        return
+
+    if output_format == "lean" and not file_path:
         try:
             file_path = str(_generate_lean_stub(config, theorem, statement, context_files))
         except Exception as exc:
@@ -932,46 +1037,44 @@ def _menu_prove(config: dict) -> None:
             return
         print(f"Generated Lean stub: {file_path}")
 
-    if not _ensure_llm_ready(config, allow_placeholder=False):
-        _save_task(
-            kind="nl_prove",
-            payload={
-                "instruction": instruction,
-                "context_files": [str(p) for p in context_files],
-                "file_path": file_path,
-                "theorem": theorem,
-            },
-        )
-        print("LLM not configured. Saved task only; configure an LLM to run.")
-        return
-
-    search_lean_backend = str(config.get("prove", {}).get("search_lean_backend", "dojo")).strip().lower()
-    if search_lean_backend not in {"dojo", "lsp"}:
-        search_lean_backend = "dojo"
-    require_dojo = prove_mode != "llm" and search_lean_backend == "dojo"
-    proceed, lean_project = _ensure_lean_backend(
+    args = _build_args_from_config(
         config,
-        Path(file_path),
-        require_dojo=require_dojo,
+        file_path,
+        theorem,
+        instruction,
+        context_files,
+        statement=statement,
     )
-    if not proceed:
-        return
-
-    args = _build_args_from_config(config, file_path, theorem, instruction, context_files)
     args.prove_mode = prove_mode
-    if prove_mode == "llm":
-        llm_typecheck_backend = str(config.get("prove", {}).get("llm_typecheck_backend", "cli")).strip().lower()
-        if llm_typecheck_backend not in {"cli", "lsp"}:
-            llm_typecheck_backend = "cli"
-        args.lean = llm_typecheck_backend
-        args.lean_project = lean_project
-    elif lean_project is None:
-        args.lean = "mock"
-        args.lean_project = None
-        print("Running with mock Lean backend (no Lean project configured).")
-    else:
-        args.lean = search_lean_backend
-        args.lean_project = lean_project
+    args.output_format = output_format
+    if output_format == "lean":
+        if not file_path:
+            print("Lean output mode requires a Lean file path.")
+            return
+        search_lean_backend = str(config.get("prove", {}).get("search_lean_backend", "dojo")).strip().lower()
+        if search_lean_backend not in {"dojo", "lsp"}:
+            search_lean_backend = "dojo"
+        require_dojo = prove_mode != "llm" and search_lean_backend == "dojo"
+        proceed, lean_project = _ensure_lean_backend(
+            config,
+            Path(file_path),
+            require_dojo=require_dojo,
+        )
+        if not proceed:
+            return
+        if prove_mode == "llm":
+            llm_typecheck_backend = str(config.get("prove", {}).get("llm_typecheck_backend", "cli")).strip().lower()
+            if llm_typecheck_backend not in {"cli", "lsp"}:
+                llm_typecheck_backend = "cli"
+            args.lean = llm_typecheck_backend
+            args.lean_project = lean_project
+        elif lean_project is None:
+            args.lean = "mock"
+            args.lean_project = None
+            print("Running with mock Lean backend (no Lean project configured).")
+        else:
+            args.lean = search_lean_backend
+            args.lean_project = lean_project
     try:
         print("Starting prover...")
         run_prove(args)
@@ -1360,10 +1463,11 @@ def _find_resume_lean_from_artifact(artifact_dir: Path, output_path: Path) -> Pa
 
 def _build_args_from_config(
     config: dict,
-    file_path: str,
+    file_path: str | None,
     theorem: str,
     instruction: str,
     context_files: list[Path],
+    statement: str = "",
 ):
     provider = config.get("llm_provider", "openai")
     openai = config.get("openai", {})
@@ -1387,10 +1491,16 @@ def _build_args_from_config(
     from argparse import Namespace
 
     return Namespace(
-        file=Path(file_path),
+        file=Path(file_path) if file_path else None,
         theorem=theorem,
         llm=provider,
         lean="dojo" if _infer_use_lean(lean) else "mock",
+        output_format=str(prove.get("output_format", "lean")),
+        statement=statement,
+        tex_out=None,
+        tex_rounds=int(prove.get("tex_rounds", 3)),
+        tex_judge_repairs=int(prove.get("tex_judge_repairs", 2)),
+        tex_worker_drafts=int(prove.get("tex_worker_drafts", 2)),
         premises=None,
         retriever="none",
         retriever_source=prove.get("retriever_source", "local"),
