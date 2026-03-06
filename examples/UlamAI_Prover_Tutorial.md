@@ -134,6 +134,10 @@ What each important choice means:
 
 ## 4) Workflow B: Prove to `.tex` (Informal First)
 
+In this workflow, we are not asking Lean to verify the theorem directly yet. Instead, we run Ulam in `--output-format tex` so the model builds a structured informal proof draft that a human can read, edit, and reuse for later formalization.
+
+The prime-number statement is a clean example because most users already know the theorem, so it is easy to judge output quality quickly. You should focus on whether the generated `.tex` is logically coherent, clearly structured, and backed by good artifact logs (`state.json`, `events.jsonl`, `summary.json`) that let you resume or debug.
+
 ### Input statement (exact)
 
 File: `examples/ProveTexPrimes.txt`
@@ -191,6 +195,10 @@ What this route is for:
 - Useful when you want a human-readable proof artifact before formalization.
 
 ## 5) Workflow C: Formalize the Polish Olympiad Problem
+
+In this workflow, we convert natural-language math into Lean declarations and proof attempts. The goal is to measure how well Ulam can map informal mathematical reasoning into machine-checkable structure, with iterative repair when the first draft is incomplete.
+
+We use two inputs for the same theorem on purpose: a short statement-only version and a full informal-proof version. This lets you see the practical difference between \"minimum context\" formalization and \"rich context\" formalization, and why the richer `pol25.tex` input is usually a stronger starting point.
 
 You now have two files for the same theorem.
 
