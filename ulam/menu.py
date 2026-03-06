@@ -255,6 +255,19 @@ def _configure_prover_all(config: dict) -> None:
         prove["tex_worker_drafts"] = max(1, int(tex_worker_drafts_raw))
     except Exception:
         prove["tex_worker_drafts"] = 2
+    tex_replan_passes_raw = _prompt(
+        "TeX replan passes",
+        default=str(prove.get("tex_replan_passes", 2)),
+    ).strip()
+    try:
+        prove["tex_replan_passes"] = max(1, int(tex_replan_passes_raw))
+    except Exception:
+        prove["tex_replan_passes"] = 2
+    tex_artifacts_dir_raw = _prompt(
+        "TeX artifacts directory",
+        default=str(prove.get("tex_artifacts_dir", "runs/prove_tex")),
+    ).strip()
+    prove["tex_artifacts_dir"] = tex_artifacts_dir_raw or "runs/prove_tex"
     retriever_k_default = str(prove.get("retriever_k", 8))
     retriever_k_raw = _prompt("Retrieved premises per state", default=retriever_k_default).strip()
     try:
@@ -463,6 +476,8 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.tex_rounds", "TeX planner/worker rounds"),
         ("prove.tex_judge_repairs", "TeX judge repair rounds"),
         ("prove.tex_worker_drafts", "TeX worker drafts per round"),
+        ("prove.tex_replan_passes", "TeX replan passes"),
+        ("prove.tex_artifacts_dir", "TeX artifacts directory"),
         ("prove.retriever_k", "Retrieved premises per state"),
         ("prove.retriever_source", "Auto retriever source"),
         ("prove.retriever_build", "Auto retriever index build"),
@@ -542,6 +557,10 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(int(prove.get("tex_judge_repairs", 2)))
     if key == "prove.tex_worker_drafts":
         return str(int(prove.get("tex_worker_drafts", 2)))
+    if key == "prove.tex_replan_passes":
+        return str(int(prove.get("tex_replan_passes", 2)))
+    if key == "prove.tex_artifacts_dir":
+        return str(prove.get("tex_artifacts_dir", "runs/prove_tex"))
     if key == "prove.retriever_k":
         return str(int(prove.get("retriever_k", 8)))
     if key == "prove.retriever_source":
@@ -687,6 +706,23 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["tex_worker_drafts"] = max(1, int(raw))
         except Exception:
             prove["tex_worker_drafts"] = 2
+        return
+    if key == "prove.tex_replan_passes":
+        raw = _prompt(
+            "TeX replan passes",
+            default=str(prove.get("tex_replan_passes", 2)),
+        ).strip()
+        try:
+            prove["tex_replan_passes"] = max(1, int(raw))
+        except Exception:
+            prove["tex_replan_passes"] = 2
+        return
+    if key == "prove.tex_artifacts_dir":
+        raw = _prompt(
+            "TeX artifacts directory",
+            default=str(prove.get("tex_artifacts_dir", "runs/prove_tex")),
+        ).strip()
+        prove["tex_artifacts_dir"] = raw or "runs/prove_tex"
         return
     if key == "prove.retriever_k":
         raw = _prompt("Retrieved premises per state", default=str(prove.get("retriever_k", 8))).strip()
@@ -1501,6 +1537,9 @@ def _build_args_from_config(
         tex_rounds=int(prove.get("tex_rounds", 3)),
         tex_judge_repairs=int(prove.get("tex_judge_repairs", 2)),
         tex_worker_drafts=int(prove.get("tex_worker_drafts", 2)),
+        tex_replan_passes=int(prove.get("tex_replan_passes", 2)),
+        tex_artifacts_dir=Path(prove.get("tex_artifacts_dir", "runs/prove_tex")),
+        tex_resume=None,
         premises=None,
         retriever="none",
         retriever_source=prove.get("retriever_source", "local"),

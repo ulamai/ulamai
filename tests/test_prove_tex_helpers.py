@@ -4,10 +4,14 @@ from argparse import Namespace
 from pathlib import Path
 
 from ulam.cli import (
+    _build_tex_replan_instruction,
     _normalize_tex_proof,
     _resolve_prove_output_format,
+    _resolve_tex_artifacts_root,
     _resolve_tex_claim_graph,
     _resolve_tex_output_path,
+    _resolve_tex_replan_passes,
+    _resolve_tex_resume_snapshot,
     _tex_static_claim_issues,
 )
 from ulam.formalize.llm import (
@@ -115,6 +119,51 @@ def test_parse_tex_claim_json_helpers() -> None:
     assert judge["verdict"] == "pass"
     assert verifier["verdict"] == "pass"
     assert checker["status"] == "ok"
+
+
+def test_build_tex_replan_instruction_mentions_previous_strategy() -> None:
+    text = _build_tex_replan_instruction(
+        "Use direct counting.",
+        pass_idx=2,
+        pass_history=[
+            {
+                "strategy": "direct contradiction",
+                "unresolved_claims": ["C3", "C4"],
+                "feedback": ["missing bound", "uses unstated assumption"],
+            }
+        ],
+    )
+    lowered = text.lower()
+    assert "replan pass 2" in lowered
+    assert "direct contradiction" in text
+    assert "c3" in lowered
+    assert "missing bound" in lowered
+
+
+def test_resolve_tex_replan_passes_prefers_explicit() -> None:
+    args = Namespace(tex_replan_passes=5)
+    cfg = {"prove": {"tex_replan_passes": 2}}
+    assert _resolve_tex_replan_passes(args, cfg) == 5
+
+
+def test_resolve_tex_resume_snapshot_dir(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir(parents=True)
+    snapshot = run_dir / "state.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    args = Namespace(tex_resume=run_dir)
+    resolved = _resolve_tex_resume_snapshot(args)
+    assert resolved == snapshot.resolve()
+
+
+def test_resolve_tex_artifacts_root_relative_to_file(tmp_path: Path) -> None:
+    lean_file = tmp_path / "Math" / "Demo.lean"
+    lean_file.parent.mkdir(parents=True)
+    lean_file.write_text("theorem demo : True := by trivial\n", encoding="utf-8")
+    args = Namespace(tex_artifacts_dir=None)
+    cfg = {"prove": {"tex_artifacts_dir": "runs/prove_tex"}}
+    root = _resolve_tex_artifacts_root(args, cfg, lean_file)
+    assert root == (lean_file.parent / "runs/prove_tex").resolve()
 
 
 def test_tex_static_claim_issues_flags_missing_dependencies_and_facts() -> None:

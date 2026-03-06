@@ -60,7 +60,7 @@ Proof modes:
 
 Prove output formats:
 - `lean` (default): current machine-checked Lean proving pipeline.
-- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts, runs judge + adversarial verifier + domain checks, then composes a final `.tex` proof draft for later `formalize`.
+- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts, runs judge + adversarial verifier + domain checks, supports pass-based replan/backtrack when a plan stalls, and writes resumable per-run artifacts (`state.json`, `events.jsonl`, `summary.json`) before composing a final `.tex` proof draft for later `formalize`.
 
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
@@ -69,10 +69,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.4)
+## Status (v0.2.5)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.4 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and an upgraded `prove --output-format tex` informal pipeline with claim-graph solving + judge/verifier/check gates.
+- **v0.2.5 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and an upgraded `prove --output-format tex` informal pipeline with claim-graph solving + judge/verifier/check gates.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -193,6 +193,23 @@ Natural language guidance:
 
 ```bash
 python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --instruction "Use a short automation tactic first."
+```
+
+Run TeX proving with replan/backtrack and artifacts:
+
+```bash
+python3 -m ulam prove --theorem demo --output-format tex \
+  --statement "There are infinitely many prime numbers." \
+  --llm codex_cli --tex-rounds 3 --tex-judge-repairs 2 --tex-worker-drafts 2 \
+  --tex-replan-passes 2 --tex-artifacts-dir runs/prove_tex
+```
+
+Resume a prior TeX proving run:
+
+```bash
+python3 -m ulam prove --theorem demo --output-format tex \
+  --statement "There are infinitely many prime numbers." \
+  --llm codex_cli --tex-resume runs/prove_tex/<run_dir>
 ```
 
 Verbose logs (LLM suggestions + tactic outcomes):
@@ -638,6 +655,13 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Stronger action constraints and cost controls (e.g., `aesop` budgeted)
 - Regression suite management (`ulam bench-list-suites`, fixed-suite builder, and `ulam bench --suite regression100` after generation)
 - Execution plan for next patch release: `docs/v0.2.1_plan.md`
+
+Potential formalization pipeline (later v0.2.x, not active yet):
+- Add pass-based replan/backtrack for `formalize` at declaration-graph level (beyond round-local repairs).
+- Upgrade LLM proof filling from single-candidate loops to worker-candidate + judge/verifier selection.
+- Move LLM `formalize` edits to declaration/body-scoped patches (reduce full-file collateral regressions).
+- Add stateful formalization artifacts (`state.json`, `events.jsonl`, `summary.json`) for deterministic resume/debugging.
+- Add dedicated formalization regression tests (stalls, equivalence repair behavior, resume determinism, guardrail non-regression).
 
 ### v0.3 — SFT training loop
 - Trace extraction into JSONL
