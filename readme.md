@@ -153,6 +153,18 @@ Toy example:
 ulam formalize examples/Formalize.tex --out examples/Formalize.lean
 ```
 
+Tutorial with runnable examples:
+
+- Markdown guide: `examples/UlamAI_Prover_Tutorial.md`
+- Colab notebook: `examples/UlamAI_Prover_Tutorial.ipynb`
+- Colab open link (main branch): `https://colab.research.google.com/github/ulamai/ulamai/blob/main/examples/UlamAI_Prover_Tutorial.ipynb`
+
+Olympiad-style formalization example:
+
+```bash
+ulam formalize examples/FormalizePolishOlympiad.tex --out examples/FormalizePolishOlympiad.lean
+```
+
 Formalization options:
 - `--no-equivalence` to skip statement equivalence checks.
 - `--llm-check/--no-llm-check` to enable or disable semantic integrity checks.
@@ -198,16 +210,22 @@ python3 -m ulam prove examples/Smoke.lean --theorem irrational_sqrt_two_smoke --
 Run TeX proving with replan/backtrack and artifacts:
 
 ```bash
-python3 -m ulam prove --theorem demo --output-format tex \
+python3 -m ulam prove --theorem infinitely_many_primes --output-format tex \
   --statement "There are infinitely many prime numbers." \
   --llm codex_cli --tex-rounds 3 --tex-judge-repairs 2 --tex-worker-drafts 2 \
   --tex-replan-passes 2 --tex-artifacts-dir runs/prove_tex
 ```
 
+Statement source used in that command:
+
+```text
+examples/ProveTexPrimes.txt
+```
+
 Resume a prior TeX proving run:
 
 ```bash
-python3 -m ulam prove --theorem demo --output-format tex \
+python3 -m ulam prove --theorem infinitely_many_primes --output-format tex \
   --statement "There are infinitely many prime numbers." \
   --llm codex_cli --tex-resume runs/prove_tex/<run_dir>
 ```
