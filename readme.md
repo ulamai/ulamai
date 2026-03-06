@@ -1,6 +1,6 @@
 # Ulam AI
 
-A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that combines:
+A **truth-first**, reproducible, open-source **Lean 4 theorem prover CLI** that combines:
 
 - **LLM-guided reasoning** (creative step proposals)
 - **Lean verification** (zero hallucinations: only accepted if Lean checks)
@@ -8,6 +8,7 @@ A **truth-first**, reproducible, open(-ish) **Lean 4 theorem prover CLI** that c
 - **Search + caching** (best-first / beam + transposition table)
 
 Ulam AI is designed to plug into **Codex / Claude Code / Gemini CLI / Ollama** and produce **machine-checked Lean 4 proofs**.
+Start here: `examples/UlamAI_Prover_Tutorial.md`.
 
 ---
 
@@ -158,11 +159,18 @@ Tutorial with runnable examples:
 - Markdown guide: `examples/UlamAI_Prover_Tutorial.md`
 - Colab notebook: `examples/UlamAI_Prover_Tutorial.ipynb`
 - Colab open link (main branch): `https://colab.research.google.com/github/ulamai/ulamai/blob/main/examples/UlamAI_Prover_Tutorial.ipynb`
+- Includes both olympiad inputs: statement-only (`FormalizePolishOlympiad.tex`) and full-proof (`pol25.tex`).
 
 Olympiad-style formalization example:
 
 ```bash
 ulam formalize examples/FormalizePolishOlympiad.tex --out examples/FormalizePolishOlympiad.lean
+```
+
+Same olympiad theorem with full informal proof (recommended):
+
+```bash
+ulam formalize examples/pol25.tex --out examples/pol25.lean
 ```
 
 Formalization options:

@@ -1,0 +1,75 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\begin{document}
+
+\textbf{Problem 2.} Given positive integers $k, m, n, p$ such that $p = 2^{2^n} + 1$, $p$ is a prime number, and $2^k - m$ is divisible by $p$. Prove that there exists a positive integer $\ell$ such that the number $2^\ell - m$ is divisible by $p^2$.
+
+Here is the step-by-step solution to the problem.
+
+### Proof
+
+Let $p = 2^{2^n} + 1$ be a Fermat prime with $n \in \mathbb{Z}^+$.
+We are given that $2^k \equiv m \pmod{p}$.
+This implies that there exists an integer $s$ such that:
+$$ m = 2^k + s \cdot p $$
+
+We want to find a positive integer $\ell$ such that $2^\ell \equiv m \pmod{p^2}$.
+
+**Step 1: Determine the behavior of powers of 2 modulo $p^2$.**
+
+First, observe the order of $2$ modulo $p$.
+Since $p = 2^{2^n} + 1$, we have:
+$$ 2^{2^n} = p - 1 \equiv -1 \pmod{p} $$
+Squaring both sides:
+$$ 2^{2^{n+1}} \equiv (-1)^2 \equiv 1 \pmod{p} $$
+Let $\delta = 2^{n+1}$. This is the order of $2$ modulo $p$.
+Now, let's examine $2^\delta$ modulo $p^2$:
+$$ 2^\delta = 2^{2^{n+1}} = (2^{2^n})^2 = (p - 1)^2 $$
+Expanding the square:
+$$ (p - 1)^2 = p^2 - 2p + 1 $$
+Considering this modulo $p^2$:
+$$ 2^\delta \equiv -2p + 1 \pmod{p^2} $$
+$$ 2^\delta = 1 - 2p \pmod{p^2} $$
+
+**Step 2: Construct $\ell$.**
+
+We look for $\ell$ in the form $\ell = k + x \cdot \delta$, where $x$ is a positive integer to be determined.
+$$ 2^\ell = 2^{k + x\delta} = 2^k \cdot (2^\delta)^x $$
+Substituting the equivalence found in Step 1:
+$$ 2^\ell \equiv 2^k \cdot (1 - 2p)^x \pmod{p^2} $$
+Using the Binomial Theorem, $(1 - 2p)^x = 1 - x(2p) + \binom{x}{2}(2p)^2 - \dots$.
+Modulo $p^2$, all terms containing $p^2$ or higher powers vanish. Thus:
+$$ (1 - 2p)^x \equiv 1 - 2xp \pmod{p^2} $$
+Substituting this back into the expression for $2^\ell$:
+$$ 2^\ell \equiv 2^k (1 - 2xp) \pmod{p^2} $$
+$$ 2^\ell \equiv 2^k - x \cdot 2^{k+1}p \pmod{p^2} $$
+
+**Step 3: Solve for $x$.**
+
+We require $2^\ell \equiv m \pmod{p^2}$.
+Recall that $m = 2^k + sp$. Therefore, we need:
+$$ 2^k - x \cdot 2^{k+1}p \equiv 2^k + sp \pmod{p^2} $$
+Subtracting $2^k$ from both sides:
+$$ -x \cdot 2^{k+1}p \equiv sp \pmod{p^2} $$
+Since $p \neq 0$, we can divide the congruence by $p$ (which changes the modulus from $p^2$ to $p$):
+$$ -x \cdot 2^{k+1} \equiv s \pmod{p} $$
+We need to solve this linear congruence for $x$.
+Since $p$ is an odd prime (as $p = 2^{2^n} + 1$), $\gcd(2^{k+1}, p) = 1$.
+Therefore, $2^{k+1}$ has a multiplicative inverse modulo $p$.
+Let $A = -2^{k+1}$. The congruence is $A \cdot x \equiv s \pmod{p}$.
+There exists a unique solution for $x$ modulo $p$:
+$$ x \equiv s \cdot A^{-1} \pmod{p} $$
+We can choose a positive integer representative for $x$. Let this specific value be $x_0$.
+
+**Conclusion**
+
+By choosing $\ell = k + x_0 \cdot 2^{n+1}$, we satisfy the condition:
+$$ 2^\ell - m \equiv 0 \pmod{p^2} $$
+Since $k$ and $x_0$ are positive, $\ell$ is a positive integer.
+Thus, such a number $\ell$ exists.
+
+Q.E.D.
+
+\end{document}
