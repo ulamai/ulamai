@@ -8,7 +8,7 @@ A **truth-first**, reproducible, open-source **Lean 4 theorem prover CLI** that 
 - **Search + caching** (best-first / beam + transposition table)
 
 Ulam AI is designed to plug into **Codex / Claude Code / Gemini CLI / Ollama** and produce **machine-checked Lean 4 proofs**.
-Start here: `examples/UlamAI_Prover_Tutorial.md`.
+Start here: [UlamAI Prover Tutorial](examples/UlamAI_Prover_Tutorial.md).
 
 ---
 
@@ -470,6 +470,8 @@ ulam -lean
 # or
 python3 -m ulam -lean
 ```
+
+Use one of the exact command forms above.
 
 Non-interactive:
 
