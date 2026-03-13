@@ -692,6 +692,12 @@ Potential formalization pipeline (later v0.2.x, not active yet):
 - Add dedicated formalization regression tests (stalls, equivalence repair behavior, resume determinism, guardrail non-regression).
 
 ### v0.3 — SFT training loop
+- (Both tracks: informal `.tex` + formal `formalize`) Dependency-first proving loop: decompose into a concept/claim or declaration DAG first, then solve bottom-up.
+- (Both tracks: informal `.tex` + formal `formalize`) Live grounding retrieval: force term/definition grounding from current Mathlib/local sources before drafting, so models don’t invent symbols/assumptions.
+- (Both tracks: informal `.tex` + formal `formalize`) Compiler/typecheck-in-the-loop reflection at each node, not only at the end.
+- (Both tracks: informal `.tex` + formal `formalize`) Semantic gate beyond syntax: check whether generated claims/statements match intended meanings (especially hidden conditions and weaker-theorem drift).
+- (Both tracks: informal `.tex` + formal `formalize`) Reliability over forced output: add an explicit abstain/no-output or partial-safe outcome when gates fail, instead of always composing a final proof/file.
+- (Both tracks: informal `.tex` + formal `formalize`) Autonomy protocol artifacts: keep fixed verification/extraction prompts, full transcripts, and an autonomy card in reports.
 - Trace extraction into JSONL
 - Train tactic policy (SFT) on mathlib traces
 - Optional “proofstep dataset” for your chosen model family
