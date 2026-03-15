@@ -675,6 +675,7 @@ fast and provides clear debugging signals. MCTS/MCGS can be layered later.
 - Minimal regression suite (`ulam bench`)
 
 ### v0.2 — “Feels powerful” baseline
+- Guardrail budget profiles (`fast|balanced|strict`) for both informal `.tex` and formal `formalize` tracks, exposed in TUI settings to trade off speed vs. verification depth.
 - Optional Lean LSP backend track for interactive goal/diagnostic loops in LLM/formalize mode (`Dojo` remains default for tactic search until parity gate).
 - Define parity gate for any LSP promotion: runner `start/apply` semantics, replay/cache stability, and non-regression on internal + miniF2F slice.
 - Better state canonicalization (stable hashing)
