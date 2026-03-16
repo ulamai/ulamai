@@ -103,19 +103,19 @@ def main(argv: list[str] | None = None) -> None:
     prove.add_argument(
         "--tex-rounds",
         type=int,
-        default=3,
+        default=None,
         help="planner/worker/judge rounds for --output-format tex",
     )
     prove.add_argument(
         "--tex-judge-repairs",
         type=int,
-        default=2,
+        default=None,
         help="max consecutive judge-directed repair rounds for --output-format tex",
     )
     prove.add_argument(
         "--tex-worker-drafts",
         type=int,
-        default=2,
+        default=None,
         help="worker drafts per round for --output-format tex",
     )
     prove.add_argument(
@@ -251,9 +251,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     prove.add_argument(
         "--proof-profile",
-        choices=["normal", "strict"],
+        choices=["fast", "balanced", "strict", "normal"],
         default=None,
-        help="policy profile for guardrails (strict disables axioms/helpers and locks edits)",
+        help="risk/speed profile (normal is accepted as an alias of balanced)",
     )
     prove.add_argument(
         "--llm-allow-helper-lemmas",
@@ -366,9 +366,9 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint.add_argument("--lean-import", action="append", default=[], help="additional Lean imports")
     checkpoint.add_argument(
         "--proof-profile",
-        choices=["normal", "strict"],
+        choices=["fast", "balanced", "strict", "normal"],
         default=None,
-        help="policy profile for checkpoint criteria",
+        help="risk/speed profile for checkpoint criteria (normal = balanced)",
     )
     checkpoint.add_argument(
         "--allow-axioms",
@@ -399,7 +399,7 @@ def main(argv: list[str] | None = None) -> None:
     formalize.add_argument("tex", type=Path, help="path to .tex file")
     formalize.add_argument("--out", type=Path, default=None, help="output .lean path")
     formalize.add_argument("--context", action="append", default=[], help="context files (.lean/.tex)")
-    formalize.add_argument("--max-rounds", type=int, default=5)
+    formalize.add_argument("--max-rounds", type=int, default=None)
     formalize.add_argument(
         "--max-repairs",
         type=int,
@@ -407,18 +407,18 @@ def main(argv: list[str] | None = None) -> None:
         help="max typecheck repairs (default: same as --max-rounds)",
     )
     formalize.add_argument("--max-equivalence-repairs", type=int, default=2)
-    formalize.add_argument("--max-proof-rounds", type=int, default=1)
+    formalize.add_argument("--max-proof-rounds", type=int, default=None)
     formalize.add_argument("--proof-max-steps", type=int, default=64)
     formalize.add_argument("--proof-beam", type=int, default=4)
     formalize.add_argument("--proof-k", type=int, default=1)
     formalize.add_argument("--proof-timeout", type=float, default=5.0)
     formalize.add_argument(
         "--proof-profile",
-        choices=["normal", "strict"],
+        choices=["fast", "balanced", "strict", "normal"],
         default=None,
-        help="policy profile for guardrails (strict disables axioms by default)",
+        help="risk/speed profile (normal is accepted as an alias of balanced)",
     )
-    formalize.add_argument("--proof-repair", type=int, default=2)
+    formalize.add_argument("--proof-repair", type=int, default=None)
     formalize.add_argument(
         "--typecheck-timeout",
         type=float,
@@ -909,6 +909,10 @@ def main(argv: list[str] | None = None) -> None:
 
 def run_prove(args: argparse.Namespace) -> None:
     config_data = load_config()
+    profile = _resolve_proof_profile(args, config_data)
+    _apply_proof_profile_to_args(args, profile)
+    if getattr(args, "verbose", False):
+        print(f"[policy] profile={profile}")
     output_format = _resolve_prove_output_format(args, config_data)
     if output_format == "tex":
         run_prove_tex(args, config_data=config_data)
@@ -917,11 +921,8 @@ def run_prove(args: argparse.Namespace) -> None:
         print("Lean output mode requires a target file.")
         print("Usage: ulam prove path/to/File.lean --theorem MyTheorem")
         return
-    profile = _resolve_proof_profile(args, config_data)
-    _apply_proof_profile_to_args(args, profile)
     inf_profile, gen_k, exec_k, verify_level = _apply_inference_runtime_to_args(args)
     if getattr(args, "verbose", False):
-        print(f"[policy] profile={profile}")
         exec_text = "all" if exec_k <= 0 else str(exec_k)
         print(
             f"[policy] inference_profile={inf_profile} "
@@ -1068,6 +1069,8 @@ def run_prove(args: argparse.Namespace) -> None:
 
 def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> bool:
     cfg = config_data if config_data is not None else load_config()
+    profile = _resolve_proof_profile(args, cfg)
+    _apply_proof_profile_to_args(args, profile)
     theorem = str(getattr(args, "theorem", "") or "").strip()
     if not theorem:
         print("`--theorem` is required for TeX output mode.")
@@ -1095,6 +1098,12 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     judge_repairs = _resolve_tex_judge_repairs(args, cfg)
     worker_drafts = _resolve_tex_worker_drafts(args, cfg)
     replan_passes = _resolve_tex_replan_passes(args, cfg)
+    verifier_policy = str(getattr(args, "tex_verifier_policy", "promoted") or "promoted").strip().lower()
+    if verifier_policy not in {"final_only", "promoted", "worker"}:
+        verifier_policy = "promoted"
+    compose_policy = str(getattr(args, "tex_compose_policy", "always") or "always").strip().lower()
+    if compose_policy not in {"always", "on_complete"}:
+        compose_policy = "always"
     instruction = str(getattr(args, "instruction", "") or "").strip()
     context_blocks = _read_context_files(list(getattr(args, "context", []) or []))
     if isinstance(file_path, Path) and file_path.exists():
@@ -1138,6 +1147,8 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             judge_repairs = max(0, int(settings.get("judge_repairs", judge_repairs)))
             worker_drafts = max(1, int(settings.get("worker_drafts", worker_drafts)))
             replan_passes = max(1, int(settings.get("replan_passes", replan_passes)))
+            verifier_policy = str(settings.get("verifier_policy", verifier_policy) or verifier_policy).strip().lower()
+            compose_policy = str(settings.get("compose_policy", compose_policy) or compose_policy).strip().lower()
         except Exception:
             pass
         out_path = Path(str(run_state.get("out_path", str(out_path)))).expanduser().resolve()
@@ -1161,6 +1172,8 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 "judge_repairs": judge_repairs,
                 "worker_drafts": worker_drafts,
                 "replan_passes": replan_passes,
+                "verifier_policy": verifier_policy,
+                "compose_policy": compose_policy,
             },
             "pass_history": [],
             "current_pass": 1,
@@ -1178,6 +1191,11 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             "final": {},
         }
 
+    if verifier_policy not in {"final_only", "promoted", "worker"}:
+        verifier_policy = "promoted"
+    if compose_policy not in {"always", "on_complete"}:
+        compose_policy = "always"
+
     run_dir.mkdir(parents=True, exist_ok=True)
     _tex_events_path(run_dir).parent.mkdir(parents=True, exist_ok=True)
     if not _tex_manifest_path(run_dir).exists():
@@ -1193,6 +1211,8 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 "judge_repairs": judge_repairs,
                 "worker_drafts": worker_drafts,
                 "replan_passes": replan_passes,
+                "verifier_policy": verifier_policy,
+                "compose_policy": compose_policy,
             },
             "llm_provider": str(getattr(args, "llm", "")).strip(),
             "llm_model": str(
@@ -1212,6 +1232,10 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     print(
         f"[tex] rounds={rounds} worker_drafts={worker_drafts} "
         f"judge_repairs={judge_repairs} replan_passes={replan_passes}"
+    )
+    print(
+        f"[tex] profile={profile} verifier_policy={verifier_policy} "
+        f"compose_policy={compose_policy}"
     )
     print(f"[tex] artifacts={run_dir}")
 
@@ -1335,6 +1359,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 prior_feedback = str(claim_feedback.get(claim_id, "") or "")
 
                 best_candidate: dict | None = None
+                worker_verifier_enabled = verifier_policy == "worker"
                 for worker_idx in range(1, worker_drafts + 1):
                     draft = llm.tex_claim_draft(
                         theorem_name=theorem,
@@ -1381,17 +1406,27 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                         ledger=ledger,
                         context=context,
                     )
-                    verifier = llm.tex_claim_verifier(
-                        theorem_name=theorem,
-                        theorem_statement=statement,
-                        instruction=str(run_state.get("current_instruction", instruction)),
-                        plan=plan,
-                        claim=claim,
-                        candidate=draft,
-                        accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
-                        ledger=ledger,
-                        context=context,
-                    )
+                    if worker_verifier_enabled:
+                        verifier = llm.tex_claim_verifier(
+                            theorem_name=theorem,
+                            theorem_statement=statement,
+                            instruction=str(run_state.get("current_instruction", instruction)),
+                            plan=plan,
+                            claim=claim,
+                            candidate=draft,
+                            accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                            ledger=ledger,
+                            context=context,
+                        )
+                    else:
+                        verifier = {
+                            "verdict": "skip",
+                            "score": 0,
+                            "summary": "deferred by profile",
+                            "critical_issues": [],
+                            "counterexample_attempt": "",
+                            "suggested_repairs": [],
+                        }
                     checker = llm.tex_claim_domain_check(
                         theorem_name=theorem,
                         theorem_statement=statement,
@@ -1406,12 +1441,14 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                         verifier=verifier,
                         checker=checker,
                         static_issues=static_issues,
+                        require_verifier=worker_verifier_enabled,
                     )
                     pass_gate = _tex_claim_pass_gate(
                         judge=judge,
                         verifier=verifier,
                         checker=checker,
                         static_issues=static_issues,
+                        require_verifier=worker_verifier_enabled,
                     )
                     candidate = {
                         "claim_id": claim_id,
@@ -1422,6 +1459,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                         "static_issues": static_issues,
                         "score": candidate_score,
                         "pass_gate": pass_gate,
+                        "verifier_mode": "worker" if worker_verifier_enabled else "deferred",
                     }
                     if best_candidate is None or candidate_score > float(best_candidate.get("score", -1e9)):
                         best_candidate = candidate
@@ -1438,7 +1476,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                     )
                     print(
                         f"[tex] claim={claim_id} worker={worker_idx} "
-                        f"judge={judge.get('verdict','revise')} verifier={verifier.get('verdict','revise')} "
+                        f"judge={judge.get('verdict','revise')} verifier={verifier.get('verdict','skip')} "
                         f"checker={checker.get('status','issues')} score={candidate_score:.1f}"
                     )
 
@@ -1458,6 +1496,52 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                     run_state["current_claim_index"] = claim_index
                     _persist_state()
                     continue
+
+                if verifier_policy == "promoted":
+                    promoted_verifier = llm.tex_claim_verifier(
+                        theorem_name=theorem,
+                        theorem_statement=statement,
+                        instruction=str(run_state.get("current_instruction", instruction)),
+                        plan=plan,
+                        claim=claim,
+                        candidate=best_candidate.get("draft", {}),
+                        accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                        ledger=ledger,
+                        context=context,
+                    )
+                    best_candidate["verifier"] = promoted_verifier
+                    best_candidate["verifier_mode"] = "promoted"
+                    best_candidate["score"] = _tex_claim_candidate_score(
+                        draft=best_candidate.get("draft", {}),
+                        judge=best_candidate.get("judge", {}),
+                        verifier=promoted_verifier,
+                        checker=best_candidate.get("checker", {}),
+                        static_issues=list(best_candidate.get("static_issues", []) or []),
+                        require_verifier=True,
+                    )
+                    best_candidate["pass_gate"] = _tex_claim_pass_gate(
+                        judge=best_candidate.get("judge", {}),
+                        verifier=promoted_verifier,
+                        checker=best_candidate.get("checker", {}),
+                        static_issues=list(best_candidate.get("static_issues", []) or []),
+                        require_verifier=True,
+                    )
+                    _append_tex_event(
+                        run_dir,
+                        {
+                            "kind": "candidate_verifier",
+                            "pass": pass_idx,
+                            "round": round_idx,
+                            "claim_id": claim_id,
+                            "mode": "promoted",
+                            "candidate": _json_clone(best_candidate),
+                        },
+                    )
+                    print(
+                        f"[tex] claim={claim_id} promoted verifier="
+                        f"{str(promoted_verifier.get('verdict', 'revise')).strip().lower()} "
+                        f"score={float(best_candidate.get('score', 0.0) or 0.0):.1f}"
+                    )
 
                 best_claim_candidates[claim_id] = best_candidate
                 if bool(best_candidate.get("pass_gate")):
@@ -1643,6 +1727,48 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         compose_accepted_claims,
         compose_best_candidates,
     )
+    claims_complete = len(compose_claim_graph) == 0 or (
+        len(compose_accepted_claims) >= len(compose_claim_graph)
+    )
+    if compose_policy == "on_complete" and not claims_complete:
+        reason = (
+            "abstained_from_composition_due_to_unresolved_claims"
+        )
+        print(
+            f"[tex] abstaining from final compose: accepted claims "
+            f"{len(compose_accepted_claims)}/{len(compose_claim_graph)}."
+        )
+        run_state["status"] = "finished"
+        run_state["final"] = {
+            "pass": False,
+            "abstained": True,
+            "reason": reason,
+            "used_pass": compose_pass_idx,
+            "accepted_claims": len(compose_accepted_claims),
+            "total_claims": len(compose_claim_graph),
+        }
+        _write_tex_state(run_dir, run_state)
+        _tex_summary_path(run_dir).write_text(
+            json.dumps(run_state["final"], indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        _append_tex_event(
+            run_dir,
+            {
+                "kind": "final",
+                "pass": False,
+                "abstained": True,
+                "reason": reason,
+                "used_pass": compose_pass_idx,
+                "accepted_claims": len(compose_accepted_claims),
+                "total_claims": len(compose_claim_graph),
+            },
+        )
+        print(f"[tex] state snapshot: {_tex_state_path(run_dir)}")
+        print(f"[tex] event log: {_tex_events_path(run_dir)}")
+        print(f"[tex] summary: {_tex_summary_path(run_dir)}")
+        return False
+
     compose_ledger = _build_tex_claim_ledger(
         {item["id"]: item for item in compose_claims if item.get("id")}
     )
@@ -1678,7 +1804,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         theorem_name=theorem,
         theorem_statement=statement,
         instruction=instruction,
-        plan=plan,
+        plan=compose_plan,
         draft_tex=final_draft,
         context=context,
     )
@@ -2893,32 +3019,104 @@ def _autop_enabled(args: argparse.Namespace) -> bool:
 
 def _normalize_proof_profile(value: object) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {"strict", "normal"}:
+    if raw in {"", "normal", "balanced", "default"}:
+        return "balanced"
+    if raw in {"fast", "strict"}:
         return raw
-    return "normal"
+    return "balanced"
 
 
 def _resolve_proof_profile(args: argparse.Namespace, config: dict | None = None) -> str:
-    explicit = _normalize_proof_profile(getattr(args, "proof_profile", ""))
-    if explicit != "normal" or str(getattr(args, "proof_profile", "")).strip():
-        return explicit
+    explicit_raw = str(getattr(args, "proof_profile", "") or "").strip()
+    if explicit_raw:
+        return _normalize_proof_profile(explicit_raw)
     cfg = config if config is not None else load_config()
     policy = cfg.get("policy", {})
     if isinstance(policy, dict):
-        return _normalize_proof_profile(policy.get("proof_profile", "normal"))
-    return "normal"
+        return _normalize_proof_profile(policy.get("proof_profile", "balanced"))
+    return "balanced"
+
+
+def _set_arg_if_unset(args: argparse.Namespace, name: str, value: object) -> None:
+    if not hasattr(args, name):
+        return
+    if getattr(args, name) is None:
+        setattr(args, name, value)
 
 
 def _apply_proof_profile_to_args(args: argparse.Namespace, profile: str) -> None:
     mode = _normalize_proof_profile(profile)
-    if mode != "strict":
-        return
-    if hasattr(args, "allow_axioms"):
-        setattr(args, "allow_axioms", False)
-    if hasattr(args, "llm_allow_helper_lemmas"):
-        setattr(args, "llm_allow_helper_lemmas", False)
-    if hasattr(args, "llm_edit_scope"):
-        setattr(args, "llm_edit_scope", "errors_only")
+    if hasattr(args, "proof_profile"):
+        setattr(args, "proof_profile", mode)
+
+    tex_profile_defaults = {
+        "fast": {
+            "tex_rounds": 2,
+            "tex_judge_repairs": 1,
+            "tex_worker_drafts": 1,
+            "tex_replan_passes": 1,
+            "tex_verifier_policy": "final_only",
+            "tex_compose_policy": "on_complete",
+        },
+        "balanced": {
+            "tex_rounds": 3,
+            "tex_judge_repairs": 2,
+            "tex_worker_drafts": 2,
+            "tex_replan_passes": 2,
+            "tex_verifier_policy": "promoted",
+            "tex_compose_policy": "always",
+        },
+        "strict": {
+            "tex_rounds": 4,
+            "tex_judge_repairs": 3,
+            "tex_worker_drafts": 3,
+            "tex_replan_passes": 3,
+            "tex_verifier_policy": "worker",
+            "tex_compose_policy": "on_complete",
+        },
+    }
+    formalize_profile_defaults = {
+        "fast": {
+            "max_rounds": 3,
+            "max_repairs": 3,
+            "max_proof_rounds": 1,
+            "proof_repair": 1,
+            "llm_check": True,
+            "llm_check_timing": "end",
+            "llm_check_repairs": 1,
+        },
+        "balanced": {
+            "max_rounds": 5,
+            "max_repairs": 5,
+            "max_proof_rounds": 1,
+            "proof_repair": 2,
+            "llm_check": True,
+            "llm_check_timing": "end",
+            "llm_check_repairs": 2,
+        },
+        "strict": {
+            "max_rounds": 6,
+            "max_repairs": 6,
+            "max_proof_rounds": 2,
+            "proof_repair": 3,
+            "llm_check": True,
+            "llm_check_timing": "mid+end",
+            "llm_check_repairs": 3,
+        },
+    }
+
+    for key, value in tex_profile_defaults[mode].items():
+        _set_arg_if_unset(args, key, value)
+    for key, value in formalize_profile_defaults[mode].items():
+        _set_arg_if_unset(args, key, value)
+
+    if mode == "strict":
+        if hasattr(args, "allow_axioms"):
+            setattr(args, "allow_axioms", False)
+        if hasattr(args, "llm_allow_helper_lemmas"):
+            setattr(args, "llm_allow_helper_lemmas", False)
+        if hasattr(args, "llm_edit_scope"):
+            setattr(args, "llm_edit_scope", "errors_only")
 
 
 def _resolve_allow_axioms(args: argparse.Namespace, config: dict | None = None) -> bool:
@@ -3443,14 +3641,15 @@ def _tex_claim_candidate_score(
     verifier: dict,
     checker: dict,
     static_issues: list[str],
+    require_verifier: bool = True,
 ) -> float:
     judge_score = float(judge.get("score", 0) or 0)
-    verifier_score = float(verifier.get("score", 0) or 0)
+    verifier_score = float(verifier.get("score", 0) or 0) if require_verifier else 0.0
     checker_score = float(checker.get("score", 0) or 0)
     confidence = float(draft.get("confidence", 0) or 0)
     score = (
         0.45 * judge_score
-        + 0.30 * verifier_score
+        + (0.30 * verifier_score if require_verifier else 0.0)
         + 0.20 * checker_score
         + 0.05 * confidence
     )
@@ -3461,10 +3660,11 @@ def _tex_claim_candidate_score(
         score -= 10
     elif judge_verdict == "fail":
         score -= 28
-    if verifier_verdict == "revise":
-        score -= 12
-    elif verifier_verdict == "fail":
-        score -= 30
+    if require_verifier:
+        if verifier_verdict == "revise":
+            score -= 12
+        elif verifier_verdict == "fail":
+            score -= 30
     if checker_status != "ok":
         score -= 12
     score -= 7 * len(static_issues)
@@ -3476,11 +3676,14 @@ def _tex_claim_pass_gate(
     verifier: dict,
     checker: dict,
     static_issues: list[str],
+    require_verifier: bool = True,
 ) -> bool:
     judge_pass = str(judge.get("verdict", "revise")).strip().lower() == "pass"
     verifier_pass = str(verifier.get("verdict", "revise")).strip().lower() == "pass"
     checker_ok = str(checker.get("status", "issues")).strip().lower() == "ok"
-    return judge_pass and verifier_pass and checker_ok and not static_issues
+    if require_verifier:
+        return judge_pass and verifier_pass and checker_ok and not static_issues
+    return judge_pass and checker_ok and not static_issues
 
 
 def _finalize_tex_claim(claim: dict, best_candidate: dict) -> dict:
@@ -3651,6 +3854,72 @@ def _strip_md_fences(text: str) -> str:
     if lines and lines[-1].strip().startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _resolve_formalize_max_rounds(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "max_rounds", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 5
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("max_rounds", 5)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 5
+
+
+def _resolve_formalize_max_repairs(
+    args: argparse.Namespace,
+    max_rounds: int,
+    config: dict | None = None,
+) -> int:
+    explicit = getattr(args, "max_repairs", None)
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except Exception:
+            return max(0, int(max_rounds))
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("max_repairs", None)
+    if raw is None:
+        return max(0, int(max_rounds))
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return max(0, int(max_rounds))
+
+
+def _resolve_formalize_max_proof_rounds(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "max_proof_rounds", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 1
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("max_proof_rounds", 1)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 1
+
+
+def _resolve_formalize_proof_repair(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "proof_repair", None)
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except Exception:
+            return 2
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("formalize", {}).get("proof_repair", 2)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 2
 
 
 def _resolve_formalize_typecheck_timeout(
@@ -5705,8 +5974,10 @@ def run_formalize(args: argparse.Namespace) -> None:
         lean_backend = "cli"
     if lean_project is None and proof_backend in {"tactic", "lemma"}:
         print("[formalize] no Lean project detected; tactic/lemma proof search will be skipped.")
-    max_rounds = max(1, int(args.max_rounds))
-    max_repairs = max_rounds if args.max_repairs is None else max(0, int(args.max_repairs))
+    max_rounds = _resolve_formalize_max_rounds(args, config)
+    max_repairs = _resolve_formalize_max_repairs(args, max_rounds, config)
+    max_proof_rounds = _resolve_formalize_max_proof_rounds(args, config)
+    proof_repair = _resolve_formalize_proof_repair(args, config)
     dojo_timeout_s = float(config.get("lean", {}).get("dojo_timeout_s", 180))
     typecheck_timeout_s = _resolve_formalize_typecheck_timeout(args, config)
     allow_axioms = _resolve_allow_axioms(args, config)
@@ -5720,12 +5991,12 @@ def run_formalize(args: argparse.Namespace) -> None:
         max_rounds=max_rounds,
         max_repairs=max_repairs,
         max_equivalence_repairs=args.max_equivalence_repairs,
-        max_proof_rounds=args.max_proof_rounds,
+        max_proof_rounds=max_proof_rounds,
         proof_max_steps=args.proof_max_steps,
         proof_beam=args.proof_beam,
         proof_k=args.proof_k,
         proof_timeout_s=args.proof_timeout,
-        proof_repair=args.proof_repair,
+        proof_repair=proof_repair,
         typecheck_timeout_s=typecheck_timeout_s,
         dojo_timeout_s=dojo_timeout_s,
         lemma_max=60,

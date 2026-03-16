@@ -90,7 +90,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "dojo_timeout_s": 180,
     },
     "policy": {
-        "proof_profile": "normal",
+        "proof_profile": "balanced",
     },
 }
 

@@ -198,11 +198,12 @@ def _configure_prover(config: dict) -> None:
 def _configure_prover_all(config: dict) -> None:
     policy = config.setdefault("policy", {})
     profile_raw = _prompt(
-        "Proof profile (normal|strict)",
-        default=str(policy.get("proof_profile", "normal")),
+        "Risk/speed profile (fast|balanced|strict)",
+        default=str(policy.get("proof_profile", "balanced")),
     ).strip().lower()
     profile = _normalize_proof_profile(profile_raw)
     policy["proof_profile"] = profile
+    _apply_proof_profile_config(config, profile)
 
     prove = config.setdefault("prove", {})
     output_format = _prompt(
@@ -461,12 +462,9 @@ def _configure_prover_all(config: dict) -> None:
     except Exception:
         formalize["llm_check_repairs"] = 2
 
-    _apply_proof_profile_config(config, profile)
-
-
 def _configure_prover_single(config: dict) -> None:
     settings: list[tuple[str, str]] = [
-        ("policy.proof_profile", "Proof profile"),
+        ("policy.proof_profile", "Risk/speed profile"),
         ("prove.output_format", "Default prove output format"),
         ("prove.mode", "Default proof mode"),
         ("prove.solver", "Default solver"),
@@ -535,7 +533,7 @@ def _prover_setting_value(config: dict, key: str) -> str:
     segmentation = config.setdefault("segmentation", {})
     formalize = config.setdefault("formalize", {})
     if key == "policy.proof_profile":
-        return _normalize_proof_profile(policy.get("proof_profile", "normal"))
+        return _normalize_proof_profile(policy.get("proof_profile", "balanced"))
     if key == "prove.output_format":
         value = str(prove.get("output_format", "lean")).strip().lower()
         if value not in {"lean", "tex"}:
@@ -633,8 +631,8 @@ def _update_prover_setting(config: dict, key: str) -> None:
     formalize = config.setdefault("formalize", {})
     if key == "policy.proof_profile":
         raw = _prompt(
-            "Proof profile (normal|strict)",
-            default=_normalize_proof_profile(policy.get("proof_profile", "normal")),
+            "Risk/speed profile (fast|balanced|strict)",
+            default=_normalize_proof_profile(policy.get("proof_profile", "balanced")),
         ).strip().lower()
         profile = _normalize_proof_profile(raw)
         policy["proof_profile"] = profile
@@ -939,7 +937,7 @@ def _reset_prover_settings(config: dict) -> None:
     formalize_defaults = DEFAULT_CONFIG.get("formalize", {})
     segmentation_defaults = DEFAULT_CONFIG.get("segmentation", {"chunk_words": 1000})
     policy = config.setdefault("policy", {})
-    policy["proof_profile"] = _normalize_proof_profile(policy_defaults.get("proof_profile", "normal"))
+    policy["proof_profile"] = _normalize_proof_profile(policy_defaults.get("proof_profile", "balanced"))
     prove = config.setdefault("prove", {})
     prove.clear()
     prove.update(json.loads(json.dumps(prove_defaults)))
@@ -970,18 +968,61 @@ def _reset_prover_settings(config: dict) -> None:
 
 def _normalize_proof_profile(value: object) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {"normal", "strict"}:
+    if raw in {"", "normal", "balanced", "default"}:
+        return "balanced"
+    if raw in {"fast", "strict"}:
         return raw
-    return "normal"
+    return "balanced"
 
 
 def _apply_proof_profile_config(config: dict, profile: str) -> None:
     mode = _normalize_proof_profile(profile)
     prove = config.setdefault("prove", {})
+    formalize = config.setdefault("formalize", {})
+    if mode == "fast":
+        prove["tex_rounds"] = 2
+        prove["tex_judge_repairs"] = 1
+        prove["tex_worker_drafts"] = 1
+        prove["tex_replan_passes"] = 1
+        formalize["max_rounds"] = 3
+        formalize["max_repairs"] = 3
+        formalize["max_proof_rounds"] = 1
+        formalize["proof_repair"] = 1
+        formalize["llm_check"] = True
+        formalize["llm_check_timing"] = "end"
+        formalize["llm_check_repairs"] = 1
+        return
+    if mode == "balanced":
+        prove["allow_axioms"] = True
+        prove["llm_allow_helper_lemmas"] = True
+        prove["llm_edit_scope"] = "full"
+        prove["tex_rounds"] = 3
+        prove["tex_judge_repairs"] = 2
+        prove["tex_worker_drafts"] = 2
+        prove["tex_replan_passes"] = 2
+        formalize["max_rounds"] = 5
+        formalize["max_repairs"] = 5
+        formalize["max_proof_rounds"] = 1
+        formalize["proof_repair"] = 2
+        formalize["llm_check"] = True
+        formalize["llm_check_timing"] = "end"
+        formalize["llm_check_repairs"] = 2
+        return
     if mode == "strict":
         prove["allow_axioms"] = False
         prove["llm_allow_helper_lemmas"] = False
         prove["llm_edit_scope"] = "errors_only"
+        prove["tex_rounds"] = 4
+        prove["tex_judge_repairs"] = 3
+        prove["tex_worker_drafts"] = 3
+        prove["tex_replan_passes"] = 3
+        formalize["max_rounds"] = 6
+        formalize["max_repairs"] = 6
+        formalize["max_proof_rounds"] = 2
+        formalize["proof_repair"] = 3
+        formalize["llm_check"] = True
+        formalize["llm_check_timing"] = "mid+end"
+        formalize["llm_check_repairs"] = 3
     return
 
 
@@ -1553,7 +1594,7 @@ def _build_args_from_config(
         llm_cycle_patience=int(prove.get("llm_cycle_patience", 2)),
         llm_allow_helper_lemmas=bool(prove.get("llm_allow_helper_lemmas", True)),
         llm_edit_scope=str(prove.get("llm_edit_scope", "full")),
-        proof_profile=_normalize_proof_profile(policy.get("proof_profile", "normal")),
+        proof_profile=_normalize_proof_profile(policy.get("proof_profile", "balanced")),
         timeout=5.0,
         typecheck_timeout=float(prove.get("typecheck_timeout_s", 60)),
         repair=2,
