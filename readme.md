@@ -73,7 +73,7 @@ Lean backends:
 ## Status (v0.2.7)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.7 highlights:** optional stateful Lean LSP runner for tactic/lemma search (`--lean lsp`), TUI-selectable search backend (`dojo|lsp`), inference profiles (`--inference-profile`, `--gen-k`, `--exec-k`, `--verify-level`), planner/replan caching metrics, stricter parity-gate comparability checks, baseline-gated campaign automation (`run_bench_campaign.sh --compare-to ...`), and an upgraded `prove --output-format tex` informal pipeline with claim-graph solving + judge/verifier/check gates.
+- **v0.2.7 highlights:** new TUI `Custom API` provider path (`1. Configure LLM` -> `5. Custom API`) for OpenAI-compatible endpoints (Mistral, Z.AI, Qwen, DeepSeek, Kimi), plus the v0.2.6 guardrail budget profiles (`fast|balanced|strict`, default `balanced`) to control speed vs reliability in both `prove` and `formalize` loops.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
