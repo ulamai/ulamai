@@ -33,7 +33,7 @@ def run_menu() -> None:
         print(f"Version: {__version__}")
         print(f"Provider: {_provider_label(config)}")
         print()
-        print("1. Configure LLM (OpenAI, Claude, Ollama, Gemini)")
+        print("1. Configure LLM (OpenAI, Claude, Ollama, Gemini, Custom API)")
         print("2. Prove with natural language guidance")
         print("3. Formalize .tex to Lean")
         print("4. Resume last formalization")
@@ -70,6 +70,7 @@ def _configure_llm(config: dict) -> None:
     print("2. Claude (Anthropic)")
     print("3. Ollama")
     print("4. Gemini")
+    print("5. Custom API (Mistral/Z.AI/Qwen/DeepSeek/Kimi)")
     choice = _prompt("Provider", default="1")
     if choice == "1":
         config["llm_provider"] = "openai"
@@ -83,6 +84,9 @@ def _configure_llm(config: dict) -> None:
     elif choice == "4":
         config["llm_provider"] = "gemini"
         _configure_gemini(config)
+    elif choice == "5":
+        config["llm_provider"] = "openai"
+        _configure_openai_compat(config)
     else:
         print("Unknown provider.")
     print("\nSaved configuration.\n")
@@ -103,8 +107,42 @@ def _configure_openai(config: dict) -> None:
         return
     section["api_key"] = _prompt("API key", default=section.get("api_key", ""))
     config["llm_provider"] = "openai"
+    section["provider_label"] = "OpenAI"
     section["base_url"] = _prompt("Base URL", default=section.get("base_url", "https://api.openai.com"))
     section["model"] = _prompt("Model", default=section.get("model", "gpt-4.1"))
+
+
+def _configure_openai_compat(config: dict) -> None:
+    section = config.setdefault("openai", {})
+    print("\nOpenAI-compatible API preset:")
+    print("1. Mistral")
+    print("2. Z.AI")
+    print("3. Qwen")
+    print("4. DeepSeek")
+    print("5. Kimi")
+    print("6. Custom")
+    preset = _prompt("Preset", default="6").strip()
+
+    presets = {
+        "1": ("Mistral", "https://api.mistral.ai", "mistral-medium-latest"),
+        "2": ("Z.AI", "https://api.z.ai/api/paas/v4", "glm-5"),
+        "3": ("Qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode", "qwen-plus"),
+        "4": ("DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
+        "5": ("Kimi", "https://api.moonshot.ai", "kimi-k2-0711-preview"),
+    }
+    current_label = str(section.get("provider_label", "")).strip() or "Custom"
+    current_base = str(section.get("base_url", "")).strip() or "https://api.openai.com"
+    current_model = str(section.get("model", "")).strip() or "gpt-4.1"
+    provider_label, default_base, default_model = presets.get(
+        preset, (current_label, current_base, current_model)
+    )
+
+    label = _prompt("Provider label", default=provider_label).strip() or provider_label
+    section["provider_label"] = label
+    section["api_key"] = _prompt("API key", default=section.get("api_key", ""))
+    section["base_url"] = _prompt("Base URL", default=default_base).strip() or default_base
+    section["model"] = _prompt("Model", default=default_model).strip() or default_model
+    config["llm_provider"] = "openai"
 
 
 def _configure_anthropic(config: dict) -> None:
@@ -2220,7 +2258,11 @@ def _print_banner() -> None:
 def _provider_label(config: dict) -> str:
     provider = config.get("llm_provider", "openai")
     if provider == "openai":
-        key = config.get("openai", {}).get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
+        section = config.get("openai", {})
+        key = section.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
+        label = str(section.get("provider_label", "")).strip() or "OpenAI"
+        if label.lower() != "openai":
+            return f"{label} (OpenAI-compatible)" if key else f"{label} (OpenAI-compatible, no API key)"
         return "OpenAI" if key else "OpenAI (no API key)"
     if provider == "codex_cli":
         tokens = load_codex_tokens()
@@ -2258,9 +2300,11 @@ def _provider_label(config: dict) -> str:
 def _ensure_llm_ready(config: dict, allow_placeholder: bool) -> bool:
     provider = config.get("llm_provider", "openai")
     if provider == "openai":
-        key = config.get("openai", {}).get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
+        section = config.get("openai", {})
+        key = section.get("api_key", "") or os.environ.get("ULAM_OPENAI_API_KEY", "")
+        label = str(section.get("provider_label", "")).strip() or "OpenAI"
         if not key:
-            print("No OpenAI API key configured. Choose option 1 to configure it.")
+            print(f"No {label} API key configured. Choose option 1 to configure it.")
             return False
         return True
     if provider == "codex_cli":

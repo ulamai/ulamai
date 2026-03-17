@@ -86,6 +86,12 @@ ulam auth codex
 4. Choose auth method `Sign in with ChatGPT (Codex CLI)`.
 5. Select model (recommended: `gpt-5.2-codex` / `gpt-5.3-codex` if available).
 
+If you want non-OpenAI hosted models (Mistral/Z.AI/Qwen/DeepSeek/Kimi) through their APIs:
+1. Run `ulam`.
+2. Click `1. Configure LLM`.
+3. Choose provider `5. Custom API`.
+4. Pick a preset (or `Custom`) and fill API key, base URL, and model.
+
 Why this is recommended:
 - Strong default quality for both proving and judging loops.
 - Easy setup if you already use ChatGPT/Codex CLI.
