@@ -69,7 +69,8 @@ class LeanDojoRunner(LeanRunner):
                     f"{exc} Found theorems: {found_msg}. "
                     "Ensure the file contains the target theorem."
                 ) from exc
-        units = _load_sorries(self._server, text_for_dojo)
+        with _redirect_stderr_to_devnull(_pantograph_stderr_quiet()):
+            units = _load_sorries(self._server, text_for_dojo)
         if target_index >= len(units):
             raise RuntimeError(
                 f"Expected at least {target_index + 1} `sorry` goals, found {len(units)}. "
@@ -110,10 +111,11 @@ class LeanDojoRunner(LeanRunner):
             except Exception:
                 timeout_overridden = False
         try:
-            if _goal_tactic_uses_index(self._server):
-                new_state = self._server.goal_tactic(goal_state, 0, tactic)
-            else:
-                new_state = self._server.goal_tactic(goal_state, tactic)
+            with _redirect_stderr_to_devnull(_pantograph_stderr_quiet()):
+                if _goal_tactic_uses_index(self._server):
+                    new_state = self._server.goal_tactic(goal_state, 0, tactic)
+                else:
+                    new_state = self._server.goal_tactic(goal_state, tactic)
         except Exception as exc:  # pragma: no cover - depends on external Lean server
             return TacticResult(
                 ok=False,
@@ -303,7 +305,7 @@ def _create_server(
 
 
 def _pantograph_stderr_quiet() -> bool:
-    raw = os.environ.get("ULAM_PANTOGRAPH_QUIET", "0").strip().lower()
+    raw = os.environ.get("ULAM_PANTOGRAPH_QUIET", "1").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
