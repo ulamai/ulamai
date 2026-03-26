@@ -1150,14 +1150,22 @@ def _menu_prove(config: dict) -> None:
     ).strip().lower()
     if output_format not in {"lean", "tex"}:
         output_format = "lean"
-    prove_mode = _prompt(
-        "Proof mode (tactic|lemma|llm)", default=prove_defaults.get("mode", "tactic")
-    ).strip().lower()
-    if prove_mode not in {"tactic", "lemma", "llm"}:
-        prove_mode = "tactic"
     prove_cfg = config.setdefault("prove", {})
-    prove_cfg["mode"] = prove_mode
     prove_cfg["output_format"] = output_format
+    tex_overrides: dict[str, object] = {}
+    if output_format == "tex":
+        tex_overrides = _default_tex_launch_overrides(config.get("prove", {}))
+        print()
+        _print_tex_defaults(config.get("prove", {}))
+        tex_overrides.update(_prompt_tex_launch_overrides(config.get("prove", {})))
+        prove_mode = "llm"
+    else:
+        prove_mode = _prompt(
+            "Proof mode (tactic|lemma|llm)", default=prove_defaults.get("mode", "tactic")
+        ).strip().lower()
+        if prove_mode not in {"tactic", "lemma", "llm"}:
+            prove_mode = "tactic"
+        prove_cfg["mode"] = prove_mode
     save_config(config)
 
     statement = ""
@@ -1225,6 +1233,7 @@ def _menu_prove(config: dict) -> None:
         instruction,
         context_files,
         statement=statement,
+        prove_overrides=tex_overrides,
     )
     args.prove_mode = prove_mode
     args.output_format = output_format
@@ -1649,6 +1658,7 @@ def _build_args_from_config(
     instruction: str,
     context_files: list[Path],
     statement: str = "",
+    prove_overrides: dict[str, object] | None = None,
 ):
     provider = config.get("llm_provider", "openai")
     openai = config.get("openai", {})
@@ -1657,7 +1667,9 @@ def _build_args_from_config(
     gemini = config.get("gemini", {})
     embed = config.get("embed", {})
     lean = config.get("lean", {})
-    prove = config.get("prove", {})
+    prove = dict(config.get("prove", {}))
+    if prove_overrides:
+        prove.update(prove_overrides)
     policy = config.get("policy", {})
     openai_model = openai.get("model", "gpt-4.1")
     if provider == "codex_cli":
@@ -1684,6 +1696,9 @@ def _build_args_from_config(
         tex_worker_drafts=int(prove.get("tex_worker_drafts", 2)),
         tex_concurrency=bool(prove.get("tex_concurrency", False)),
         tex_replan_passes=int(prove.get("tex_replan_passes", 2)),
+        tex_action_steps=int(prove.get("tex_action_steps", 10)),
+        tex_planner_model=str(prove.get("tex_planner_model", "")),
+        tex_worker_model=str(prove.get("tex_worker_model", "")),
         tex_artifacts_dir=Path(prove.get("tex_artifacts_dir", "runs/prove_tex")),
         tex_resume=None,
         premises=None,
@@ -1739,6 +1754,96 @@ def _build_args_from_config(
         gemini_model=gemini_model,
         verbose=True,
     )
+
+
+def _print_tex_defaults(prove: dict) -> None:
+    launch = _default_tex_launch_overrides(prove)
+    print("[tex]")
+    print(f"rounds: {int(prove.get('tex_rounds', 3))}")
+    print(f"judge_repairs: {int(prove.get('tex_judge_repairs', 2))}")
+    print("workers: one")
+    print(f"worker_drafts: {int(launch.get('tex_worker_drafts', 1))}")
+    print(f"concurrency: {'on' if bool(launch.get('tex_concurrency', False)) else 'off'}")
+    print(f"artifacts_dir: {str(prove.get('tex_artifacts_dir', 'runs/prove_tex'))}")
+
+
+def _prompt_tex_launch_overrides(prove: dict) -> dict[str, object]:
+    edit = _prompt("Edit TeX defaults for this run? (y/N)", default="n").strip().lower()
+    if edit not in {"y", "yes", "true", "1"}:
+        return {}
+
+    overrides = _default_tex_launch_overrides(prove)
+    raw = _prompt("TeX planner/worker rounds", default=str(prove.get("tex_rounds", 3))).strip()
+    try:
+        overrides["tex_rounds"] = max(1, int(raw))
+    except Exception:
+        overrides["tex_rounds"] = int(prove.get("tex_rounds", 3))
+
+    raw = _prompt(
+        "TeX judge-directed repair rounds",
+        default=str(prove.get("tex_judge_repairs", 2)),
+    ).strip()
+    try:
+        overrides["tex_judge_repairs"] = max(0, int(raw))
+    except Exception:
+        overrides["tex_judge_repairs"] = int(prove.get("tex_judge_repairs", 2))
+
+    worker_mode = _prompt("Workers (one|multi)", default="one").strip().lower()
+    if worker_mode not in {"one", "multi"}:
+        worker_mode = "one"
+    if worker_mode == "multi":
+        raw = _prompt(
+            "TeX worker drafts per round",
+            default=str(max(2, int(prove.get("tex_worker_drafts", 2)))),
+        ).strip()
+        try:
+            overrides["tex_worker_drafts"] = max(2, int(raw))
+        except Exception:
+            overrides["tex_worker_drafts"] = max(2, int(prove.get("tex_worker_drafts", 2)))
+        overrides["tex_concurrency"] = True
+
+        raw = _prompt(
+            "TeX replan passes",
+            default=str(prove.get("tex_replan_passes", 2)),
+        ).strip()
+        try:
+            overrides["tex_replan_passes"] = max(1, int(raw))
+        except Exception:
+            overrides["tex_replan_passes"] = int(prove.get("tex_replan_passes", 2))
+
+        raw = _prompt(
+            "TeX planner action steps",
+            default=str(prove.get("tex_action_steps", 10)),
+        ).strip()
+        try:
+            overrides["tex_action_steps"] = max(1, int(raw))
+        except Exception:
+            overrides["tex_action_steps"] = int(prove.get("tex_action_steps", 10))
+
+        overrides["tex_planner_model"] = _prompt(
+            "TeX planner model override (blank = provider default)",
+            default=str(prove.get("tex_planner_model", "")),
+        ).strip()
+        overrides["tex_worker_model"] = _prompt(
+            "TeX worker model override (blank = provider default)",
+            default=str(prove.get("tex_worker_model", "")),
+        ).strip()
+
+    raw = _prompt(
+        "TeX artifacts directory",
+        default=str(prove.get("tex_artifacts_dir", "runs/prove_tex")),
+    ).strip()
+    overrides["tex_artifacts_dir"] = raw or str(prove.get("tex_artifacts_dir", "runs/prove_tex"))
+    return overrides
+
+
+def _default_tex_launch_overrides(prove: dict) -> dict[str, object]:
+    return {
+        "tex_worker_drafts": 1,
+        "tex_concurrency": False,
+        "tex_planner_model": "",
+        "tex_worker_model": "",
+    }
 
 
 def _infer_use_lean(lean: dict) -> bool:

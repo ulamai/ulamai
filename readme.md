@@ -70,10 +70,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.9)
+## Status (v0.2.10)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.9 highlights:** informal `prove --output-format tex` now adds separate planner/worker model overrides, a bounded planner-action loop, and planner-managed repo CRUD + `[[wikilink]]` context expansion on top of the new persistent `WHITEBOARD.md` + `repo/` run memory and optional concurrent TeX worker evaluation.
+- **v0.2.10 highlights:** the natural-language TUI flow for informal `tex` proving is simpler: it no longer shows inline LLM/provider settings there, defaults launch-time TeX proving to `workers: one` with `worker_drafts: 1` and `concurrency: off`, and only reveals the advanced multi-worker controls (`worker_drafts`, `replan passes`, `action steps`, planner/worker model overrides) after choosing `workers: multi`.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
