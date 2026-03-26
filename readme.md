@@ -61,7 +61,7 @@ Proof modes:
 
 Prove output formats:
 - `lean` (default): current machine-checked Lean proving pipeline.
-- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts, runs judge + adversarial verifier + domain checks, supports pass-based replan/backtrack when a plan stalls, and writes resumable per-run artifacts (`state.json`, `events.jsonl`, `summary.json`) before composing a final `.tex` proof draft for later `formalize`.
+- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts (serial by default, optional concurrent evaluation), maintains a persistent whiteboard + repo memory, runs judge + adversarial verifier + domain checks, supports pass-based replan/backtrack when a plan stalls, and writes resumable per-run artifacts (`state.json`, `events.jsonl`, `summary.json`, `WHITEBOARD.md`, `repo/`) before composing a final `.tex` proof draft for later `formalize`.
 
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
@@ -70,10 +70,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.7)
+## Status (v0.2.8)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.7 highlights:** new TUI `Custom API` provider path (`1. Configure LLM` -> `5. Custom API`) for OpenAI-compatible endpoints (Mistral, Z.AI, Qwen, DeepSeek, Kimi), plus the v0.2.6 guardrail budget profiles (`fast|balanced|strict`, default `balanced`) to control speed vs reliability in both `prove` and `formalize` loops.
+- **v0.2.8 highlights:** informal `prove --output-format tex` now supports persistent `WHITEBOARD.md` + `repo/` run memory, plus optional concurrent TeX worker evaluation via `--tex-concurrency` (off by default).
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -443,12 +443,14 @@ TeX mode knobs:
 - `--tex-out` explicit output path for the generated `.tex` draft.
 - `--tex-rounds` max fixed orchestration rounds for claim solving.
 - `--tex-worker-drafts` fixed worker candidates generated per claim per round.
+- `--tex-concurrency/--no-tex-concurrency` toggle concurrent evaluation of TeX worker drafts (default: off).
 - `--tex-judge-repairs` max consecutive rounds without accepted claim before composing best available draft.
 
 TeX mode execution model:
 - planner emits a claim graph (`claims`, dependencies, assumptions, required facts),
-- workers draft each claim,
+- workers draft each claim, with optional parallel evaluation when `--tex-concurrency` is enabled,
 - each claim is gated by judge + adversarial verifier + domain checker,
+- a persistent `WHITEBOARD.md` plus `repo/` memory items are updated across rounds/passes and fed back into later prompts,
 - accepted claims are composed into the final theorem proof.
 - token allocation is fixed by the settings above (no adaptive widening).
 

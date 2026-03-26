@@ -294,6 +294,12 @@ def _configure_prover_all(config: dict) -> None:
         prove["tex_worker_drafts"] = max(1, int(tex_worker_drafts_raw))
     except Exception:
         prove["tex_worker_drafts"] = 2
+    tex_concurrency_default = "y" if bool(prove.get("tex_concurrency", False)) else "n"
+    tex_concurrency_raw = _prompt(
+        "Enable TeX worker concurrency (y/N)",
+        default=tex_concurrency_default,
+    ).strip().lower()
+    prove["tex_concurrency"] = tex_concurrency_raw in {"y", "yes", "true", "1"}
     tex_replan_passes_raw = _prompt(
         "TeX replan passes",
         default=str(prove.get("tex_replan_passes", 2)),
@@ -512,6 +518,7 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.tex_rounds", "TeX planner/worker rounds"),
         ("prove.tex_judge_repairs", "TeX judge repair rounds"),
         ("prove.tex_worker_drafts", "TeX worker drafts per round"),
+        ("prove.tex_concurrency", "Enable TeX worker concurrency"),
         ("prove.tex_replan_passes", "TeX replan passes"),
         ("prove.tex_artifacts_dir", "TeX artifacts directory"),
         ("prove.retriever_k", "Retrieved premises per state"),
@@ -593,6 +600,8 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return str(int(prove.get("tex_judge_repairs", 2)))
     if key == "prove.tex_worker_drafts":
         return str(int(prove.get("tex_worker_drafts", 2)))
+    if key == "prove.tex_concurrency":
+        return "on" if bool(prove.get("tex_concurrency", False)) else "off"
     if key == "prove.tex_replan_passes":
         return str(int(prove.get("tex_replan_passes", 2)))
     if key == "prove.tex_artifacts_dir":
@@ -742,6 +751,13 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["tex_worker_drafts"] = max(1, int(raw))
         except Exception:
             prove["tex_worker_drafts"] = 2
+        return
+    if key == "prove.tex_concurrency":
+        raw = _prompt(
+            "Enable TeX worker concurrency (y/N)",
+            default="y" if bool(prove.get("tex_concurrency", False)) else "n",
+        ).strip().lower()
+        prove["tex_concurrency"] = raw in {"y", "yes", "true", "1"}
         return
     if key == "prove.tex_replan_passes":
         raw = _prompt(
@@ -1616,6 +1632,7 @@ def _build_args_from_config(
         tex_rounds=int(prove.get("tex_rounds", 3)),
         tex_judge_repairs=int(prove.get("tex_judge_repairs", 2)),
         tex_worker_drafts=int(prove.get("tex_worker_drafts", 2)),
+        tex_concurrency=bool(prove.get("tex_concurrency", False)),
         tex_replan_passes=int(prove.get("tex_replan_passes", 2)),
         tex_artifacts_dir=Path(prove.get("tex_artifacts_dir", "runs/prove_tex")),
         tex_resume=None,

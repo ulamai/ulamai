@@ -51,6 +51,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "tex_rounds": 3,
         "tex_judge_repairs": 2,
         "tex_worker_drafts": 2,
+        "tex_concurrency": False,
         "tex_replan_passes": 2,
         "tex_artifacts_dir": "runs/prove_tex",
         "llm_rounds": 4,

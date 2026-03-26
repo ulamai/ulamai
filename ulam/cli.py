@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 import statistics
 import hashlib
@@ -117,6 +118,19 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=None,
         help="worker drafts per round for --output-format tex",
+    )
+    prove.add_argument(
+        "--tex-concurrency",
+        dest="tex_concurrency",
+        action="store_true",
+        default=None,
+        help="enable concurrent TeX worker evaluation for --output-format tex",
+    )
+    prove.add_argument(
+        "--no-tex-concurrency",
+        dest="tex_concurrency",
+        action="store_false",
+        help="disable concurrent TeX worker evaluation for --output-format tex",
     )
     prove.add_argument(
         "--tex-replan-passes",
@@ -1097,6 +1111,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     rounds = _resolve_tex_rounds(args, cfg)
     judge_repairs = _resolve_tex_judge_repairs(args, cfg)
     worker_drafts = _resolve_tex_worker_drafts(args, cfg)
+    tex_concurrency = _resolve_tex_concurrency(args, cfg)
     replan_passes = _resolve_tex_replan_passes(args, cfg)
     verifier_policy = str(getattr(args, "tex_verifier_policy", "promoted") or "promoted").strip().lower()
     if verifier_policy not in {"final_only", "promoted", "worker"}:
@@ -1110,7 +1125,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         theorem_block = _decl_block(file_path.read_text(encoding="utf-8", errors="ignore"), theorem)
         if theorem_block:
             context_blocks.append(f"[theorem source: {file_path}]\n{theorem_block[:5000]}")
-    context = "\n\n".join(context_blocks)
+    base_context = "\n\n".join(context_blocks)
 
     out_path = _resolve_tex_output_path(args, cfg, theorem, file_path=file_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1140,12 +1155,13 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         run_dir = resume_snapshot.parent.resolve()
         statement = str(run_state.get("statement", "")).strip() or statement
         instruction = str(run_state.get("instruction", instruction))
-        context = str(run_state.get("context", context))
+        base_context = str(run_state.get("context", base_context))
         try:
             settings = run_state.get("settings", {}) if isinstance(run_state.get("settings", {}), dict) else {}
             rounds = max(1, int(settings.get("rounds", rounds)))
             judge_repairs = max(0, int(settings.get("judge_repairs", judge_repairs)))
             worker_drafts = max(1, int(settings.get("worker_drafts", worker_drafts)))
+            tex_concurrency = bool(settings.get("concurrency", tex_concurrency))
             replan_passes = max(1, int(settings.get("replan_passes", replan_passes)))
             verifier_policy = str(settings.get("verifier_policy", verifier_policy) or verifier_policy).strip().lower()
             compose_policy = str(settings.get("compose_policy", compose_policy) or compose_policy).strip().lower()
@@ -1166,11 +1182,12 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             "out_path": str(out_path),
             "artifacts_dir": str(run_dir),
             "instruction": instruction,
-            "context": context,
+            "context": base_context,
             "settings": {
                 "rounds": rounds,
                 "judge_repairs": judge_repairs,
                 "worker_drafts": worker_drafts,
+                "concurrency": tex_concurrency,
                 "replan_passes": replan_passes,
                 "verifier_policy": verifier_policy,
                 "compose_policy": compose_policy,
@@ -1198,6 +1215,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
 
     run_dir.mkdir(parents=True, exist_ok=True)
     _tex_events_path(run_dir).parent.mkdir(parents=True, exist_ok=True)
+    run_state["context"] = base_context
     if not _tex_manifest_path(run_dir).exists():
         manifest = {
             "version": 1,
@@ -1210,6 +1228,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 "rounds": rounds,
                 "judge_repairs": judge_repairs,
                 "worker_drafts": worker_drafts,
+                "concurrency": tex_concurrency,
                 "replan_passes": replan_passes,
                 "verifier_policy": verifier_policy,
                 "compose_policy": compose_policy,
@@ -1226,7 +1245,14 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             json.dumps(manifest, indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
         )
-    _write_tex_state(run_dir, run_state)
+    _sync_tex_memory_state(run_state, theorem, statement)
+
+    def _persist_state() -> None:
+        _sync_tex_memory_state(run_state, theorem, statement)
+        _write_tex_state(run_dir, run_state)
+        _write_tex_memory_artifacts(run_dir, run_state)
+
+    _persist_state()
 
     print(f"[tex] theorem={theorem}")
     print(
@@ -1234,7 +1260,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         f"judge_repairs={judge_repairs} replan_passes={replan_passes}"
     )
     print(
-        f"[tex] profile={profile} verifier_policy={verifier_policy} "
+        f"[tex] profile={profile} concurrency={'on' if tex_concurrency else 'off'} verifier_policy={verifier_policy} "
         f"compose_policy={compose_policy}"
     )
     print(f"[tex] artifacts={run_dir}")
@@ -1244,9 +1270,6 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         final_pass = bool(final.get("pass", False))
         print("[tex] run is already finished in snapshot.")
         return final_pass
-
-    def _persist_state() -> None:
-        _write_tex_state(run_dir, run_state)
 
     while int(run_state.get("current_pass", 1) or 1) <= replan_passes and not bool(run_state.get("compose_ready", False)):
         pass_idx = max(1, int(run_state.get("current_pass", 1) or 1))
@@ -1258,11 +1281,17 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 pass_history=list(run_state.get("pass_history", []) or []),
             )
             print(f"[tex] generating proof plan (pass {pass_idx}/{replan_passes})...")
+            plan_context = _build_tex_memory_context(
+                base_context,
+                run_state,
+                pass_idx=pass_idx,
+                max_items=5,
+            )
             plan = llm.tex_plan(
                 theorem_name=theorem,
                 theorem_statement=statement,
                 instruction=pass_instruction,
-                context=context,
+                context=plan_context,
             )
             strategy = str(plan.get("strategy", "")).strip()
             if strategy:
@@ -1359,24 +1388,35 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 prior_feedback = str(claim_feedback.get(claim_id, "") or "")
 
                 best_candidate: dict | None = None
-                worker_verifier_enabled = verifier_policy == "worker"
-                for worker_idx in range(1, worker_drafts + 1):
-                    draft = llm.tex_claim_draft(
-                        theorem_name=theorem,
-                        theorem_statement=statement,
-                        instruction=str(run_state.get("current_instruction", instruction)),
-                        plan=plan,
-                        claim=claim,
-                        accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
-                        ledger=ledger,
-                        prior_draft=prior_draft,
-                        prior_feedback=prior_feedback,
-                        context=context,
-                        round_idx=round_idx,
-                        worker_id=worker_idx,
-                    )
-                    proof_tex = _extract_tex_snippet_for_claim(draft, claim=claim)
-                    if not proof_tex:
+                accepted_claims_context = _claim_context_for_prompt(claims, accepted_claims)
+                claim_context = _build_tex_memory_context(
+                    base_context,
+                    run_state,
+                    claim=claim,
+                    pass_idx=pass_idx,
+                    max_items=6,
+                )
+                worker_results = _evaluate_tex_claim_workers(
+                    llm=llm,
+                    theorem=theorem,
+                    theorem_statement=statement,
+                    instruction=str(run_state.get("current_instruction", instruction)),
+                    plan=plan,
+                    claim=claim,
+                    accepted_claims_context=accepted_claims_context,
+                    ledger=ledger,
+                    prior_draft=prior_draft,
+                    prior_feedback=prior_feedback,
+                    prompt_context=claim_context,
+                    round_idx=round_idx,
+                    worker_drafts=worker_drafts,
+                    concurrent=tex_concurrency,
+                    verifier_policy=verifier_policy,
+                )
+                for worker_result in worker_results:
+                    worker_idx = int(worker_result.get("worker", 0) or 0)
+                    event_payload = worker_result.get("event", {})
+                    if isinstance(event_payload, dict):
                         _append_tex_event(
                             run_dir,
                             {
@@ -1384,100 +1424,28 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                                 "pass": pass_idx,
                                 "round": round_idx,
                                 "claim_id": claim_id,
-                                "worker": worker_idx,
-                                "status": "empty_proof",
+                                **event_payload,
                             },
                         )
+                    candidate = worker_result.get("candidate")
+                    if not isinstance(candidate, dict):
+                        status = str(worker_result.get("status", "") or "").strip().lower()
+                        if status == "worker_error":
+                            print(
+                                f"[tex] claim={claim_id} worker={worker_idx} "
+                                f"error={_tex_trim(str(worker_result.get('error', '') or ''), 180)}"
+                            )
                         continue
-                    draft["proof_tex"] = proof_tex
-                    static_issues = _tex_static_claim_issues(
-                        claim=claim,
-                        candidate=draft,
-                        accepted_claims=accepted_claims,
-                    )
-                    judge = llm.tex_claim_judge(
-                        theorem_name=theorem,
-                        theorem_statement=statement,
-                        instruction=str(run_state.get("current_instruction", instruction)),
-                        plan=plan,
-                        claim=claim,
-                        candidate=draft,
-                        accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
-                        ledger=ledger,
-                        context=context,
-                    )
-                    if worker_verifier_enabled:
-                        verifier = llm.tex_claim_verifier(
-                            theorem_name=theorem,
-                            theorem_statement=statement,
-                            instruction=str(run_state.get("current_instruction", instruction)),
-                            plan=plan,
-                            claim=claim,
-                            candidate=draft,
-                            accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
-                            ledger=ledger,
-                            context=context,
-                        )
-                    else:
-                        verifier = {
-                            "verdict": "skip",
-                            "score": 0,
-                            "summary": "deferred by profile",
-                            "critical_issues": [],
-                            "counterexample_attempt": "",
-                            "suggested_repairs": [],
-                        }
-                    checker = llm.tex_claim_domain_check(
-                        theorem_name=theorem,
-                        theorem_statement=statement,
-                        plan=plan,
-                        claim=claim,
-                        candidate=draft,
-                        context=context,
-                    )
-                    candidate_score = _tex_claim_candidate_score(
-                        draft=draft,
-                        judge=judge,
-                        verifier=verifier,
-                        checker=checker,
-                        static_issues=static_issues,
-                        require_verifier=worker_verifier_enabled,
-                    )
-                    pass_gate = _tex_claim_pass_gate(
-                        judge=judge,
-                        verifier=verifier,
-                        checker=checker,
-                        static_issues=static_issues,
-                        require_verifier=worker_verifier_enabled,
-                    )
-                    candidate = {
-                        "claim_id": claim_id,
-                        "draft": draft,
-                        "judge": judge,
-                        "verifier": verifier,
-                        "checker": checker,
-                        "static_issues": static_issues,
-                        "score": candidate_score,
-                        "pass_gate": pass_gate,
-                        "verifier_mode": "worker" if worker_verifier_enabled else "deferred",
-                    }
-                    if best_candidate is None or candidate_score > float(best_candidate.get("score", -1e9)):
+                    if best_candidate is None or float(candidate.get("score", -1e9) or -1e9) > float(
+                        best_candidate.get("score", -1e9) or -1e9
+                    ):
                         best_candidate = candidate
-                    _append_tex_event(
-                        run_dir,
-                        {
-                            "kind": "candidate",
-                            "pass": pass_idx,
-                            "round": round_idx,
-                            "claim_id": claim_id,
-                            "worker": worker_idx,
-                            "candidate": _json_clone(candidate),
-                        },
-                    )
                     print(
                         f"[tex] claim={claim_id} worker={worker_idx} "
-                        f"judge={judge.get('verdict','revise')} verifier={verifier.get('verdict','skip')} "
-                        f"checker={checker.get('status','issues')} score={candidate_score:.1f}"
+                        f"judge={candidate.get('judge', {}).get('verdict','revise')} "
+                        f"verifier={candidate.get('verifier', {}).get('verdict','skip')} "
+                        f"checker={candidate.get('checker', {}).get('status','issues')} "
+                        f"score={float(candidate.get('score', 0.0) or 0.0):.1f}"
                     )
 
                 if not best_candidate:
@@ -1505,9 +1473,9 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                         plan=plan,
                         claim=claim,
                         candidate=best_candidate.get("draft", {}),
-                        accepted_claims=_claim_context_for_prompt(claims, accepted_claims),
+                        accepted_claims=accepted_claims_context,
                         ledger=ledger,
-                        context=context,
+                        context=claim_context,
                     )
                     best_candidate["verifier"] = promoted_verifier
                     best_candidate["verifier_mode"] = "promoted"
@@ -1747,7 +1715,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             "accepted_claims": len(compose_accepted_claims),
             "total_claims": len(compose_claim_graph),
         }
-        _write_tex_state(run_dir, run_state)
+        _persist_state()
         _tex_summary_path(run_dir).write_text(
             json.dumps(run_state["final"], indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
@@ -1776,6 +1744,12 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         f"[tex] composing final theorem proof (using pass {compose_pass_idx}, "
         f"accepted claims: {len(compose_accepted_claims)}/{len(compose_claim_graph)})..."
     )
+    compose_context = _build_tex_memory_context(
+        base_context,
+        run_state,
+        pass_idx=compose_pass_idx,
+        max_items=8,
+    )
     composed = llm.tex_compose(
         theorem_name=theorem,
         theorem_statement=statement,
@@ -1783,7 +1757,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         plan=compose_plan,
         accepted_claims=compose_claims,
         ledger=compose_ledger,
-        context=context,
+        context=compose_context,
     )
     final_draft = _normalize_tex_proof(composed, theorem=theorem, theorem_statement=statement)
     if not final_draft:
@@ -1793,7 +1767,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         print("Failed to produce a TeX proof draft.")
         run_state["status"] = "finished"
         run_state["final"] = {"pass": False, "error": "empty_final_draft"}
-        _write_tex_state(run_dir, run_state)
+        _persist_state()
         _tex_summary_path(run_dir).write_text(
             json.dumps(run_state["final"], indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
@@ -1806,7 +1780,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         instruction=instruction,
         plan=compose_plan,
         draft_tex=final_draft,
-        context=context,
+        context=compose_context,
     )
     final_claim = {
         "id": "FINAL",
@@ -1833,7 +1807,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         candidate=final_candidate,
         accepted_claims=compose_claims,
         ledger=compose_ledger,
-        context=context,
+        context=compose_context,
     )
     final_checker = llm.tex_claim_domain_check(
         theorem_name=theorem,
@@ -1841,7 +1815,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         plan=compose_plan,
         claim=final_claim,
         candidate=final_candidate,
-        context=context,
+        context=compose_context,
     )
     final_static_issues = _tex_static_claim_issues(
         claim=final_claim,
@@ -1893,7 +1867,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         "checker": _json_clone(final_checker),
         "static_issues": _json_clone(final_static_issues),
     }
-    _write_tex_state(run_dir, run_state)
+    _persist_state()
     _tex_summary_path(run_dir).write_text(
         json.dumps(run_state["final"], indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
@@ -3241,6 +3215,14 @@ def _resolve_tex_worker_drafts(args: argparse.Namespace, config: dict | None = N
         return 2
 
 
+def _resolve_tex_concurrency(args: argparse.Namespace, config: dict | None = None) -> bool:
+    explicit = getattr(args, "tex_concurrency", None)
+    if explicit is not None:
+        return bool(explicit)
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("prove", {}).get("tex_concurrency", False))
+
+
 def _resolve_tex_replan_passes(args: argparse.Namespace, config: dict | None = None) -> int:
     explicit = getattr(args, "tex_replan_passes", None)
     if explicit is not None:
@@ -3367,6 +3349,559 @@ def _append_tex_event(run_dir: Path, event: dict) -> None:
     payload["ts"] = payload.get("ts") or _tex_iso_now()
     with _tex_events_path(run_dir).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _tex_whiteboard_path(run_dir: Path) -> Path:
+    return run_dir / "WHITEBOARD.md"
+
+
+def _tex_repo_dir(run_dir: Path) -> Path:
+    return run_dir / "repo"
+
+
+def _tex_repo_index_path(run_dir: Path) -> Path:
+    return _tex_repo_dir(run_dir) / "index.json"
+
+
+def _tex_trim(text: str, limit: int) -> str:
+    raw = str(text or "").strip()
+    if limit <= 0 or len(raw) <= limit:
+        return raw
+    if limit <= 3:
+        return raw[:limit]
+    return raw[: limit - 3].rstrip() + "..."
+
+
+def _tex_repo_slug(name: str) -> str:
+    return _tex_slug(str(name or "").strip().lower())
+
+
+def _tex_repo_upsert(
+    repo_items: dict[str, dict],
+    slug: str,
+    *,
+    kind: str,
+    summary: str,
+    content: str,
+    **extra,
+) -> str:
+    safe_slug = _tex_repo_slug(slug)
+    item = {
+        "slug": safe_slug,
+        "kind": _tex_trim(kind, 40) or "note",
+        "summary": _tex_trim(summary, 220) or "repo item",
+        "content": _tex_trim(content, 20000),
+        "updated_at": _tex_iso_now(),
+    }
+    for key, value in extra.items():
+        if value is None:
+            continue
+        item[str(key)] = _json_clone(value)
+    repo_items[safe_slug] = item
+    return safe_slug
+
+
+def _tex_repo_index_rows(repo_items: dict[str, dict]) -> list[dict]:
+    rows: list[dict] = []
+    for slug, item in sorted(repo_items.items()):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "slug": slug,
+                "kind": str(item.get("kind", "note")).strip() or "note",
+                "summary": _tex_trim(str(item.get("summary", "") or ""), 220),
+                "updated_at": str(item.get("updated_at", "") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _render_tex_repo_item_markdown(item: dict) -> str:
+    slug = str(item.get("slug", "")).strip()
+    kind = str(item.get("kind", "note")).strip() or "note"
+    summary = str(item.get("summary", "")).strip()
+    updated_at = str(item.get("updated_at", "")).strip()
+    lines = [f"# {slug or 'repo_item'}", ""]
+    lines.append(f"- Kind: {kind}")
+    if summary:
+        lines.append(f"- Summary: {summary}")
+    if updated_at:
+        lines.append(f"- Updated: {updated_at}")
+    for key in ("status", "claim_id", "pass_idx", "round_idx", "worker", "score"):
+        if key not in item:
+            continue
+        value = item.get(key)
+        if value in (None, "", []):
+            continue
+        label = key.replace("_", " ").title()
+        lines.append(f"- {label}: {value}")
+    content = str(item.get("content", "") or "").strip()
+    if content:
+        lines.extend(["", content])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _select_tex_repo_materials(
+    run_state: dict,
+    *,
+    claim: dict | None = None,
+    pass_idx: int | None = None,
+    max_items: int = 6,
+) -> list[dict]:
+    repo_items = run_state.get("repo_items", {})
+    if not isinstance(repo_items, dict):
+        return []
+    chosen: list[str] = []
+    seen: set[str] = set()
+
+    def _add(slug: str) -> None:
+        safe = _tex_repo_slug(slug)
+        if safe and safe in repo_items and safe not in seen:
+            seen.add(safe)
+            chosen.append(safe)
+
+    _add("theorem")
+    _add("open_claims")
+    if pass_idx is not None:
+        _add(f"pass_{pass_idx}_plan")
+        _add(f"pass_{pass_idx}_summary")
+    best_pass = run_state.get("best_pass", {})
+    if isinstance(best_pass, dict):
+        try:
+            best_pass_idx = int(best_pass.get("pass", 0) or 0)
+        except Exception:
+            best_pass_idx = 0
+        if best_pass_idx > 0:
+            _add(f"pass_{best_pass_idx}_plan")
+            _add(f"pass_{best_pass_idx}_summary")
+    pass_history = run_state.get("pass_history", [])
+    if isinstance(pass_history, list):
+        for entry in pass_history[-2:]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                hist_pass = int(entry.get("pass", 0) or 0)
+            except Exception:
+                hist_pass = 0
+            if hist_pass > 0:
+                _add(f"pass_{hist_pass}_summary")
+    if isinstance(claim, dict):
+        claim_id = str(claim.get("id", "")).strip()
+        if claim_id:
+            _add(f"claim_{claim_id}")
+        for dep in list(claim.get("depends_on", []) or []):
+            dep_id = str(dep).strip()
+            if dep_id:
+                _add(f"claim_{dep_id}")
+    materials: list[dict] = []
+    for slug in chosen[:max(1, max_items)]:
+        item = repo_items.get(slug)
+        if isinstance(item, dict):
+            materials.append(item)
+    return materials
+
+
+def _build_tex_memory_context(
+    base_context: str,
+    run_state: dict,
+    *,
+    claim: dict | None = None,
+    pass_idx: int | None = None,
+    max_items: int = 6,
+) -> str:
+    parts: list[str] = []
+    raw_base = str(base_context or "").strip()
+    if raw_base:
+        parts.append(raw_base)
+    whiteboard = str(run_state.get("whiteboard", "") or "").strip()
+    if whiteboard:
+        parts.append("[persistent whiteboard]\n" + _tex_trim(whiteboard, 6000))
+    repo_items = run_state.get("repo_items", {})
+    if isinstance(repo_items, dict) and repo_items:
+        index_lines = []
+        for row in _tex_repo_index_rows(repo_items)[:12]:
+            summary = str(row.get("summary", "")).strip()
+            line = f"- {row.get('slug', '')} [{row.get('kind', 'note')}]"
+            if summary:
+                line += f": {summary}"
+            index_lines.append(line)
+        if index_lines:
+            parts.append("[repo index]\n" + "\n".join(index_lines))
+        materials = _select_tex_repo_materials(
+            run_state,
+            claim=claim,
+            pass_idx=pass_idx,
+            max_items=max_items,
+        )
+        if materials:
+            material_blocks: list[str] = []
+            for item in materials:
+                slug = str(item.get("slug", "")).strip() or "repo_item"
+                summary = str(item.get("summary", "")).strip()
+                content = _tex_trim(str(item.get("content", "") or ""), 5000)
+                block = f"[repo item: {slug}]"
+                if summary:
+                    block += f"\nSummary: {summary}"
+                if content:
+                    block += "\n\n" + content
+                material_blocks.append(block)
+            if material_blocks:
+                parts.append("\n\n".join(material_blocks))
+    return "\n\n".join(part for part in parts if str(part).strip())
+
+
+def _render_tex_whiteboard(run_state: dict, theorem: str, theorem_statement: str) -> str:
+    try:
+        current_pass = int(run_state.get("current_pass", 1) or 1)
+    except Exception:
+        current_pass = 1
+    try:
+        current_round = int(run_state.get("current_round", 1) or 1)
+    except Exception:
+        current_round = 1
+    try:
+        claim_index = int(run_state.get("current_claim_index", 0) or 0)
+    except Exception:
+        claim_index = 0
+    plan = run_state.get("plan", {})
+    pass_history = run_state.get("pass_history", [])
+    claims = run_state.get("claims", [])
+    accepted_claims = run_state.get("accepted_claims", {})
+    claim_feedback = run_state.get("claim_feedback", {})
+    repo_items = run_state.get("repo_items", {})
+    best_pass = run_state.get("best_pass", {})
+    final = run_state.get("final", {})
+    strategy = ""
+    if isinstance(plan, dict):
+        strategy = str(plan.get("strategy", "") or "").strip()
+    if not strategy and isinstance(pass_history, list) and pass_history:
+        last = pass_history[-1]
+        if isinstance(last, dict):
+            strategy = str(last.get("strategy", "") or "").strip()
+    unresolved_rows: list[str] = []
+    if isinstance(claims, list):
+        accepted_ids = set()
+        if isinstance(accepted_claims, dict):
+            accepted_ids = {str(key).strip() for key in accepted_claims.keys() if str(key).strip()}
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("id", "")).strip()
+            if not claim_id or claim_id in accepted_ids:
+                continue
+            goal = _tex_trim(str(claim.get("goal", "") or ""), 180)
+            unresolved_rows.append(f"- {claim_id}: {goal}")
+    feedback_rows: list[str] = []
+    if isinstance(claim_feedback, dict):
+        for claim_id in sorted(claim_feedback.keys())[:6]:
+            feedback = str(claim_feedback.get(claim_id, "") or "").strip()
+            if not feedback:
+                continue
+            first_line = feedback.splitlines()[0].lstrip("- ").strip()
+            if first_line:
+                feedback_rows.append(f"- {claim_id}: {_tex_trim(first_line, 220)}")
+    lines = ["# TeX Whiteboard", ""]
+    lines.append(f"Theorem: {theorem}")
+    if theorem_statement.strip():
+        lines.append(f"Statement: {_tex_trim(theorem_statement, 260)}")
+    lines.extend(["", "## Status"])
+    lines.append(f"- Run status: {str(run_state.get('status', 'running') or 'running').strip()}")
+    lines.append(f"- Current pass/round: {current_pass}/{current_round}")
+    lines.append(f"- Current claim index: {claim_index}")
+    if strategy:
+        lines.append(f"- Current strategy: {_tex_trim(strategy, 220)}")
+    if isinstance(best_pass, dict) and best_pass:
+        quality = best_pass.get("quality", {}) if isinstance(best_pass.get("quality", {}), dict) else {}
+        best_count = int(quality.get("accepted_count", 0) or 0)
+        best_score = float(quality.get("score", 0.0) or 0.0)
+        lines.append(
+            f"- Best pass so far: {int(best_pass.get('pass', 0) or 0)} "
+            f"({best_count} accepted, score={best_score:.1f})"
+        )
+    if isinstance(final, dict) and final:
+        lines.append(f"- Final pass verdict: {bool(final.get('pass', False))}")
+    lines.extend(["", "## Open Claims"])
+    if unresolved_rows:
+        lines.extend(unresolved_rows[:8])
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Recent Feedback"])
+    if feedback_rows:
+        lines.extend(feedback_rows[:8])
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Repo Highlights"])
+    if isinstance(repo_items, dict) and repo_items:
+        for row in _tex_repo_index_rows(repo_items)[:8]:
+            summary = str(row.get("summary", "")).strip()
+            text = f"- {row.get('slug', '')} [{row.get('kind', 'note')}]"
+            if summary:
+                text += f": {summary}"
+            lines.append(_tex_trim(text, 240))
+    else:
+        lines.append("- theorem [theorem]: theorem statement and guidance")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _sync_tex_memory_state(run_state: dict, theorem: str, theorem_statement: str) -> None:
+    repo_items = run_state.get("repo_items")
+    if not isinstance(repo_items, dict):
+        repo_items = {}
+        run_state["repo_items"] = repo_items
+    _tex_repo_upsert(
+        repo_items,
+        "theorem",
+        kind="theorem",
+        summary=f"Informal theorem statement for {theorem}",
+        content=(
+            f"Theorem: {theorem}\n\n"
+            "Statement:\n"
+            f"{_tex_trim(theorem_statement, 4000)}\n"
+        ),
+        theorem=theorem,
+    )
+    plan = run_state.get("plan", {})
+    claims = run_state.get("claims", [])
+    if isinstance(plan, dict) and plan:
+        try:
+            pass_idx = int(run_state.get("current_pass", 1) or 1)
+        except Exception:
+            pass_idx = 1
+        outline = [str(item).strip() for item in list(plan.get("outline", []) or []) if str(item).strip()]
+        key_lemmas = [
+            str(item).strip() for item in list(plan.get("key_lemmas", []) or []) if str(item).strip()
+        ]
+        checks = [str(item).strip() for item in list(plan.get("checks", []) or []) if str(item).strip()]
+        claim_lines: list[str] = []
+        if isinstance(claims, list):
+            for claim in claims[:10]:
+                if not isinstance(claim, dict):
+                    continue
+                claim_id = str(claim.get("id", "")).strip()
+                goal = _tex_trim(str(claim.get("goal", "") or ""), 180)
+                if claim_id:
+                    claim_lines.append(f"- {claim_id}: {goal}")
+        sections = [f"Strategy: {str(plan.get('strategy', '')).strip() or 'unspecified'}"]
+        if outline:
+            sections.extend(["", "Outline:"] + [f"- {item}" for item in outline[:8]])
+        if key_lemmas:
+            sections.extend(["", "Key lemmas/facts:"] + [f"- {item}" for item in key_lemmas[:8]])
+        if checks:
+            sections.extend(["", "Checks:"] + [f"- {item}" for item in checks[:8]])
+        if claim_lines:
+            sections.extend(["", "Claims:"] + claim_lines[:8])
+        _tex_repo_upsert(
+            repo_items,
+            f"pass_{pass_idx}_plan",
+            kind="plan",
+            summary=str(plan.get("strategy", "") or f"Pass {pass_idx} plan").strip() or f"Pass {pass_idx} plan",
+            content="\n".join(sections).strip(),
+            pass_idx=pass_idx,
+            strategy=str(plan.get("strategy", "") or "").strip(),
+        )
+    pass_history = run_state.get("pass_history", [])
+    if isinstance(pass_history, list):
+        for entry in pass_history:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                hist_pass = int(entry.get("pass", 0) or 0)
+            except Exception:
+                hist_pass = 0
+            if hist_pass <= 0:
+                continue
+            accepted_count = int(entry.get("accepted_count", 0) or 0)
+            total_claims = int(entry.get("total_claims", 0) or 0)
+            strategy = str(entry.get("strategy", "") or "").strip()
+            body = []
+            if strategy:
+                body.append(f"Strategy: {strategy}")
+            body.append(
+                f"Status: {str(entry.get('status', 'unknown') or 'unknown').strip()} "
+                f"({accepted_count}/{total_claims} claims accepted)"
+            )
+            unresolved = [str(item).strip() for item in list(entry.get("unresolved_claims", []) or []) if str(item).strip()]
+            feedback = [str(item).strip() for item in list(entry.get("feedback", []) or []) if str(item).strip()]
+            if unresolved:
+                body.extend(["", "Unresolved claims:"] + [f"- {item}" for item in unresolved[:12]])
+            if feedback:
+                body.extend(["", "Key feedback:"] + [f"- {item}" for item in feedback[:12]])
+            _tex_repo_upsert(
+                repo_items,
+                f"pass_{hist_pass}_summary",
+                kind="summary",
+                summary=(
+                    f"Pass {hist_pass} {str(entry.get('status', 'unknown') or 'unknown').strip()}: "
+                    f"{accepted_count}/{total_claims} accepted"
+                ),
+                content="\n".join(body).strip(),
+                pass_idx=hist_pass,
+                status=str(entry.get("status", "unknown") or "unknown").strip(),
+            )
+    if isinstance(claims, list):
+        accepted_claims = run_state.get("accepted_claims", {})
+        best_candidates = run_state.get("best_claim_candidates", {})
+        claim_feedback = run_state.get("claim_feedback", {})
+        if not isinstance(accepted_claims, dict):
+            accepted_claims = {}
+        if not isinstance(best_candidates, dict):
+            best_candidates = {}
+        if not isinstance(claim_feedback, dict):
+            claim_feedback = {}
+        try:
+            pass_idx = int(run_state.get("current_pass", 1) or 1)
+        except Exception:
+            pass_idx = 1
+        try:
+            round_idx = int(run_state.get("current_round", 1) or 1)
+        except Exception:
+            round_idx = 1
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("id", "")).strip()
+            if not claim_id:
+                continue
+            slug = f"claim_{claim_id}"
+            accepted = accepted_claims.get(claim_id)
+            if isinstance(accepted, dict):
+                body = [
+                    f"Goal: {str(accepted.get('goal', '')).strip()}",
+                    "",
+                    "Accepted proof:",
+                    _tex_trim(str(accepted.get("proof_tex", "") or ""), 12000),
+                ]
+                assumptions = list(accepted.get("assumptions_used", []) or [])
+                deps = list(accepted.get("depends_on_used", []) or [])
+                citations = list(accepted.get("cited_facts", []) or [])
+                if assumptions:
+                    body.extend(["", "Assumptions used:"] + [f"- {str(item).strip()}" for item in assumptions[:12]])
+                if deps:
+                    body.extend(["", "Dependencies used:"] + [f"- {str(item).strip()}" for item in deps[:12]])
+                if citations:
+                    body.extend(["", "Cited facts:"] + [f"- {str(item).strip()}" for item in citations[:12]])
+                _tex_repo_upsert(
+                    repo_items,
+                    slug,
+                    kind="claim",
+                    summary=f"Accepted claim {claim_id}: {_tex_trim(str(accepted.get('goal', '') or ''), 140)}",
+                    content="\n".join(body).strip(),
+                    claim_id=claim_id,
+                    status="accepted",
+                    pass_idx=pass_idx,
+                    round_idx=round_idx,
+                    score=float(accepted.get("score", 0.0) or 0.0),
+                )
+                continue
+            best_candidate = best_candidates.get(claim_id)
+            if not isinstance(best_candidate, dict):
+                continue
+            draft = best_candidate.get("draft", {}) if isinstance(best_candidate.get("draft"), dict) else {}
+            proof_tex = _strip_md_fences(str(draft.get("proof_tex", "") or "")).strip()
+            feedback = str(claim_feedback.get(claim_id, "") or "").strip() or _build_tex_claim_feedback(best_candidate)
+            body = [f"Goal: {str(claim.get('goal', '')).strip()}"]
+            if proof_tex:
+                body.extend(["", "Latest best draft:", _tex_trim(proof_tex, 10000)])
+            if feedback:
+                body.extend(["", "Feedback to address:", _tex_trim(feedback, 5000)])
+            _tex_repo_upsert(
+                repo_items,
+                slug,
+                kind="claim",
+                summary=f"Open claim {claim_id}: {_tex_trim(str(claim.get('goal', '') or ''), 140)}",
+                content="\n".join(body).strip(),
+                claim_id=claim_id,
+                status="open",
+                pass_idx=pass_idx,
+                round_idx=round_idx,
+                score=float(best_candidate.get("score", 0.0) or 0.0),
+            )
+    unresolved_lines: list[str] = []
+    accepted_claims = run_state.get("accepted_claims", {})
+    if not isinstance(accepted_claims, dict):
+        accepted_claims = {}
+    accepted_ids = {str(key).strip() for key in accepted_claims.keys() if str(key).strip()}
+    if isinstance(claims, list):
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("id", "")).strip()
+            if not claim_id or claim_id in accepted_ids:
+                continue
+            unresolved_lines.append(f"- {claim_id}: {_tex_trim(str(claim.get('goal', '') or ''), 180)}")
+            feedback = str(run_state.get("claim_feedback", {}).get(claim_id, "") if isinstance(run_state.get("claim_feedback", {}), dict) else "").strip()
+            if feedback:
+                unresolved_lines.append(f"  feedback: {_tex_trim(feedback.splitlines()[0].lstrip('- ').strip(), 180)}")
+    unresolved_count = 0
+    if not unresolved_lines:
+        unresolved_lines.append("- none")
+    else:
+        unresolved_count = len(
+            [
+                claim
+                for claim in claims
+                if isinstance(claim, dict)
+                and str(claim.get("id", "")).strip()
+                and str(claim.get("id", "")).strip() not in accepted_ids
+            ]
+        )
+    _tex_repo_upsert(
+        repo_items,
+        "open_claims",
+        kind="memory",
+        summary=f"Current unresolved claims ({unresolved_count})",
+        content="\n".join(unresolved_lines).strip(),
+        pass_idx=int(run_state.get("current_pass", 1) or 1),
+    )
+    final = run_state.get("final", {})
+    if isinstance(final, dict) and final:
+        lines = [f"Pass verdict: {bool(final.get('pass', False))}"]
+        for key in ("error", "reason"):
+            text = str(final.get(key, "") or "").strip()
+            if text:
+                lines.append(f"{key.title()}: {text}")
+        lines.append(
+            f"Accepted claims: {int(final.get('accepted_claims', 0) or 0)}/"
+            f"{int(final.get('total_claims', 0) or 0)}"
+        )
+        _tex_repo_upsert(
+            repo_items,
+            "final_outcome",
+            kind="summary",
+            summary="Final TeX run outcome",
+            content="\n".join(lines).strip(),
+            status="finished",
+        )
+    run_state["whiteboard"] = _render_tex_whiteboard(run_state, theorem, theorem_statement)
+
+
+def _write_tex_memory_artifacts(run_dir: Path, run_state: dict) -> None:
+    whiteboard = str(run_state.get("whiteboard", "") or "").strip()
+    if whiteboard:
+        _tex_whiteboard_path(run_dir).write_text(whiteboard.rstrip() + "\n", encoding="utf-8")
+    repo_items = run_state.get("repo_items", {})
+    if not isinstance(repo_items, dict):
+        return
+    repo_dir = _tex_repo_dir(run_dir)
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    keep = {"index.json"}
+    for slug, item in repo_items.items():
+        if not isinstance(item, dict):
+            continue
+        filename = f"{slug}.md"
+        keep.add(filename)
+        (repo_dir / filename).write_text(
+            _render_tex_repo_item_markdown(item),
+            encoding="utf-8",
+        )
+    for path in repo_dir.glob("*.md"):
+        if path.name not in keep:
+            path.unlink(missing_ok=True)
+    _tex_repo_index_path(run_dir).write_text(
+        json.dumps(_tex_repo_index_rows(repo_items), indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _build_tex_replan_instruction(base_instruction: str, pass_idx: int, pass_history: list[dict]) -> str:
@@ -3684,6 +4219,212 @@ def _tex_claim_pass_gate(
     if require_verifier:
         return judge_pass and verifier_pass and checker_ok and not static_issues
     return judge_pass and checker_ok and not static_issues
+
+
+def _evaluate_tex_claim_worker(
+    *,
+    llm: FormalizationLLM,
+    theorem: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    claim: dict,
+    accepted_claims_context: list[dict],
+    ledger: dict,
+    prior_draft: str,
+    prior_feedback: str,
+    prompt_context: str,
+    round_idx: int,
+    worker_idx: int,
+    verifier_policy: str,
+) -> dict:
+    try:
+        draft = llm.tex_claim_draft(
+            theorem_name=theorem,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            claim=claim,
+            accepted_claims=accepted_claims_context,
+            ledger=ledger,
+            prior_draft=prior_draft,
+            prior_feedback=prior_feedback,
+            context=prompt_context,
+            round_idx=round_idx,
+            worker_id=worker_idx,
+        )
+        proof_tex = _extract_tex_snippet_for_claim(draft, claim=claim)
+        if not proof_tex:
+            return {
+                "worker": worker_idx,
+                "status": "empty_proof",
+                "event": {
+                    "worker": worker_idx,
+                    "status": "empty_proof",
+                },
+                "candidate": None,
+            }
+        draft["proof_tex"] = proof_tex
+        static_issues = _tex_static_claim_issues(
+            claim=claim,
+            candidate=draft,
+            accepted_claims={row.get("id", ""): row for row in accepted_claims_context if row.get("id")},
+        )
+        judge = llm.tex_claim_judge(
+            theorem_name=theorem,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            plan=plan,
+            claim=claim,
+            candidate=draft,
+            accepted_claims=accepted_claims_context,
+            ledger=ledger,
+            context=prompt_context,
+        )
+        if verifier_policy == "worker":
+            verifier = llm.tex_claim_verifier(
+                theorem_name=theorem,
+                theorem_statement=theorem_statement,
+                instruction=instruction,
+                plan=plan,
+                claim=claim,
+                candidate=draft,
+                accepted_claims=accepted_claims_context,
+                ledger=ledger,
+                context=prompt_context,
+            )
+        else:
+            verifier = {
+                "verdict": "skip",
+                "score": 0,
+                "summary": "deferred by profile",
+                "critical_issues": [],
+                "counterexample_attempt": "",
+                "suggested_repairs": [],
+            }
+        checker = llm.tex_claim_domain_check(
+            theorem_name=theorem,
+            theorem_statement=theorem_statement,
+            plan=plan,
+            claim=claim,
+            candidate=draft,
+            context=prompt_context,
+        )
+        require_verifier = verifier_policy == "worker"
+        candidate_score = _tex_claim_candidate_score(
+            draft=draft,
+            judge=judge,
+            verifier=verifier,
+            checker=checker,
+            static_issues=static_issues,
+            require_verifier=require_verifier,
+        )
+        pass_gate = _tex_claim_pass_gate(
+            judge=judge,
+            verifier=verifier,
+            checker=checker,
+            static_issues=static_issues,
+            require_verifier=require_verifier,
+        )
+        candidate = {
+            "claim_id": str(claim.get("id", "")).strip(),
+            "draft": draft,
+            "judge": judge,
+            "verifier": verifier,
+            "checker": checker,
+            "static_issues": static_issues,
+            "score": candidate_score,
+            "pass_gate": pass_gate,
+            "verifier_mode": "worker" if require_verifier else "deferred",
+        }
+        return {
+            "worker": worker_idx,
+            "status": "ok",
+            "candidate": candidate,
+            "event": {
+                "worker": worker_idx,
+                "candidate": _json_clone(candidate),
+            },
+        }
+    except Exception as exc:
+        return {
+            "worker": worker_idx,
+            "status": "worker_error",
+            "error": str(exc),
+            "candidate": None,
+            "event": {
+                "worker": worker_idx,
+                "status": "worker_error",
+                "error": str(exc),
+            },
+        }
+
+
+def _evaluate_tex_claim_workers(
+    *,
+    llm: FormalizationLLM,
+    theorem: str,
+    theorem_statement: str,
+    instruction: str,
+    plan: dict,
+    claim: dict,
+    accepted_claims_context: list[dict],
+    ledger: dict,
+    prior_draft: str,
+    prior_feedback: str,
+    prompt_context: str,
+    round_idx: int,
+    worker_drafts: int,
+    concurrent: bool,
+    verifier_policy: str,
+) -> list[dict]:
+    max_workers = max(1, int(worker_drafts))
+    if max_workers == 1 or not bool(concurrent):
+        return [
+            _evaluate_tex_claim_worker(
+                llm=llm,
+                theorem=theorem,
+                theorem_statement=theorem_statement,
+                instruction=instruction,
+                plan=plan,
+                claim=claim,
+                accepted_claims_context=accepted_claims_context,
+                ledger=ledger,
+                prior_draft=prior_draft,
+                prior_feedback=prior_feedback,
+                prompt_context=prompt_context,
+                round_idx=round_idx,
+                worker_idx=worker_idx,
+                verifier_policy=verifier_policy,
+            )
+            for worker_idx in range(1, max_workers + 1)
+        ]
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _evaluate_tex_claim_worker,
+                llm=llm,
+                theorem=theorem,
+                theorem_statement=theorem_statement,
+                instruction=instruction,
+                plan=plan,
+                claim=claim,
+                accepted_claims_context=accepted_claims_context,
+                ledger=ledger,
+                prior_draft=prior_draft,
+                prior_feedback=prior_feedback,
+                prompt_context=prompt_context,
+                round_idx=round_idx,
+                worker_idx=worker_idx,
+                verifier_policy=verifier_policy,
+            )
+            for worker_idx in range(1, max_workers + 1)
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+    results.sort(key=lambda item: int(item.get("worker", 0) or 0))
+    return results
 
 
 def _finalize_tex_claim(claim: dict, best_candidate: dict) -> dict:
