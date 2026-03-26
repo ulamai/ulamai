@@ -308,6 +308,22 @@ def _configure_prover_all(config: dict) -> None:
         prove["tex_replan_passes"] = max(1, int(tex_replan_passes_raw))
     except Exception:
         prove["tex_replan_passes"] = 2
+    tex_action_steps_raw = _prompt(
+        "TeX planner action steps",
+        default=str(prove.get("tex_action_steps", 10)),
+    ).strip()
+    try:
+        prove["tex_action_steps"] = max(1, int(tex_action_steps_raw))
+    except Exception:
+        prove["tex_action_steps"] = 10
+    prove["tex_planner_model"] = _prompt(
+        "TeX planner model override (blank = provider default)",
+        default=str(prove.get("tex_planner_model", "")),
+    ).strip()
+    prove["tex_worker_model"] = _prompt(
+        "TeX worker model override (blank = provider default)",
+        default=str(prove.get("tex_worker_model", "")),
+    ).strip()
     tex_artifacts_dir_raw = _prompt(
         "TeX artifacts directory",
         default=str(prove.get("tex_artifacts_dir", "runs/prove_tex")),
@@ -520,6 +536,9 @@ def _configure_prover_single(config: dict) -> None:
         ("prove.tex_worker_drafts", "TeX worker drafts per round"),
         ("prove.tex_concurrency", "Enable TeX worker concurrency"),
         ("prove.tex_replan_passes", "TeX replan passes"),
+        ("prove.tex_action_steps", "TeX planner action steps"),
+        ("prove.tex_planner_model", "TeX planner model override"),
+        ("prove.tex_worker_model", "TeX worker model override"),
         ("prove.tex_artifacts_dir", "TeX artifacts directory"),
         ("prove.retriever_k", "Retrieved premises per state"),
         ("prove.retriever_source", "Auto retriever source"),
@@ -604,6 +623,12 @@ def _prover_setting_value(config: dict, key: str) -> str:
         return "on" if bool(prove.get("tex_concurrency", False)) else "off"
     if key == "prove.tex_replan_passes":
         return str(int(prove.get("tex_replan_passes", 2)))
+    if key == "prove.tex_action_steps":
+        return str(int(prove.get("tex_action_steps", 10)))
+    if key == "prove.tex_planner_model":
+        return str(prove.get("tex_planner_model", "") or "<default>")
+    if key == "prove.tex_worker_model":
+        return str(prove.get("tex_worker_model", "") or "<default>")
     if key == "prove.tex_artifacts_dir":
         return str(prove.get("tex_artifacts_dir", "runs/prove_tex"))
     if key == "prove.retriever_k":
@@ -768,6 +793,28 @@ def _update_prover_setting(config: dict, key: str) -> None:
             prove["tex_replan_passes"] = max(1, int(raw))
         except Exception:
             prove["tex_replan_passes"] = 2
+        return
+    if key == "prove.tex_action_steps":
+        raw = _prompt(
+            "TeX planner action steps",
+            default=str(prove.get("tex_action_steps", 10)),
+        ).strip()
+        try:
+            prove["tex_action_steps"] = max(1, int(raw))
+        except Exception:
+            prove["tex_action_steps"] = 10
+        return
+    if key == "prove.tex_planner_model":
+        prove["tex_planner_model"] = _prompt(
+            "TeX planner model override (blank = provider default)",
+            default=str(prove.get("tex_planner_model", "")),
+        ).strip()
+        return
+    if key == "prove.tex_worker_model":
+        prove["tex_worker_model"] = _prompt(
+            "TeX worker model override (blank = provider default)",
+            default=str(prove.get("tex_worker_model", "")),
+        ).strip()
         return
     if key == "prove.tex_artifacts_dir":
         raw = _prompt(
@@ -1038,6 +1085,7 @@ def _apply_proof_profile_config(config: dict, profile: str) -> None:
         prove["tex_judge_repairs"] = 1
         prove["tex_worker_drafts"] = 1
         prove["tex_replan_passes"] = 1
+        prove["tex_action_steps"] = 4
         formalize["max_rounds"] = 3
         formalize["max_repairs"] = 3
         formalize["max_proof_rounds"] = 1
@@ -1054,6 +1102,7 @@ def _apply_proof_profile_config(config: dict, profile: str) -> None:
         prove["tex_judge_repairs"] = 2
         prove["tex_worker_drafts"] = 2
         prove["tex_replan_passes"] = 2
+        prove["tex_action_steps"] = 10
         formalize["max_rounds"] = 5
         formalize["max_repairs"] = 5
         formalize["max_proof_rounds"] = 1
@@ -1070,6 +1119,7 @@ def _apply_proof_profile_config(config: dict, profile: str) -> None:
         prove["tex_judge_repairs"] = 3
         prove["tex_worker_drafts"] = 3
         prove["tex_replan_passes"] = 3
+        prove["tex_action_steps"] = 16
         formalize["max_rounds"] = 6
         formalize["max_repairs"] = 6
         formalize["max_proof_rounds"] = 2

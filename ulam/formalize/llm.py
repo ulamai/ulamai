@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Iterable
@@ -148,6 +149,24 @@ class FormalizationLLM:
         )
         raw = self._call(prompt)
         return _parse_tex_plan(raw)
+
+    def tex_action_plan(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        state: dict,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_action_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            state=state,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_action_plan(raw)
 
     def tex_claim_draft(
         self,
@@ -681,6 +700,56 @@ def _build_tex_plan_prompt(
         prompt += "User guidance:\n" + instruction.strip() + "\n\n"
     if context:
         prompt += "Context files:\n" + _truncate_block(context, 8000) + "\n\n"
+    return prompt
+
+
+def _build_tex_action_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    state: dict,
+    context: str,
+) -> str:
+    state_json = json.dumps(state, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are a bounded proof-orchestration planner for an informal LaTeX theorem proof.\n"
+        "Choose the single best next action.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "action": "plan|solve|compose|write_memory|give_up",\n'
+        '  "summary": "short reason",\n'
+        '  "whiteboard_note": "optional note to keep on the whiteboard",\n'
+        '  "worker_guidance": "optional guidance for the next solve step; may reference repo items with [[slug]]",\n'
+        '  "repo_reads": ["slug_to_pull_into_next_context"],\n'
+        '  "claim_focus": ["C1", "C2"],\n'
+        '  "repo_writes": [\n'
+        "    {\n"
+        '      "op": "upsert|delete",\n'
+        '      "slug": "short_slug",\n'
+        '      "kind": "note|observation|lemma|attempt|strategy|counterexample",\n'
+        '      "summary": "short summary",\n'
+        '      "content": "markdown/plain text content"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Action policy:\n"
+        "- `plan`: create or replace the current claim decomposition.\n"
+        "- `solve`: run one bounded claim-solving round with the current plan.\n"
+        "- `compose`: synthesize the best current proof into a final theorem/proof block.\n"
+        "- `write_memory`: update repo/whiteboard guidance without solving yet.\n"
+        "- `give_up`: stop only when remaining progress is unlikely.\n"
+        "- Prefer `compose` over `give_up` when there is enough accepted material for a credible draft.\n"
+        "- Keep repo writes concise and reusable.\n"
+        "- Avoid deleting system-managed repo items like theorem/pass summaries/claim snapshots.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Current run state:\n"
+        f"{_truncate_block(state_json, 16000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 9000) + "\n\n"
     return prompt
 
 
@@ -1372,6 +1441,100 @@ def _extract_tex_document(raw: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
+
+
+def _normalize_tex_repo_slug(raw: object) -> str:
+    text = re.sub(r"[^a-z0-9_]+", "_", str(raw or "").strip().lower())
+    return text.strip("_")[:48]
+
+
+def _parse_tex_action_plan(raw: str) -> dict:
+    fallback = {
+        "action": "solve",
+        "summary": "fallback solve step",
+        "whiteboard_note": "",
+        "worker_guidance": "",
+        "repo_reads": [],
+        "claim_focus": [],
+        "repo_writes": [],
+    }
+    if not raw.strip():
+        return fallback
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        lowered = text.lower()
+        action = "solve"
+        for candidate in ("compose", "give_up", "write_memory", "plan", "solve"):
+            if candidate in lowered:
+                action = candidate
+                break
+        return {
+            **fallback,
+            "action": action,
+            "summary": _truncate_block(text, 600) or fallback["summary"],
+        }
+
+    action = str(payload.get("action", "solve")).strip().lower()
+    if action not in {"plan", "solve", "compose", "write_memory", "give_up"}:
+        action = "solve"
+    repo_reads = payload.get("repo_reads", [])
+    if not isinstance(repo_reads, list):
+        repo_reads = []
+    claim_focus = payload.get("claim_focus", [])
+    if not isinstance(claim_focus, list):
+        claim_focus = []
+    repo_writes = payload.get("repo_writes", [])
+    if not isinstance(repo_writes, list):
+        repo_writes = []
+    normalized_writes: list[dict] = []
+    for item in repo_writes[:10]:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op", "upsert")).strip().lower()
+        if op not in {"upsert", "delete"}:
+            op = "upsert"
+        slug = _normalize_tex_repo_slug(item.get("slug", ""))
+        if not slug:
+            continue
+        if op == "delete":
+            normalized_writes.append({"op": "delete", "slug": slug})
+            continue
+        kind = str(item.get("kind", "note")).strip().lower() or "note"
+        summary = str(item.get("summary", "")).strip()[:220]
+        content = str(item.get("content", "")).strip()[:12000]
+        normalized_writes.append(
+            {
+                "op": "upsert",
+                "slug": slug,
+                "kind": kind[:40],
+                "summary": summary or f"{slug} note",
+                "content": content,
+            }
+        )
+    return {
+        "action": action,
+        "summary": str(payload.get("summary", "")).strip()[:600] or fallback["summary"],
+        "whiteboard_note": str(payload.get("whiteboard_note", "")).strip()[:1200],
+        "worker_guidance": str(payload.get("worker_guidance", "")).strip()[:4000],
+        "repo_reads": [
+            slug
+            for slug in (_normalize_tex_repo_slug(item) for item in repo_reads[:8])
+            if slug
+        ],
+        "claim_focus": [
+            str(item).strip()[:24]
+            for item in claim_focus[:8]
+            if str(item).strip()
+        ],
+        "repo_writes": normalized_writes,
+    }
 
 
 def _parse_tex_plan(raw: str) -> dict:

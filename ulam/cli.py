@@ -139,6 +139,22 @@ def main(argv: list[str] | None = None) -> None:
         help="number of decomposition replan passes after stall",
     )
     prove.add_argument(
+        "--tex-action-steps",
+        type=int,
+        default=None,
+        help="bounded planner action steps for --output-format tex",
+    )
+    prove.add_argument(
+        "--tex-planner-model",
+        default="",
+        help="optional provider model override for TeX planner/judge/verifier/compose",
+    )
+    prove.add_argument(
+        "--tex-worker-model",
+        default="",
+        help="optional provider model override for TeX claim-draft workers",
+    )
+    prove.add_argument(
         "--tex-artifacts-dir",
         type=Path,
         default=None,
@@ -1113,6 +1129,9 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     worker_drafts = _resolve_tex_worker_drafts(args, cfg)
     tex_concurrency = _resolve_tex_concurrency(args, cfg)
     replan_passes = _resolve_tex_replan_passes(args, cfg)
+    action_steps = _resolve_tex_action_steps(args, cfg)
+    planner_model = _resolve_tex_role_model(args, "planner", cfg)
+    worker_model = _resolve_tex_role_model(args, "worker", cfg)
     verifier_policy = str(getattr(args, "tex_verifier_policy", "promoted") or "promoted").strip().lower()
     if verifier_policy not in {"final_only", "promoted", "worker"}:
         verifier_policy = "promoted"
@@ -1135,7 +1154,9 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         print("Could not find a TeX resume snapshot. Pass an artifacts directory or state.json file.")
         return False
 
-    llm = FormalizationLLM(args.llm, _llm_config_from_args(args))
+    base_llm_config = _llm_config_from_args(args)
+    planner_llm = _make_tex_role_llm(args.llm, base_llm_config, planner_model)
+    worker_llm = _make_tex_role_llm(args.llm, base_llm_config, worker_model)
     if resume_snapshot is not None:
         try:
             run_state = json.loads(resume_snapshot.read_text(encoding="utf-8"))
@@ -1163,10 +1184,15 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             worker_drafts = max(1, int(settings.get("worker_drafts", worker_drafts)))
             tex_concurrency = bool(settings.get("concurrency", tex_concurrency))
             replan_passes = max(1, int(settings.get("replan_passes", replan_passes)))
+            action_steps = max(1, int(settings.get("action_steps", action_steps)))
             verifier_policy = str(settings.get("verifier_policy", verifier_policy) or verifier_policy).strip().lower()
             compose_policy = str(settings.get("compose_policy", compose_policy) or compose_policy).strip().lower()
+            planner_model = str(settings.get("planner_model", planner_model) or planner_model).strip()
+            worker_model = str(settings.get("worker_model", worker_model) or worker_model).strip()
         except Exception:
             pass
+        planner_llm = _make_tex_role_llm(args.llm, base_llm_config, planner_model)
+        worker_llm = _make_tex_role_llm(args.llm, base_llm_config, worker_model)
         out_path = Path(str(run_state.get("out_path", str(out_path)))).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"[tex] resumed snapshot: {resume_snapshot}")
@@ -1189,13 +1215,18 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 "worker_drafts": worker_drafts,
                 "concurrency": tex_concurrency,
                 "replan_passes": replan_passes,
+                "action_steps": action_steps,
                 "verifier_policy": verifier_policy,
                 "compose_policy": compose_policy,
+                "planner_model": planner_model,
+                "worker_model": worker_model,
             },
             "pass_history": [],
+            "action_history": [],
             "current_pass": 1,
             "current_round": 1,
             "current_claim_index": 0,
+            "current_round_order": [],
             "repairs_used": 0,
             "round_progressed": False,
             "plan": None,
@@ -1203,6 +1234,10 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             "accepted_claims": {},
             "best_claim_candidates": {},
             "claim_feedback": {},
+            "planner_notes": [],
+            "pending_worker_guidance": "",
+            "pending_repo_reads": [],
+            "pending_claim_focus": [],
             "best_pass": None,
             "compose_ready": False,
             "final": {},
@@ -1230,8 +1265,11 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 "worker_drafts": worker_drafts,
                 "concurrency": tex_concurrency,
                 "replan_passes": replan_passes,
+                "action_steps": action_steps,
                 "verifier_policy": verifier_policy,
                 "compose_policy": compose_policy,
+                "planner_model": planner_model,
+                "worker_model": worker_model,
             },
             "llm_provider": str(getattr(args, "llm", "")).strip(),
             "llm_model": str(
@@ -1257,12 +1295,17 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
     print(f"[tex] theorem={theorem}")
     print(
         f"[tex] rounds={rounds} worker_drafts={worker_drafts} "
-        f"judge_repairs={judge_repairs} replan_passes={replan_passes}"
+        f"judge_repairs={judge_repairs} replan_passes={replan_passes} action_steps={action_steps}"
     )
     print(
         f"[tex] profile={profile} concurrency={'on' if tex_concurrency else 'off'} verifier_policy={verifier_policy} "
         f"compose_policy={compose_policy}"
     )
+    if planner_model or worker_model:
+        print(
+            f"[tex] models planner={planner_model or '<default>'} "
+            f"worker={worker_model or '<default>'}"
+        )
     print(f"[tex] artifacts={run_dir}")
 
     if str(run_state.get("status", "")).strip().lower() == "finished":
@@ -1271,10 +1314,134 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         print("[tex] run is already finished in snapshot.")
         return final_pass
 
-    while int(run_state.get("current_pass", 1) or 1) <= replan_passes and not bool(run_state.get("compose_ready", False)):
+    action_step = max(1, int(run_state.get("action_step", 1) or 1))
+    run_state["action_step"] = action_step
+    while action_step <= action_steps and not bool(run_state.get("compose_ready", False)):
         pass_idx = max(1, int(run_state.get("current_pass", 1) or 1))
+        action_state = _build_tex_action_state(
+            run_state,
+            rounds=rounds,
+            judge_repairs=judge_repairs,
+            replan_passes=replan_passes,
+            action_step=action_step,
+            action_limit=action_steps,
+        )
+        action_context = _build_tex_memory_context(
+            base_context,
+            run_state,
+            pass_idx=pass_idx,
+            extra_repo_slugs=list(run_state.get("pending_repo_reads", []) or []),
+            guidance=str(run_state.get("pending_worker_guidance", "") or ""),
+            max_items=6,
+        )
+        planner_action = planner_llm.tex_action_plan(
+            theorem_name=theorem,
+            theorem_statement=statement,
+            instruction=instruction,
+            state=action_state,
+            context=action_context,
+        )
+        action_choice = _resolve_tex_planner_action(
+            planner_action,
+            run_state,
+            replan_passes=replan_passes,
+        )
+        action_summary = str(planner_action.get("summary", "") or "").strip() or action_choice
+        print(f"[tex] action {action_step}/{action_steps}: {action_choice} - {_tex_trim(action_summary, 180)}")
+        _record_tex_action_history(
+            run_state,
+            step=action_step,
+            action=action_choice,
+            summary=action_summary,
+        )
+        _append_tex_event(
+            run_dir,
+            {
+                "kind": "planner_action",
+                "step": action_step,
+                "pass": pass_idx,
+                "action": action_choice,
+                "summary": _tex_trim(action_summary, 400),
+                "payload": _json_clone(planner_action),
+            },
+        )
+        _apply_tex_planner_memory_action(run_state, planner_action)
+        _persist_state()
 
-        if not isinstance(run_state.get("plan"), dict):
+        if action_choice == "write_memory":
+            action_step += 1
+            run_state["action_step"] = action_step
+            _persist_state()
+            continue
+
+        if action_choice == "give_up":
+            best_payload = run_state.get("best_pass", {}) if isinstance(run_state.get("best_pass", {}), dict) else {}
+            best_claims = list(best_payload.get("claims", []) or []) if isinstance(best_payload, dict) else []
+            best_accepted = dict(best_payload.get("accepted_claims", {}) or {}) if isinstance(best_payload, dict) else {}
+            if not best_claims:
+                best_claims = list(run_state.get("claims", []) or [])
+            if not best_accepted:
+                best_accepted = dict(run_state.get("accepted_claims", {}) or {})
+            reason = action_summary or "planner requested give_up"
+            print(f"[tex] planner gave up: {reason}")
+            run_state["status"] = "finished"
+            run_state["final"] = {
+                "pass": False,
+                "abstained": True,
+                "reason": reason,
+                "used_pass": int(best_payload.get("pass", pass_idx) or pass_idx) if isinstance(best_payload, dict) else pass_idx,
+                "accepted_claims": len(best_accepted),
+                "total_claims": len(best_claims),
+            }
+            _clear_tex_planner_directives(run_state)
+            _persist_state()
+            _tex_summary_path(run_dir).write_text(
+                json.dumps(run_state["final"], indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+            _append_tex_event(
+                run_dir,
+                {
+                    "kind": "final",
+                    "pass": False,
+                    "abstained": True,
+                    "reason": reason,
+                    "used_pass": int(run_state["final"].get("used_pass", pass_idx) or pass_idx),
+                    "accepted_claims": len(best_accepted),
+                    "total_claims": len(best_claims),
+                },
+            )
+            print(f"[tex] state snapshot: {_tex_state_path(run_dir)}")
+            print(f"[tex] event log: {_tex_events_path(run_dir)}")
+            print(f"[tex] summary: {_tex_summary_path(run_dir)}")
+            return False
+
+        if action_choice == "compose":
+            run_state["compose_ready"] = True
+            _clear_tex_planner_directives(run_state)
+            _persist_state()
+            break
+
+        if action_choice == "plan":
+            active_plan = isinstance(run_state.get("plan"), dict) and bool(run_state.get("plan"))
+            if active_plan:
+                current_plan = dict(run_state.get("plan", {}) or {})
+                current_claims = list(run_state.get("claims", []) or [])
+                pass_summary = _summarize_tex_pass(run_state, current_plan, current_claims, "planner_replan")
+                _append_tex_event(run_dir, {"kind": "pass_summary", "summary": _json_clone(pass_summary)})
+                if pass_idx >= replan_passes:
+                    run_state["compose_ready"] = True
+                    _clear_tex_planner_directives(run_state)
+                    _persist_state()
+                    break
+                run_state["current_pass"] = pass_idx + 1
+                _reset_tex_pass_state(run_state)
+                pass_idx = int(run_state.get("current_pass", 1) or 1)
+            if pass_idx > replan_passes:
+                run_state["compose_ready"] = True
+                _clear_tex_planner_directives(run_state)
+                _persist_state()
+                break
             pass_instruction = _build_tex_replan_instruction(
                 instruction,
                 pass_idx=pass_idx,
@@ -1285,9 +1452,10 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 base_context,
                 run_state,
                 pass_idx=pass_idx,
-                max_items=5,
+                extra_repo_slugs=list(run_state.get("pending_repo_reads", []) or []),
+                max_items=6,
             )
-            plan = llm.tex_plan(
+            plan = planner_llm.tex_plan(
                 theorem_name=theorem,
                 theorem_statement=statement,
                 instruction=pass_instruction,
@@ -1306,6 +1474,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
             run_state["claim_feedback"] = {}
             run_state["current_round"] = 1
             run_state["current_claim_index"] = 0
+            run_state["current_round_order"] = []
             run_state["repairs_used"] = 0
             run_state["round_progressed"] = False
             pass_dir = run_dir / "passes" / f"pass_{pass_idx:02d}"
@@ -1328,353 +1497,48 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
                 },
             )
             _persist_state()
-        else:
-            plan = dict(run_state.get("plan", {}) or {})
-            claims = list(run_state.get("claims", []) or [])
-            strategy = str(plan.get("strategy", "")).strip()
-            if strategy:
-                print(f"[tex] resuming pass strategy: {strategy}")
-
-        pass_completed = False
-        stalled = False
-        while int(run_state.get("current_round", 1) or 1) <= rounds:
-            round_idx = max(1, int(run_state.get("current_round", 1) or 1))
-            claim_index = max(0, int(run_state.get("current_claim_index", 0) or 0))
-            if claim_index <= 0:
-                print(f"[tex] pass {pass_idx}/{replan_passes} round {round_idx}/{rounds}")
-            else:
-                print(
-                    f"[tex] pass {pass_idx}/{replan_passes} round {round_idx}/{rounds} "
-                    f"(resuming claim {claim_index + 1}/{len(claims)})"
-                )
-            progressed = bool(run_state.get("round_progressed", False))
-
-            while claim_index < len(claims):
-                claim = claims[claim_index]
-                accepted_claims = run_state.get("accepted_claims", {})
-                best_claim_candidates = run_state.get("best_claim_candidates", {})
-                claim_feedback = run_state.get("claim_feedback", {})
-                if not isinstance(accepted_claims, dict):
-                    accepted_claims = {}
-                if not isinstance(best_claim_candidates, dict):
-                    best_claim_candidates = {}
-                if not isinstance(claim_feedback, dict):
-                    claim_feedback = {}
-                run_state["accepted_claims"] = accepted_claims
-                run_state["best_claim_candidates"] = best_claim_candidates
-                run_state["claim_feedback"] = claim_feedback
-
-                claim_id = str(claim.get("id", "")).strip()
-                run_state["current_claim_index"] = claim_index
-                _persist_state()
-                if not claim_id or claim_id in accepted_claims:
-                    claim_index += 1
-                    run_state["current_claim_index"] = claim_index
-                    _persist_state()
-                    continue
-                deps = [str(dep).strip() for dep in list(claim.get("depends_on", []) or []) if str(dep).strip()]
-                missing_deps = [dep for dep in deps if dep not in accepted_claims]
-                if missing_deps:
-                    claim_index += 1
-                    run_state["current_claim_index"] = claim_index
-                    _persist_state()
-                    continue
-
-                ledger = _build_tex_claim_ledger(accepted_claims)
-                prior_candidate = best_claim_candidates.get(claim_id, {})
-                prior_draft = ""
-                if isinstance(prior_candidate.get("draft"), dict):
-                    prior_draft = str(prior_candidate["draft"].get("proof_tex", "") or "")
-                prior_feedback = str(claim_feedback.get(claim_id, "") or "")
-
-                best_candidate: dict | None = None
-                accepted_claims_context = _claim_context_for_prompt(claims, accepted_claims)
-                claim_context = _build_tex_memory_context(
-                    base_context,
-                    run_state,
-                    claim=claim,
-                    pass_idx=pass_idx,
-                    max_items=6,
-                )
-                worker_results = _evaluate_tex_claim_workers(
-                    llm=llm,
-                    theorem=theorem,
-                    theorem_statement=statement,
-                    instruction=str(run_state.get("current_instruction", instruction)),
-                    plan=plan,
-                    claim=claim,
-                    accepted_claims_context=accepted_claims_context,
-                    ledger=ledger,
-                    prior_draft=prior_draft,
-                    prior_feedback=prior_feedback,
-                    prompt_context=claim_context,
-                    round_idx=round_idx,
-                    worker_drafts=worker_drafts,
-                    concurrent=tex_concurrency,
-                    verifier_policy=verifier_policy,
-                )
-                for worker_result in worker_results:
-                    worker_idx = int(worker_result.get("worker", 0) or 0)
-                    event_payload = worker_result.get("event", {})
-                    if isinstance(event_payload, dict):
-                        _append_tex_event(
-                            run_dir,
-                            {
-                                "kind": "candidate",
-                                "pass": pass_idx,
-                                "round": round_idx,
-                                "claim_id": claim_id,
-                                **event_payload,
-                            },
-                        )
-                    candidate = worker_result.get("candidate")
-                    if not isinstance(candidate, dict):
-                        status = str(worker_result.get("status", "") or "").strip().lower()
-                        if status == "worker_error":
-                            print(
-                                f"[tex] claim={claim_id} worker={worker_idx} "
-                                f"error={_tex_trim(str(worker_result.get('error', '') or ''), 180)}"
-                            )
-                        continue
-                    if best_candidate is None or float(candidate.get("score", -1e9) or -1e9) > float(
-                        best_candidate.get("score", -1e9) or -1e9
-                    ):
-                        best_candidate = candidate
-                    print(
-                        f"[tex] claim={claim_id} worker={worker_idx} "
-                        f"judge={candidate.get('judge', {}).get('verdict','revise')} "
-                        f"verifier={candidate.get('verifier', {}).get('verdict','skip')} "
-                        f"checker={candidate.get('checker', {}).get('status','issues')} "
-                        f"score={float(candidate.get('score', 0.0) or 0.0):.1f}"
-                    )
-
-                if not best_candidate:
-                    print(f"[tex] claim={claim_id} produced no valid candidate.")
-                    _append_tex_event(
-                        run_dir,
-                        {
-                            "kind": "claim_result",
-                            "pass": pass_idx,
-                            "round": round_idx,
-                            "claim_id": claim_id,
-                            "status": "no_candidate",
-                        },
-                    )
-                    claim_index += 1
-                    run_state["current_claim_index"] = claim_index
-                    _persist_state()
-                    continue
-
-                if verifier_policy == "promoted":
-                    promoted_verifier = llm.tex_claim_verifier(
-                        theorem_name=theorem,
-                        theorem_statement=statement,
-                        instruction=str(run_state.get("current_instruction", instruction)),
-                        plan=plan,
-                        claim=claim,
-                        candidate=best_candidate.get("draft", {}),
-                        accepted_claims=accepted_claims_context,
-                        ledger=ledger,
-                        context=claim_context,
-                    )
-                    best_candidate["verifier"] = promoted_verifier
-                    best_candidate["verifier_mode"] = "promoted"
-                    best_candidate["score"] = _tex_claim_candidate_score(
-                        draft=best_candidate.get("draft", {}),
-                        judge=best_candidate.get("judge", {}),
-                        verifier=promoted_verifier,
-                        checker=best_candidate.get("checker", {}),
-                        static_issues=list(best_candidate.get("static_issues", []) or []),
-                        require_verifier=True,
-                    )
-                    best_candidate["pass_gate"] = _tex_claim_pass_gate(
-                        judge=best_candidate.get("judge", {}),
-                        verifier=promoted_verifier,
-                        checker=best_candidate.get("checker", {}),
-                        static_issues=list(best_candidate.get("static_issues", []) or []),
-                        require_verifier=True,
-                    )
-                    _append_tex_event(
-                        run_dir,
-                        {
-                            "kind": "candidate_verifier",
-                            "pass": pass_idx,
-                            "round": round_idx,
-                            "claim_id": claim_id,
-                            "mode": "promoted",
-                            "candidate": _json_clone(best_candidate),
-                        },
-                    )
-                    print(
-                        f"[tex] claim={claim_id} promoted verifier="
-                        f"{str(promoted_verifier.get('verdict', 'revise')).strip().lower()} "
-                        f"score={float(best_candidate.get('score', 0.0) or 0.0):.1f}"
-                    )
-
-                best_claim_candidates[claim_id] = best_candidate
-                if bool(best_candidate.get("pass_gate")):
-                    accepted_claims[claim_id] = _finalize_tex_claim(claim, best_candidate)
-                    claim_feedback.pop(claim_id, None)
-                    progressed = True
-                    run_state["round_progressed"] = True
-                    print(f"[tex] claim={claim_id} accepted.")
-                    _append_tex_event(
-                        run_dir,
-                        {
-                            "kind": "claim_result",
-                            "pass": pass_idx,
-                            "round": round_idx,
-                            "claim_id": claim_id,
-                            "status": "accepted",
-                            "candidate": _json_clone(best_candidate),
-                        },
-                    )
-                else:
-                    feedback = _build_tex_claim_feedback(best_candidate)
-                    if feedback:
-                        claim_feedback[claim_id] = feedback
-                    print(f"[tex] claim={claim_id} needs revision.")
-                    _append_tex_event(
-                        run_dir,
-                        {
-                            "kind": "claim_result",
-                            "pass": pass_idx,
-                            "round": round_idx,
-                            "claim_id": claim_id,
-                            "status": "revise",
-                            "feedback": feedback,
-                            "candidate": _json_clone(best_candidate),
-                        },
-                    )
-
-                claim_index += 1
-                run_state["current_claim_index"] = claim_index
-                _persist_state()
-
-            unresolved = [
-                str(claim.get("id", "")).strip()
-                for claim in claims
-                if str(claim.get("id", "")).strip()
-                and str(claim.get("id", "")).strip() not in run_state.get("accepted_claims", {})
-            ]
-            if not unresolved:
-                print("[tex] all planned claims accepted.")
-                pass_completed = True
-                break
-            if progressed:
-                run_state["repairs_used"] = 0
-            else:
-                run_state["repairs_used"] = int(run_state.get("repairs_used", 0) or 0) + 1
-                print(
-                    f"[tex] no claim accepted this round "
-                    f"(repair cycle {run_state['repairs_used']}/{judge_repairs})."
-                )
-                if int(run_state.get("repairs_used", 0) or 0) > judge_repairs:
-                    print("[tex] reached repair limit for this pass; triggering replan/backtrack.")
-                    stalled = True
-                    break
-
-            run_state["current_round"] = round_idx + 1
-            run_state["current_claim_index"] = 0
-            run_state["round_progressed"] = False
+            action_step += 1
+            run_state["action_step"] = action_step
             _persist_state()
+            continue
 
-        accepted_claims = run_state.get("accepted_claims", {})
-        best_claim_candidates = run_state.get("best_claim_candidates", {})
-        claim_feedback = run_state.get("claim_feedback", {})
-        if not isinstance(accepted_claims, dict):
-            accepted_claims = {}
-        if not isinstance(best_claim_candidates, dict):
-            best_claim_candidates = {}
-        if not isinstance(claim_feedback, dict):
-            claim_feedback = {}
-        unresolved_claims = [
-            str(claim.get("id", "")).strip()
-            for claim in claims
-            if str(claim.get("id", "")).strip() and str(claim.get("id", "")).strip() not in accepted_claims
-        ]
-        feedback_lines: list[str] = []
-        for item in list(claim_feedback.values())[:8]:
-            if not isinstance(item, str):
-                continue
-            for line in item.splitlines():
-                text = line.strip()
-                if not text:
-                    continue
-                feedback_lines.append(text.lstrip("- ").strip())
-                if len(feedback_lines) >= 8:
-                    break
-            if len(feedback_lines) >= 8:
-                break
-        quality = _tex_pass_quality(claims, accepted_claims, best_claim_candidates)
-        pass_summary = {
-            "pass": pass_idx,
-            "strategy": str(plan.get("strategy", "")).strip(),
-            "accepted_count": quality[0],
-            "total_claims": len(claims),
-            "quality_score": quality[1],
-            "unresolved_claims": unresolved_claims[:40],
-            "feedback": feedback_lines[:12],
-            "status": (
-                "claims_complete"
-                if pass_completed
-                else ("stalled" if stalled else "round_limit")
-            ),
-            "round_reached": int(run_state.get("current_round", 1) or 1),
-        }
-        pass_history = run_state.get("pass_history", [])
-        if not isinstance(pass_history, list):
-            pass_history = []
-        pass_history.append(pass_summary)
-        run_state["pass_history"] = pass_history
-        _append_tex_event(run_dir, {"kind": "pass_summary", "summary": _json_clone(pass_summary)})
-
-        best_pass = run_state.get("best_pass", None)
-        current_best_payload = {
-            "pass": pass_idx,
-            "plan": _json_clone(plan),
-            "claims": _json_clone(claims),
-            "accepted_claims": _json_clone(accepted_claims),
-            "best_claim_candidates": _json_clone(best_claim_candidates),
-            "quality": {"accepted_count": quality[0], "score": quality[1]},
-        }
-        if not isinstance(best_pass, dict):
-            run_state["best_pass"] = current_best_payload
-        else:
-            prev_quality = best_pass.get("quality", {})
-            try:
-                prev_tuple = (
-                    int(prev_quality.get("accepted_count", 0) or 0),
-                    float(prev_quality.get("score", 0.0) or 0.0),
-                )
-            except Exception:
-                prev_tuple = (0, 0.0)
-            if quality > prev_tuple:
-                run_state["best_pass"] = current_best_payload
-
-        if pass_completed:
-            run_state["compose_ready"] = True
-            _persist_state()
-            break
-        if pass_idx >= replan_passes:
-            run_state["compose_ready"] = True
-            _persist_state()
-            break
-
-        run_state["current_pass"] = pass_idx + 1
-        run_state["current_round"] = 1
-        run_state["current_claim_index"] = 0
-        run_state["repairs_used"] = 0
-        run_state["round_progressed"] = False
-        run_state["plan"] = None
-        run_state["claims"] = []
-        run_state["accepted_claims"] = {}
-        run_state["best_claim_candidates"] = {}
-        run_state["claim_feedback"] = {}
-        _persist_state()
-        print(
-            f"[tex] starting replan pass {int(run_state['current_pass'])}/{replan_passes}."
+        solve_result = _run_tex_solve_round(
+            planner_llm=planner_llm,
+            worker_llm=worker_llm,
+            theorem=theorem,
+            theorem_statement=statement,
+            instruction=instruction,
+            base_context=base_context,
+            run_state=run_state,
+            run_dir=run_dir,
+            worker_drafts=worker_drafts,
+            tex_concurrency=tex_concurrency,
+            verifier_policy=verifier_policy,
+            judge_repairs=judge_repairs,
+            rounds=rounds,
+            persist_state=_persist_state,
         )
+        solve_status = str(solve_result.get("status", "continue") or "continue").strip().lower()
+        plan = dict(solve_result.get("plan", {}) or {})
+        claims = list(solve_result.get("claims", []) or [])
+        if solve_status in {"claims_complete", "stalled", "round_limit"}:
+            pass_summary = _summarize_tex_pass(run_state, plan, claims, solve_status)
+            _append_tex_event(run_dir, {"kind": "pass_summary", "summary": _json_clone(pass_summary)})
+            if solve_status == "claims_complete" or pass_idx >= replan_passes:
+                run_state["compose_ready"] = True
+            else:
+                run_state["current_pass"] = pass_idx + 1
+            _reset_tex_pass_state(run_state)
+        _clear_tex_planner_directives(run_state)
+        _persist_state()
+        action_step += 1
+        run_state["action_step"] = action_step
+        _persist_state()
+
+    if not bool(run_state.get("compose_ready", False)) and str(run_state.get("status", "")).strip().lower() != "finished":
+        print("[tex] reached action budget; composing best available draft.")
+        run_state["compose_ready"] = True
+        _persist_state()
 
     best_pass = run_state.get("best_pass", None)
     if isinstance(best_pass, dict):
@@ -1750,7 +1614,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         pass_idx=compose_pass_idx,
         max_items=8,
     )
-    composed = llm.tex_compose(
+    composed = planner_llm.tex_compose(
         theorem_name=theorem,
         theorem_statement=statement,
         instruction=instruction,
@@ -1774,7 +1638,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         )
         return False
 
-    final_judge = llm.tex_judge(
+    final_judge = planner_llm.tex_judge(
         theorem_name=theorem,
         theorem_statement=statement,
         instruction=instruction,
@@ -1798,7 +1662,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         "cited_facts": sorted({fact for item in compose_claims for fact in list(item.get("cited_facts", []) or [])}),
         "confidence": 90,
     }
-    final_verifier = llm.tex_claim_verifier(
+    final_verifier = planner_llm.tex_claim_verifier(
         theorem_name=theorem,
         theorem_statement=statement,
         instruction=instruction,
@@ -1809,7 +1673,7 @@ def run_prove_tex(args: argparse.Namespace, config_data: dict | None = None) -> 
         ledger=compose_ledger,
         context=compose_context,
     )
-    final_checker = llm.tex_claim_domain_check(
+    final_checker = planner_llm.tex_claim_domain_check(
         theorem_name=theorem,
         theorem_statement=statement,
         plan=compose_plan,
@@ -3029,6 +2893,7 @@ def _apply_proof_profile_to_args(args: argparse.Namespace, profile: str) -> None
             "tex_judge_repairs": 1,
             "tex_worker_drafts": 1,
             "tex_replan_passes": 1,
+            "tex_action_steps": 4,
             "tex_verifier_policy": "final_only",
             "tex_compose_policy": "on_complete",
         },
@@ -3037,6 +2902,7 @@ def _apply_proof_profile_to_args(args: argparse.Namespace, profile: str) -> None
             "tex_judge_repairs": 2,
             "tex_worker_drafts": 2,
             "tex_replan_passes": 2,
+            "tex_action_steps": 10,
             "tex_verifier_policy": "promoted",
             "tex_compose_policy": "always",
         },
@@ -3045,6 +2911,7 @@ def _apply_proof_profile_to_args(args: argparse.Namespace, profile: str) -> None
             "tex_judge_repairs": 3,
             "tex_worker_drafts": 3,
             "tex_replan_passes": 3,
+            "tex_action_steps": 16,
             "tex_verifier_policy": "worker",
             "tex_compose_policy": "on_complete",
         },
@@ -3238,6 +3105,31 @@ def _resolve_tex_replan_passes(args: argparse.Namespace, config: dict | None = N
         return 2
 
 
+def _resolve_tex_action_steps(args: argparse.Namespace, config: dict | None = None) -> int:
+    explicit = getattr(args, "tex_action_steps", None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except Exception:
+            return 10
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("prove", {}).get("tex_action_steps", 10)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 10
+
+
+def _resolve_tex_role_model(args: argparse.Namespace, role: str, config: dict | None = None) -> str:
+    safe_role = "planner" if str(role).strip().lower() == "planner" else "worker"
+    attr = f"tex_{safe_role}_model"
+    explicit = str(getattr(args, attr, "") or "").strip()
+    if explicit:
+        return explicit
+    cfg = config if config is not None else load_config()
+    return str(cfg.get("prove", {}).get(attr, "") or "").strip()
+
+
 def _resolve_tex_artifacts_root(
     args: argparse.Namespace,
     config: dict,
@@ -3417,6 +3309,60 @@ def _tex_repo_index_rows(repo_items: dict[str, dict]) -> list[dict]:
     return rows
 
 
+def _tex_system_repo_slug(slug: str) -> bool:
+    safe = _tex_repo_slug(slug)
+    if safe in {"theorem", "open_claims", "final_outcome", "planner_notes", "planner_guidance"}:
+        return True
+    if safe.startswith("claim_"):
+        return True
+    return bool(re.fullmatch(r"pass_\d+_(plan|summary)", safe))
+
+
+def _tex_repo_delete(repo_items: dict[str, dict], slug: str) -> bool:
+    safe = _tex_repo_slug(slug)
+    if not safe or _tex_system_repo_slug(safe):
+        return False
+    return repo_items.pop(safe, None) is not None
+
+
+def _tex_resolve_repo_wikilinks(
+    text: str,
+    repo_items: dict[str, dict],
+    *,
+    max_refs: int = 4,
+    content_limit: int = 2400,
+) -> str:
+    raw = str(text or "").strip()
+    if not raw or not isinstance(repo_items, dict) or not repo_items:
+        return raw
+    refs: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\[\[([^\]]+)\]\]", raw):
+        slug = _tex_repo_slug(match.group(1))
+        if not slug or slug in seen or slug not in repo_items:
+            continue
+        refs.append(slug)
+        seen.add(slug)
+        if len(refs) >= max(1, max_refs):
+            break
+    if not refs:
+        return raw
+    sections = [raw, "", "Referenced repo materials:"]
+    for slug in refs:
+        item = repo_items.get(slug)
+        if not isinstance(item, dict):
+            continue
+        summary = _tex_trim(str(item.get("summary", "") or ""), 180)
+        content = _tex_trim(str(item.get("content", "") or ""), max(400, content_limit))
+        header = f"- [[{slug}]] [{str(item.get('kind', 'note') or 'note').strip() or 'note'}]"
+        if summary:
+            header += f": {summary}"
+        sections.append(header)
+        if content:
+            sections.append(content)
+    return "\n".join(part for part in sections if part is not None).strip()
+
+
 def _render_tex_repo_item_markdown(item: dict) -> str:
     slug = str(item.get("slug", "")).strip()
     kind = str(item.get("kind", "note")).strip() or "note"
@@ -3447,6 +3393,7 @@ def _select_tex_repo_materials(
     *,
     claim: dict | None = None,
     pass_idx: int | None = None,
+    extra_slugs: list[str] | None = None,
     max_items: int = 6,
 ) -> list[dict]:
     repo_items = run_state.get("repo_items", {})
@@ -3494,6 +3441,8 @@ def _select_tex_repo_materials(
             dep_id = str(dep).strip()
             if dep_id:
                 _add(f"claim_{dep_id}")
+    for slug in list(extra_slugs or []):
+        _add(str(slug))
     materials: list[dict] = []
     for slug in chosen[:max(1, max_items)]:
         item = repo_items.get(slug)
@@ -3508,16 +3457,23 @@ def _build_tex_memory_context(
     *,
     claim: dict | None = None,
     pass_idx: int | None = None,
+    extra_repo_slugs: list[str] | None = None,
+    guidance: str = "",
     max_items: int = 6,
 ) -> str:
     parts: list[str] = []
     raw_base = str(base_context or "").strip()
     if raw_base:
         parts.append(raw_base)
+    repo_items = run_state.get("repo_items", {})
+    if not isinstance(repo_items, dict):
+        repo_items = {}
+    guide = _tex_resolve_repo_wikilinks(guidance, repo_items, max_refs=4, content_limit=1800)
+    if guide:
+        parts.append("[planner guidance]\n" + _tex_trim(guide, 5000))
     whiteboard = str(run_state.get("whiteboard", "") or "").strip()
     if whiteboard:
         parts.append("[persistent whiteboard]\n" + _tex_trim(whiteboard, 6000))
-    repo_items = run_state.get("repo_items", {})
     if isinstance(repo_items, dict) and repo_items:
         index_lines = []
         for row in _tex_repo_index_rows(repo_items)[:12]:
@@ -3532,6 +3488,7 @@ def _build_tex_memory_context(
             run_state,
             claim=claim,
             pass_idx=pass_idx,
+            extra_slugs=list(extra_repo_slugs or []),
             max_items=max_items,
         )
         if materials:
@@ -3539,7 +3496,13 @@ def _build_tex_memory_context(
             for item in materials:
                 slug = str(item.get("slug", "")).strip() or "repo_item"
                 summary = str(item.get("summary", "")).strip()
-                content = _tex_trim(str(item.get("content", "") or ""), 5000)
+                content = _tex_resolve_repo_wikilinks(
+                    str(item.get("content", "") or ""),
+                    repo_items,
+                    max_refs=3,
+                    content_limit=1600,
+                )
+                content = _tex_trim(content, 5000)
                 block = f"[repo item: {slug}]"
                 if summary:
                     block += f"\nSummary: {summary}"
@@ -3572,6 +3535,8 @@ def _render_tex_whiteboard(run_state: dict, theorem: str, theorem_statement: str
     repo_items = run_state.get("repo_items", {})
     best_pass = run_state.get("best_pass", {})
     final = run_state.get("final", {})
+    planner_notes = run_state.get("planner_notes", [])
+    worker_guidance = str(run_state.get("pending_worker_guidance", "") or "").strip()
     strategy = ""
     if isinstance(plan, dict):
         strategy = str(plan.get("strategy", "") or "").strip()
@@ -3631,6 +3596,19 @@ def _render_tex_whiteboard(run_state: dict, theorem: str, theorem_statement: str
         lines.extend(feedback_rows[:8])
     else:
         lines.append("- none")
+    lines.extend(["", "## Planner Notes"])
+    if isinstance(planner_notes, list) and planner_notes:
+        for note in planner_notes[-6:]:
+            text = _tex_trim(str(note).strip(), 240)
+            if text:
+                lines.append(f"- {text}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Pending Worker Guidance"])
+    if worker_guidance:
+        lines.append(_tex_trim(worker_guidance, 600))
+    else:
+        lines.append("- none")
     lines.extend(["", "## Repo Highlights"])
     if isinstance(repo_items, dict) and repo_items:
         for row in _tex_repo_index_rows(repo_items)[:8]:
@@ -3661,6 +3639,32 @@ def _sync_tex_memory_state(run_state: dict, theorem: str, theorem_statement: str
         ),
         theorem=theorem,
     )
+    planner_notes = run_state.get("planner_notes", [])
+    if isinstance(planner_notes, list) and planner_notes:
+        note_lines = [f"- {_tex_trim(str(item).strip(), 500)}" for item in planner_notes[-8:] if str(item).strip()]
+        if note_lines:
+            _tex_repo_upsert(
+                repo_items,
+                "planner_notes",
+                kind="memory",
+                summary="Planner-authored notes for future TeX actions",
+                content="\n".join(note_lines).strip(),
+                status="active",
+            )
+    else:
+        repo_items.pop("planner_notes", None)
+    worker_guidance = str(run_state.get("pending_worker_guidance", "") or "").strip()
+    if worker_guidance:
+        _tex_repo_upsert(
+            repo_items,
+            "planner_guidance",
+            kind="memory",
+            summary="Planner guidance queued for the next solve step",
+            content=_tex_trim(worker_guidance, 10000),
+            status="queued",
+        )
+    else:
+        repo_items.pop("planner_guidance", None)
     plan = run_state.get("plan", {})
     claims = run_state.get("claims", [])
     if isinstance(plan, dict) and plan:
@@ -3931,6 +3935,592 @@ def _build_tex_replan_instruction(base_instruction: str, pass_idx: int, pass_his
     if base_instruction.strip():
         return base_instruction.strip() + "\n\n" + replan_note
     return replan_note
+
+
+def _config_with_llm_model(provider: str, config: dict, model_name: str) -> dict:
+    if not str(model_name or "").strip():
+        return config
+    cloned = _json_clone(config)
+    if provider in {"openai", "codex_cli"}:
+        section = cloned.setdefault("openai", {})
+        section["model"] = model_name
+        section["codex_model"] = model_name
+        return cloned
+    if provider in {"anthropic", "claude_cli"}:
+        section = cloned.setdefault("anthropic", {})
+        section["model"] = model_name
+        section["claude_model"] = model_name
+        return cloned
+    if provider == "ollama":
+        cloned.setdefault("ollama", {})["model"] = model_name
+        return cloned
+    if provider in {"gemini", "gemini_cli"}:
+        section = cloned.setdefault("gemini", {})
+        section["model"] = model_name
+        section["cli_model"] = model_name
+        return cloned
+    return cloned
+
+
+def _make_tex_role_llm(provider: str, config: dict, model_name: str) -> FormalizationLLM:
+    return FormalizationLLM(provider, _config_with_llm_model(provider, config, model_name))
+
+
+def _tex_claim_order(claims: list[dict], focus_ids: list[str] | None = None) -> list[str]:
+    rows = [str(claim.get("id", "")).strip() for claim in claims if str(claim.get("id", "")).strip()]
+    focus = {str(item).strip() for item in list(focus_ids or []) if str(item).strip()}
+    if not focus:
+        return rows
+    prioritized = [claim_id for claim_id in rows if claim_id in focus]
+    remainder = [claim_id for claim_id in rows if claim_id not in focus]
+    return prioritized + remainder
+
+
+def _build_tex_action_state(
+    run_state: dict,
+    *,
+    rounds: int,
+    judge_repairs: int,
+    replan_passes: int,
+    action_step: int,
+    action_limit: int,
+) -> dict:
+    claims = run_state.get("claims", [])
+    accepted_claims = run_state.get("accepted_claims", {})
+    plan = run_state.get("plan", {})
+    best_pass = run_state.get("best_pass", {})
+    if not isinstance(claims, list):
+        claims = []
+    if not isinstance(accepted_claims, dict):
+        accepted_claims = {}
+    if not isinstance(plan, dict):
+        plan = {}
+    if not isinstance(best_pass, dict):
+        best_pass = {}
+    unresolved = []
+    accepted_ids = {str(key).strip() for key in accepted_claims.keys() if str(key).strip()}
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("id", "")).strip()
+        if not claim_id or claim_id in accepted_ids:
+            continue
+        unresolved.append(
+            {
+                "id": claim_id,
+                "goal": _tex_trim(str(claim.get("goal", "") or ""), 200),
+                "depends_on": [str(dep).strip() for dep in list(claim.get("depends_on", []) or []) if str(dep).strip()],
+            }
+        )
+    best_quality = best_pass.get("quality", {}) if isinstance(best_pass.get("quality", {}), dict) else {}
+    repo_items = run_state.get("repo_items", {})
+    repo_index = _tex_repo_index_rows(repo_items)[:12] if isinstance(repo_items, dict) else []
+    action_history = run_state.get("action_history", [])
+    if not isinstance(action_history, list):
+        action_history = []
+    pass_history = run_state.get("pass_history", [])
+    if not isinstance(pass_history, list):
+        pass_history = []
+    return {
+        "status": str(run_state.get("status", "running") or "running").strip(),
+        "compose_ready": bool(run_state.get("compose_ready", False)),
+        "current_pass": int(run_state.get("current_pass", 1) or 1),
+        "current_round": int(run_state.get("current_round", 1) or 1),
+        "repairs_used": int(run_state.get("repairs_used", 0) or 0),
+        "round_progressed": bool(run_state.get("round_progressed", False)),
+        "round_limit": int(rounds),
+        "judge_repair_limit": int(judge_repairs),
+        "replan_pass_limit": int(replan_passes),
+        "action_step": int(action_step),
+        "action_limit": int(action_limit),
+        "active_plan": bool(plan),
+        "plan_strategy": _tex_trim(str(plan.get("strategy", "") or ""), 300),
+        "plan_claim_count": len(claims),
+        "accepted_claims": len(accepted_ids),
+        "unresolved_claims": unresolved[:10],
+        "pending_repo_reads": [
+            _tex_repo_slug(item)
+            for item in list(run_state.get("pending_repo_reads", []) or [])[:8]
+            if _tex_repo_slug(item)
+        ],
+        "pending_claim_focus": [
+            str(item).strip()[:24]
+            for item in list(run_state.get("pending_claim_focus", []) or [])[:8]
+            if str(item).strip()
+        ],
+        "pending_worker_guidance": _tex_trim(str(run_state.get("pending_worker_guidance", "") or ""), 1200),
+        "recent_actions": [_json_clone(item) for item in action_history[-4:] if isinstance(item, dict)],
+        "recent_passes": [_json_clone(item) for item in pass_history[-3:] if isinstance(item, dict)],
+        "best_pass": {
+            "pass": int(best_pass.get("pass", 0) or 0) if best_pass else 0,
+            "accepted_count": int(best_quality.get("accepted_count", 0) or 0),
+            "score": float(best_quality.get("score", 0.0) or 0.0),
+        },
+        "repo_index": repo_index,
+    }
+
+
+def _record_tex_action_history(run_state: dict, *, step: int, action: str, summary: str) -> None:
+    history = run_state.get("action_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "step": int(step),
+            "action": str(action).strip().lower(),
+            "summary": _tex_trim(summary, 400),
+            "ts": _tex_iso_now(),
+        }
+    )
+    run_state["action_history"] = history[-16:]
+
+
+def _resolve_tex_planner_action(
+    planner_action: dict,
+    run_state: dict,
+    *,
+    replan_passes: int,
+) -> str:
+    requested = str(planner_action.get("action", "solve") or "solve").strip().lower()
+    if requested not in {"plan", "solve", "compose", "write_memory", "give_up"}:
+        requested = "solve"
+    active_plan = isinstance(run_state.get("plan"), dict) and bool(run_state.get("plan"))
+    compose_ready = bool(run_state.get("compose_ready", False))
+    current_pass = int(run_state.get("current_pass", 1) or 1)
+    if compose_ready and requested not in {"compose", "give_up", "write_memory"}:
+        return "compose"
+    if requested == "solve" and not active_plan:
+        return "plan" if current_pass <= replan_passes else "compose"
+    if requested == "plan" and current_pass > replan_passes:
+        return "compose"
+    return requested
+
+
+def _apply_tex_planner_memory_action(run_state: dict, planner_action: dict) -> None:
+    repo_items = run_state.get("repo_items")
+    if not isinstance(repo_items, dict):
+        repo_items = {}
+        run_state["repo_items"] = repo_items
+    note = str(planner_action.get("whiteboard_note", "") or "").strip()
+    if note:
+        notes = run_state.get("planner_notes", [])
+        if not isinstance(notes, list):
+            notes = []
+        trimmed = _tex_trim(note, 1200)
+        if not notes or str(notes[-1]).strip() != trimmed:
+            notes.append(trimmed)
+        run_state["planner_notes"] = notes[-8:]
+    guidance = str(planner_action.get("worker_guidance", "") or "").strip()
+    if guidance:
+        run_state["pending_worker_guidance"] = _tex_trim(guidance, 4000)
+    repo_reads = []
+    for item in list(planner_action.get("repo_reads", []) or [])[:8]:
+        slug = _tex_repo_slug(item)
+        if slug:
+            repo_reads.append(slug)
+    if repo_reads:
+        run_state["pending_repo_reads"] = repo_reads
+    claim_focus = [str(item).strip()[:24] for item in list(planner_action.get("claim_focus", []) or [])[:8] if str(item).strip()]
+    if claim_focus:
+        run_state["pending_claim_focus"] = claim_focus
+    for item in list(planner_action.get("repo_writes", []) or [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op", "upsert") or "upsert").strip().lower()
+        slug = _tex_repo_slug(item.get("slug", ""))
+        if not slug:
+            continue
+        if op == "delete":
+            _tex_repo_delete(repo_items, slug)
+            continue
+        _tex_repo_upsert(
+            repo_items,
+            slug,
+            kind=str(item.get("kind", "note") or "note").strip()[:40] or "note",
+            summary=str(item.get("summary", "") or slug).strip()[:220] or slug,
+            content=str(item.get("content", "") or "").strip()[:20000],
+            status="planner",
+            planner_managed=True,
+        )
+
+
+def _clear_tex_planner_directives(run_state: dict) -> None:
+    run_state["pending_worker_guidance"] = ""
+    run_state["pending_repo_reads"] = []
+    run_state["pending_claim_focus"] = []
+    run_state["current_round_order"] = []
+
+
+def _summarize_tex_pass(run_state: dict, plan: dict, claims: list[dict], status: str) -> dict:
+    accepted_claims = run_state.get("accepted_claims", {})
+    best_claim_candidates = run_state.get("best_claim_candidates", {})
+    claim_feedback = run_state.get("claim_feedback", {})
+    if not isinstance(accepted_claims, dict):
+        accepted_claims = {}
+    if not isinstance(best_claim_candidates, dict):
+        best_claim_candidates = {}
+    if not isinstance(claim_feedback, dict):
+        claim_feedback = {}
+    unresolved_claims = [
+        str(claim.get("id", "")).strip()
+        for claim in claims
+        if str(claim.get("id", "")).strip() and str(claim.get("id", "")).strip() not in accepted_claims
+    ]
+    feedback_lines: list[str] = []
+    for item in list(claim_feedback.values())[:8]:
+        if not isinstance(item, str):
+            continue
+        for line in item.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            feedback_lines.append(text.lstrip("- ").strip())
+            if len(feedback_lines) >= 8:
+                break
+        if len(feedback_lines) >= 8:
+            break
+    quality = _tex_pass_quality(claims, accepted_claims, best_claim_candidates)
+    pass_idx = int(run_state.get("current_pass", 1) or 1)
+    pass_summary = {
+        "pass": pass_idx,
+        "strategy": str(plan.get("strategy", "")).strip(),
+        "accepted_count": quality[0],
+        "total_claims": len(claims),
+        "quality_score": quality[1],
+        "unresolved_claims": unresolved_claims[:40],
+        "feedback": feedback_lines[:12],
+        "status": str(status or "unknown").strip() or "unknown",
+        "round_reached": int(run_state.get("current_round", 1) or 1),
+    }
+    pass_history = run_state.get("pass_history", [])
+    if not isinstance(pass_history, list):
+        pass_history = []
+    pass_history.append(pass_summary)
+    run_state["pass_history"] = pass_history
+    current_best_payload = {
+        "pass": pass_idx,
+        "plan": _json_clone(plan),
+        "claims": _json_clone(claims),
+        "accepted_claims": _json_clone(accepted_claims),
+        "best_claim_candidates": _json_clone(best_claim_candidates),
+        "quality": {"accepted_count": quality[0], "score": quality[1]},
+    }
+    best_pass = run_state.get("best_pass", None)
+    if not isinstance(best_pass, dict):
+        run_state["best_pass"] = current_best_payload
+    else:
+        prev_quality = best_pass.get("quality", {}) if isinstance(best_pass.get("quality", {}), dict) else {}
+        try:
+            prev_tuple = (
+                int(prev_quality.get("accepted_count", 0) or 0),
+                float(prev_quality.get("score", 0.0) or 0.0),
+            )
+        except Exception:
+            prev_tuple = (0, 0.0)
+        if quality > prev_tuple:
+            run_state["best_pass"] = current_best_payload
+    return pass_summary
+
+
+def _reset_tex_pass_state(run_state: dict) -> None:
+    run_state["plan"] = None
+    run_state["claims"] = []
+    run_state["accepted_claims"] = {}
+    run_state["best_claim_candidates"] = {}
+    run_state["claim_feedback"] = {}
+    run_state["current_round"] = 1
+    run_state["current_claim_index"] = 0
+    run_state["repairs_used"] = 0
+    run_state["round_progressed"] = False
+    run_state["current_round_order"] = []
+
+
+def _run_tex_solve_round(
+    *,
+    planner_llm: FormalizationLLM,
+    worker_llm: FormalizationLLM,
+    theorem: str,
+    theorem_statement: str,
+    instruction: str,
+    base_context: str,
+    run_state: dict,
+    run_dir: Path,
+    worker_drafts: int,
+    tex_concurrency: bool,
+    verifier_policy: str,
+    judge_repairs: int,
+    rounds: int,
+    persist_state,
+) -> dict:
+    plan = dict(run_state.get("plan", {}) or {})
+    claims = list(run_state.get("claims", []) or [])
+    if not plan or not claims:
+        return {"status": "no_plan", "plan": plan, "claims": claims}
+    pass_idx = max(1, int(run_state.get("current_pass", 1) or 1))
+    round_idx = max(1, int(run_state.get("current_round", 1) or 1))
+    if round_idx > rounds:
+        return {"status": "round_limit", "plan": plan, "claims": claims}
+    claim_index = max(0, int(run_state.get("current_claim_index", 0) or 0))
+    if claim_index <= 0:
+        print(f"[tex] pass {pass_idx} round {round_idx}/{rounds}")
+        run_state["current_round_order"] = _tex_claim_order(
+            claims,
+            list(run_state.get("pending_claim_focus", []) or []),
+        )
+    else:
+        print(
+            f"[tex] pass {pass_idx} round {round_idx}/{rounds} "
+            f"(resuming claim {claim_index + 1}/{len(claims)})"
+        )
+    order = list(run_state.get("current_round_order", []) or [])
+    if not order:
+        order = _tex_claim_order(claims, list(run_state.get("pending_claim_focus", []) or []))
+        run_state["current_round_order"] = order
+    claims_by_id = {
+        str(claim.get("id", "")).strip(): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("id", "")).strip()
+    }
+    progressed = bool(run_state.get("round_progressed", False))
+    while claim_index < len(order):
+        claim_id = str(order[claim_index]).strip()
+        claim = claims_by_id.get(claim_id)
+        if not isinstance(claim, dict):
+            claim_index += 1
+            run_state["current_claim_index"] = claim_index
+            persist_state()
+            continue
+        accepted_claims = run_state.get("accepted_claims", {})
+        best_claim_candidates = run_state.get("best_claim_candidates", {})
+        claim_feedback = run_state.get("claim_feedback", {})
+        if not isinstance(accepted_claims, dict):
+            accepted_claims = {}
+        if not isinstance(best_claim_candidates, dict):
+            best_claim_candidates = {}
+        if not isinstance(claim_feedback, dict):
+            claim_feedback = {}
+        run_state["accepted_claims"] = accepted_claims
+        run_state["best_claim_candidates"] = best_claim_candidates
+        run_state["claim_feedback"] = claim_feedback
+
+        run_state["current_claim_index"] = claim_index
+        persist_state()
+        if claim_id in accepted_claims:
+            claim_index += 1
+            run_state["current_claim_index"] = claim_index
+            persist_state()
+            continue
+        deps = [str(dep).strip() for dep in list(claim.get("depends_on", []) or []) if str(dep).strip()]
+        missing_deps = [dep for dep in deps if dep not in accepted_claims]
+        if missing_deps:
+            claim_index += 1
+            run_state["current_claim_index"] = claim_index
+            persist_state()
+            continue
+
+        ledger = _build_tex_claim_ledger(accepted_claims)
+        prior_candidate = best_claim_candidates.get(claim_id, {})
+        prior_draft = ""
+        if isinstance(prior_candidate.get("draft"), dict):
+            prior_draft = str(prior_candidate["draft"].get("proof_tex", "") or "")
+        prior_feedback = str(claim_feedback.get(claim_id, "") or "")
+        accepted_claims_context = _claim_context_for_prompt(claims, accepted_claims)
+        claim_context = _build_tex_memory_context(
+            base_context,
+            run_state,
+            claim=claim,
+            pass_idx=pass_idx,
+            extra_repo_slugs=list(run_state.get("pending_repo_reads", []) or []),
+            guidance=str(run_state.get("pending_worker_guidance", "") or ""),
+            max_items=8,
+        )
+        worker_results = _evaluate_tex_claim_workers(
+            planner_llm=planner_llm,
+            worker_llm=worker_llm,
+            theorem=theorem,
+            theorem_statement=theorem_statement,
+            instruction=str(run_state.get("current_instruction", instruction)),
+            plan=plan,
+            claim=claim,
+            accepted_claims_context=accepted_claims_context,
+            ledger=ledger,
+            prior_draft=prior_draft,
+            prior_feedback=prior_feedback,
+            prompt_context=claim_context,
+            round_idx=round_idx,
+            worker_drafts=worker_drafts,
+            concurrent=tex_concurrency,
+            verifier_policy=verifier_policy,
+        )
+        best_candidate: dict | None = None
+        for worker_result in worker_results:
+            worker_idx = int(worker_result.get("worker", 0) or 0)
+            event_payload = worker_result.get("event", {})
+            if isinstance(event_payload, dict):
+                _append_tex_event(
+                    run_dir,
+                    {
+                        "kind": "candidate",
+                        "pass": pass_idx,
+                        "round": round_idx,
+                        "claim_id": claim_id,
+                        **event_payload,
+                    },
+                )
+            candidate = worker_result.get("candidate")
+            if not isinstance(candidate, dict):
+                status = str(worker_result.get("status", "") or "").strip().lower()
+                if status == "worker_error":
+                    print(
+                        f"[tex] claim={claim_id} worker={worker_idx} "
+                        f"error={_tex_trim(str(worker_result.get('error', '') or ''), 180)}"
+                    )
+                continue
+            if best_candidate is None or float(candidate.get("score", -1e9) or -1e9) > float(
+                best_candidate.get("score", -1e9) or -1e9
+            ):
+                best_candidate = candidate
+            print(
+                f"[tex] claim={claim_id} worker={worker_idx} "
+                f"judge={candidate.get('judge', {}).get('verdict','revise')} "
+                f"verifier={candidate.get('verifier', {}).get('verdict','skip')} "
+                f"checker={candidate.get('checker', {}).get('status','issues')} "
+                f"score={float(candidate.get('score', 0.0) or 0.0):.1f}"
+            )
+
+        if not best_candidate:
+            print(f"[tex] claim={claim_id} produced no valid candidate.")
+            _append_tex_event(
+                run_dir,
+                {
+                    "kind": "claim_result",
+                    "pass": pass_idx,
+                    "round": round_idx,
+                    "claim_id": claim_id,
+                    "status": "no_candidate",
+                },
+            )
+            claim_index += 1
+            run_state["current_claim_index"] = claim_index
+            persist_state()
+            continue
+
+        if verifier_policy == "promoted":
+            promoted_verifier = planner_llm.tex_claim_verifier(
+                theorem_name=theorem,
+                theorem_statement=theorem_statement,
+                instruction=str(run_state.get("current_instruction", instruction)),
+                plan=plan,
+                claim=claim,
+                candidate=best_candidate.get("draft", {}),
+                accepted_claims=accepted_claims_context,
+                ledger=ledger,
+                context=claim_context,
+            )
+            best_candidate["verifier"] = promoted_verifier
+            best_candidate["verifier_mode"] = "promoted"
+            best_candidate["score"] = _tex_claim_candidate_score(
+                draft=best_candidate.get("draft", {}),
+                judge=best_candidate.get("judge", {}),
+                verifier=promoted_verifier,
+                checker=best_candidate.get("checker", {}),
+                static_issues=list(best_candidate.get("static_issues", []) or []),
+                require_verifier=True,
+            )
+            best_candidate["pass_gate"] = _tex_claim_pass_gate(
+                judge=best_candidate.get("judge", {}),
+                verifier=promoted_verifier,
+                checker=best_candidate.get("checker", {}),
+                static_issues=list(best_candidate.get("static_issues", []) or []),
+                require_verifier=True,
+            )
+            _append_tex_event(
+                run_dir,
+                {
+                    "kind": "candidate_verifier",
+                    "pass": pass_idx,
+                    "round": round_idx,
+                    "claim_id": claim_id,
+                    "mode": "promoted",
+                    "candidate": _json_clone(best_candidate),
+                },
+            )
+            print(
+                f"[tex] claim={claim_id} promoted verifier="
+                f"{str(promoted_verifier.get('verdict', 'revise')).strip().lower()} "
+                f"score={float(best_candidate.get('score', 0.0) or 0.0):.1f}"
+            )
+
+        best_claim_candidates[claim_id] = best_candidate
+        if bool(best_candidate.get("pass_gate")):
+            accepted_claims[claim_id] = _finalize_tex_claim(claim, best_candidate)
+            claim_feedback.pop(claim_id, None)
+            progressed = True
+            run_state["round_progressed"] = True
+            print(f"[tex] claim={claim_id} accepted.")
+            _append_tex_event(
+                run_dir,
+                {
+                    "kind": "claim_result",
+                    "pass": pass_idx,
+                    "round": round_idx,
+                    "claim_id": claim_id,
+                    "status": "accepted",
+                    "candidate": _json_clone(best_candidate),
+                },
+            )
+        else:
+            feedback = _build_tex_claim_feedback(best_candidate)
+            if feedback:
+                claim_feedback[claim_id] = feedback
+            print(f"[tex] claim={claim_id} needs revision.")
+            _append_tex_event(
+                run_dir,
+                {
+                    "kind": "claim_result",
+                    "pass": pass_idx,
+                    "round": round_idx,
+                    "claim_id": claim_id,
+                    "status": "revise",
+                    "feedback": feedback,
+                    "candidate": _json_clone(best_candidate),
+                },
+            )
+
+        claim_index += 1
+        run_state["current_claim_index"] = claim_index
+        persist_state()
+
+    unresolved = [
+        str(claim.get("id", "")).strip()
+        for claim in claims
+        if str(claim.get("id", "")).strip()
+        and str(claim.get("id", "")).strip() not in run_state.get("accepted_claims", {})
+    ]
+    run_state["current_claim_index"] = 0
+    run_state["current_round_order"] = []
+    if not unresolved:
+        print("[tex] all planned claims accepted.")
+        return {"status": "claims_complete", "plan": plan, "claims": claims}
+    if round_idx >= rounds:
+        run_state["round_progressed"] = False
+        return {"status": "round_limit", "plan": plan, "claims": claims}
+    if progressed:
+        run_state["repairs_used"] = 0
+    else:
+        run_state["repairs_used"] = int(run_state.get("repairs_used", 0) or 0) + 1
+        print(
+            f"[tex] no claim accepted this round "
+            f"(repair cycle {run_state['repairs_used']}/{judge_repairs})."
+        )
+        if int(run_state.get("repairs_used", 0) or 0) > judge_repairs:
+            print("[tex] reached repair limit for this pass; triggering replan/backtrack.")
+            run_state["round_progressed"] = False
+            return {"status": "stalled", "plan": plan, "claims": claims}
+    run_state["current_round"] = round_idx + 1
+    run_state["round_progressed"] = False
+    persist_state()
+    return {"status": "continue", "plan": plan, "claims": claims}
 
 
 def _tex_pass_quality(
@@ -4223,7 +4813,8 @@ def _tex_claim_pass_gate(
 
 def _evaluate_tex_claim_worker(
     *,
-    llm: FormalizationLLM,
+    planner_llm: FormalizationLLM,
+    worker_llm: FormalizationLLM,
     theorem: str,
     theorem_statement: str,
     instruction: str,
@@ -4239,7 +4830,7 @@ def _evaluate_tex_claim_worker(
     verifier_policy: str,
 ) -> dict:
     try:
-        draft = llm.tex_claim_draft(
+        draft = worker_llm.tex_claim_draft(
             theorem_name=theorem,
             theorem_statement=theorem_statement,
             instruction=instruction,
@@ -4270,7 +4861,7 @@ def _evaluate_tex_claim_worker(
             candidate=draft,
             accepted_claims={row.get("id", ""): row for row in accepted_claims_context if row.get("id")},
         )
-        judge = llm.tex_claim_judge(
+        judge = planner_llm.tex_claim_judge(
             theorem_name=theorem,
             theorem_statement=theorem_statement,
             instruction=instruction,
@@ -4282,7 +4873,7 @@ def _evaluate_tex_claim_worker(
             context=prompt_context,
         )
         if verifier_policy == "worker":
-            verifier = llm.tex_claim_verifier(
+            verifier = planner_llm.tex_claim_verifier(
                 theorem_name=theorem,
                 theorem_statement=theorem_statement,
                 instruction=instruction,
@@ -4302,7 +4893,7 @@ def _evaluate_tex_claim_worker(
                 "counterexample_attempt": "",
                 "suggested_repairs": [],
             }
-        checker = llm.tex_claim_domain_check(
+        checker = planner_llm.tex_claim_domain_check(
             theorem_name=theorem,
             theorem_statement=theorem_statement,
             plan=plan,
@@ -4362,7 +4953,8 @@ def _evaluate_tex_claim_worker(
 
 def _evaluate_tex_claim_workers(
     *,
-    llm: FormalizationLLM,
+    planner_llm: FormalizationLLM,
+    worker_llm: FormalizationLLM,
     theorem: str,
     theorem_statement: str,
     instruction: str,
@@ -4382,7 +4974,8 @@ def _evaluate_tex_claim_workers(
     if max_workers == 1 or not bool(concurrent):
         return [
             _evaluate_tex_claim_worker(
-                llm=llm,
+                planner_llm=planner_llm,
+                worker_llm=worker_llm,
                 theorem=theorem,
                 theorem_statement=theorem_statement,
                 instruction=instruction,
@@ -4404,7 +4997,8 @@ def _evaluate_tex_claim_workers(
         futures = [
             executor.submit(
                 _evaluate_tex_claim_worker,
-                llm=llm,
+                planner_llm=planner_llm,
+                worker_llm=worker_llm,
                 theorem=theorem,
                 theorem_statement=theorem_statement,
                 instruction=instruction,

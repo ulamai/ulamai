@@ -61,7 +61,7 @@ Proof modes:
 
 Prove output formats:
 - `lean` (default): current machine-checked Lean proving pipeline.
-- `tex`: separate informal proving pipeline that plans a claim graph, solves claims with worker drafts (serial by default, optional concurrent evaluation), maintains a persistent whiteboard + repo memory, runs judge + adversarial verifier + domain checks, supports pass-based replan/backtrack when a plan stalls, and writes resumable per-run artifacts (`state.json`, `events.jsonl`, `summary.json`, `WHITEBOARD.md`, `repo/`) before composing a final `.tex` proof draft for later `formalize`.
+- `tex`: separate informal proving pipeline that runs a bounded planner-action loop over claim-graph proving, can split planner vs worker models, solves claims with worker drafts (serial by default, optional concurrent evaluation), maintains a persistent whiteboard + mutable `repo/` memory with planner CRUD + `[[wikilink]]` references, runs judge + adversarial verifier + domain checks, supports pass-based replan/backtrack when a plan stalls, and writes resumable per-run artifacts (`state.json`, `events.jsonl`, `summary.json`, `WHITEBOARD.md`, `repo/`) before composing a final `.tex` proof draft for later `formalize`.
 
 Lean backends:
 - `dojo`: Pantograph/LeanDojo server. **Pros:** goal-state access, tactic execution. **Cons:** extra install, toolchain pinning sensitivity.
@@ -70,10 +70,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.8)
+## Status (v0.2.9)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.8 highlights:** informal `prove --output-format tex` now supports persistent `WHITEBOARD.md` + `repo/` run memory, plus optional concurrent TeX worker evaluation via `--tex-concurrency` (off by default).
+- **v0.2.9 highlights:** informal `prove --output-format tex` now adds separate planner/worker model overrides, a bounded planner-action loop, and planner-managed repo CRUD + `[[wikilink]]` context expansion on top of the new persistent `WHITEBOARD.md` + `repo/` run memory and optional concurrent TeX worker evaluation.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts
@@ -221,7 +221,9 @@ Run TeX proving with replan/backtrack and artifacts:
 python3 -m ulam prove --theorem infinitely_many_primes --output-format tex \
   --statement "There are infinitely many prime numbers." \
   --llm codex_cli --tex-rounds 3 --tex-judge-repairs 2 --tex-worker-drafts 2 \
-  --tex-replan-passes 2 --tex-artifacts-dir runs/prove_tex
+  --tex-replan-passes 2 --tex-action-steps 10 \
+  --tex-planner-model gpt-5.4 --tex-worker-model gpt-5.4-mini \
+  --tex-artifacts-dir runs/prove_tex
 ```
 
 Statement source used in that command:
@@ -445,14 +447,19 @@ TeX mode knobs:
 - `--tex-worker-drafts` fixed worker candidates generated per claim per round.
 - `--tex-concurrency/--no-tex-concurrency` toggle concurrent evaluation of TeX worker drafts (default: off).
 - `--tex-judge-repairs` max consecutive rounds without accepted claim before composing best available draft.
+- `--tex-replan-passes` max decomposition resets after a stalled pass.
+- `--tex-action-steps` bounded planner-action steps for the informal solver.
+- `--tex-planner-model` optional provider-model override for planning, judging, verification, and final composition.
+- `--tex-worker-model` optional provider-model override for claim-draft workers.
 
 TeX mode execution model:
-- planner emits a claim graph (`claims`, dependencies, assumptions, required facts),
+- a planner action loop chooses whether to `plan`, `solve`, `write_memory`, `compose`, or `give_up`,
+- the planner emits a claim graph (`claims`, dependencies, assumptions, required facts) and can attach worker guidance plus repo reads,
 - workers draft each claim, with optional parallel evaluation when `--tex-concurrency` is enabled,
 - each claim is gated by judge + adversarial verifier + domain checker,
-- a persistent `WHITEBOARD.md` plus `repo/` memory items are updated across rounds/passes and fed back into later prompts,
+- a persistent `WHITEBOARD.md` plus mutable `repo/` memory items are updated across rounds/passes, can be created/updated/deleted by the planner, and support `[[wikilink]]` expansion in later prompts,
 - accepted claims are composed into the final theorem proof.
-- token allocation is fixed by the settings above (no adaptive widening).
+- the action budget is bounded by the settings above; when it is exhausted, the solver composes the best available draft.
 
 Install the CLI entrypoint if you want `ulam` directly:
 

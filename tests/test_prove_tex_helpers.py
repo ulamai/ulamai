@@ -10,16 +10,20 @@ from ulam.cli import (
     _evaluate_tex_claim_workers,
     _normalize_tex_proof,
     _resolve_prove_output_format,
+    _resolve_tex_action_steps,
     _resolve_tex_artifacts_root,
     _resolve_tex_claim_graph,
     _resolve_tex_concurrency,
     _resolve_tex_output_path,
     _resolve_tex_replan_passes,
+    _resolve_tex_role_model,
     _resolve_tex_resume_snapshot,
     _sync_tex_memory_state,
+    _tex_resolve_repo_wikilinks,
     _tex_static_claim_issues,
 )
 from ulam.formalize.llm import (
+    _parse_tex_action_plan,
     _parse_tex_claim_checker,
     _parse_tex_claim_draft,
     _parse_tex_claim_judge,
@@ -67,6 +71,28 @@ def test_parse_tex_plan_json() -> None:
     assert parsed["strategy"] == "induction"
     assert parsed["outline"] == ["base case", "step case"]
     assert parsed["key_lemmas"] == ["lemma A"]
+
+
+def test_parse_tex_action_plan_json() -> None:
+    parsed = _parse_tex_action_plan(
+        """
+        {
+          "action":"write_memory",
+          "summary":"store a useful observation",
+          "whiteboard_note":"Track parity split.",
+          "worker_guidance":"Reuse [[parity_fact]].",
+          "repo_reads":["parity_fact"],
+          "claim_focus":["C2"],
+          "repo_writes":[
+            {"op":"upsert","slug":"parity_fact","kind":"observation","summary":"Parity lemma","content":"If n is odd then ..."}
+          ]
+        }
+        """
+    )
+    assert parsed["action"] == "write_memory"
+    assert parsed["repo_reads"] == ["parity_fact"]
+    assert parsed["claim_focus"] == ["C2"]
+    assert parsed["repo_writes"][0]["slug"] == "parity_fact"
 
 
 def test_parse_tex_judge_fallback_on_plain_text() -> None:
@@ -149,6 +175,19 @@ def test_resolve_tex_replan_passes_prefers_explicit() -> None:
     args = Namespace(tex_replan_passes=5)
     cfg = {"prove": {"tex_replan_passes": 2}}
     assert _resolve_tex_replan_passes(args, cfg) == 5
+
+
+def test_resolve_tex_action_steps_prefers_explicit() -> None:
+    args = Namespace(tex_action_steps=7)
+    cfg = {"prove": {"tex_action_steps": 10}}
+    assert _resolve_tex_action_steps(args, cfg) == 7
+
+
+def test_resolve_tex_role_model_prefers_explicit() -> None:
+    args = Namespace(tex_planner_model="planner-pro", tex_worker_model="")
+    cfg = {"prove": {"tex_planner_model": "fallback-planner", "tex_worker_model": "fallback-worker"}}
+    assert _resolve_tex_role_model(args, "planner", cfg) == "planner-pro"
+    assert _resolve_tex_role_model(args, "worker", cfg) == "fallback-worker"
 
 
 def test_resolve_tex_concurrency_defaults_off() -> None:
@@ -288,15 +327,32 @@ def test_build_tex_memory_context_includes_whiteboard_and_repo_materials() -> No
         run_state,
         claim={"id": "C1", "depends_on": []},
         pass_idx=1,
+        guidance="Use [[theorem]] first.",
         max_items=4,
     )
     assert "base context" in text
+    assert "[planner guidance]" in text
     assert "[persistent whiteboard]" in text
     assert "[repo index]" in text
     assert "[repo item: theorem]" in text
 
 
-class _DummyTexLLM:
+def test_tex_resolve_repo_wikilinks_expands_known_items() -> None:
+    repo_items = {
+        "parity_fact": {
+            "slug": "parity_fact",
+            "kind": "observation",
+            "summary": "A parity identity",
+            "content": "If n is odd then n = 2k + 1 for some k.",
+        }
+    }
+    text = _tex_resolve_repo_wikilinks("Reuse [[parity_fact]] in the case split.", repo_items)
+    assert "Referenced repo materials:" in text
+    assert "parity_fact" in text
+    assert "2k + 1" in text
+
+
+class _DummyTexWorkerLLM:
     def tex_claim_draft(
         self,
         *,
@@ -326,6 +382,8 @@ class _DummyTexLLM:
             "confidence": 80 + worker_id,
         }
 
+
+class _DummyTexPlannerLLM:
     def tex_claim_judge(
         self,
         *,
@@ -392,7 +450,8 @@ class _DummyTexLLM:
 
 def test_evaluate_tex_claim_workers_returns_sorted_results() -> None:
     results = _evaluate_tex_claim_workers(
-        llm=_DummyTexLLM(),  # type: ignore[arg-type]
+        planner_llm=_DummyTexPlannerLLM(),  # type: ignore[arg-type]
+        worker_llm=_DummyTexWorkerLLM(),  # type: ignore[arg-type]
         theorem="demo_theorem",
         theorem_statement="show P",
         instruction="",
@@ -422,7 +481,8 @@ def test_evaluate_tex_claim_workers_returns_sorted_results() -> None:
 
 def test_evaluate_tex_claim_workers_can_run_serially() -> None:
     results = _evaluate_tex_claim_workers(
-        llm=_DummyTexLLM(),  # type: ignore[arg-type]
+        planner_llm=_DummyTexPlannerLLM(),  # type: ignore[arg-type]
+        worker_llm=_DummyTexWorkerLLM(),  # type: ignore[arg-type]
         theorem="demo_theorem",
         theorem_statement="show P",
         instruction="",
