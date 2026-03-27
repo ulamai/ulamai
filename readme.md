@@ -70,10 +70,10 @@ Lean backends:
 
 ---
 
-## Status (v0.2.10)
+## Status (v0.2.11)
 This repo now contains a **working benchmark-ready proving/formalization pipeline** with reproducible reporting and optional Lean LSP loops:
 
-- **v0.2.10 highlights:** the natural-language TUI flow for informal `tex` proving is simpler: it no longer shows inline LLM/provider settings there, defaults launch-time TeX proving to `workers: one` with `worker_drafts: 1` and `concurrency: off`, and only reveals the advanced multi-worker controls (`worker_drafts`, `replan passes`, `action steps`, planner/worker model overrides) after choosing `workers: multi`.
+- **v0.2.11 highlights:** informal natural-language `tex` proving now starts with one deep whole-theorem attempt using a single primary model, and only falls back to planner/worker claim decomposition if that first full proof draft fails verification. The natural-language TUI keeps the simpler TeX launch flow with no inline LLM/provider settings there, defaults launch-time TeX proving to `workers: one` with `worker_drafts: 1` and `concurrency: off`, and only reveals the advanced multi-worker controls after choosing `workers: multi`.
 - **Autop tactics** (aesop/simp/linarith/ring) as fallback during proof search
 - **Axiom toggle** (axioms/constants allowed by default; disable with `--no-allow-axioms`)
 - **Resume last formalization** in the menu + reuse prior artifacts

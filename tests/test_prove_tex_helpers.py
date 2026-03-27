@@ -15,6 +15,7 @@ from ulam.cli import (
     _resolve_tex_claim_graph,
     _resolve_tex_concurrency,
     _resolve_tex_output_path,
+    _resolve_tex_primary_model,
     _resolve_tex_replan_passes,
     _resolve_tex_role_model,
     _resolve_tex_resume_snapshot,
@@ -28,7 +29,9 @@ from ulam.formalize.llm import (
     _parse_tex_claim_draft,
     _parse_tex_claim_judge,
     _parse_tex_claim_verifier,
+    _parse_tex_episode,
     _parse_tex_judge,
+    _parse_tex_monolithic_attempt,
     _parse_tex_plan,
 )
 
@@ -93,6 +96,64 @@ def test_parse_tex_action_plan_json() -> None:
     assert parsed["repo_reads"] == ["parity_fact"]
     assert parsed["claim_focus"] == ["C2"]
     assert parsed["repo_writes"][0]["slug"] == "parity_fact"
+
+
+def test_parse_tex_monolithic_attempt_json() -> None:
+    parsed = _parse_tex_monolithic_attempt(
+        """
+        {
+          "summary":"direct contradiction attempt",
+          "whiteboard_note":"Track the parity split.",
+          "repo_writes":[
+            {"op":"upsert","slug":"parity_note","kind":"strategy","summary":"Parity route","content":"Split into odd and even."}
+          ],
+          "proof_tex":"\\\\begin{proof}Assume otherwise.\\\\end{proof}",
+          "open_questions":["justify the final divisibility step"]
+        }
+        """
+    )
+    assert parsed["summary"] == "direct contradiction attempt"
+    assert parsed["whiteboard_note"] == "Track the parity split."
+    assert parsed["repo_writes"][0]["slug"] == "parity_note"
+    assert "begin{proof}" in parsed["proof_tex"]
+    assert parsed["open_questions"] == ["justify the final divisibility step"]
+
+
+def test_parse_tex_episode_json() -> None:
+    parsed = _parse_tex_episode(
+        """
+        {
+          "status":"compose",
+          "summary":"Two bottlenecks isolated.",
+          "strategy":"reduce to a counting contradiction",
+          "outline":["set up counting","derive contradiction"],
+          "key_lemmas":["double counting"],
+          "checks":["no hidden assumption"],
+          "repo_reads":["counting_fact"],
+          "claims":[
+            {"id":"C1","goal":"show the count is even","depends_on":[]}
+          ],
+          "claim_drafts":[
+            {
+              "claim_id":"C1",
+              "goal":"show the count is even",
+              "proof_tex":"By pairing the terms.",
+              "depends_on_used":[],
+              "assumptions_used":[],
+              "cited_facts":["pairing lemma"],
+              "confidence":81
+            }
+          ],
+          "proof_tex":"\\\\begin{proof}Assemble the accepted claim.\\\\end{proof}"
+        }
+        """
+    )
+    assert parsed["status"] == "compose"
+    assert parsed["strategy"] == "reduce to a counting contradiction"
+    assert parsed["repo_reads"] == ["counting_fact"]
+    assert parsed["claims"][0]["id"] == "C1"
+    assert parsed["claim_drafts"][0]["claim_id"] == "C1"
+    assert "begin{proof}" in parsed["proof_tex"]
 
 
 def test_parse_tex_judge_fallback_on_plain_text() -> None:
@@ -188,6 +249,15 @@ def test_resolve_tex_role_model_prefers_explicit() -> None:
     cfg = {"prove": {"tex_planner_model": "fallback-planner", "tex_worker_model": "fallback-worker"}}
     assert _resolve_tex_role_model(args, "planner", cfg) == "planner-pro"
     assert _resolve_tex_role_model(args, "worker", cfg) == "fallback-worker"
+
+
+def test_resolve_tex_primary_model_prefers_planner_then_worker() -> None:
+    args = Namespace(tex_planner_model="planner-pro", tex_worker_model="worker-fast")
+    cfg = {"prove": {"tex_planner_model": "", "tex_worker_model": ""}}
+    assert _resolve_tex_primary_model(args, cfg) == "planner-pro"
+
+    args = Namespace(tex_planner_model="", tex_worker_model="worker-fast")
+    assert _resolve_tex_primary_model(args, cfg) == "worker-fast"
 
 
 def test_resolve_tex_concurrency_defaults_off() -> None:

@@ -168,6 +168,44 @@ class FormalizationLLM:
         raw = self._call(prompt)
         return _parse_tex_action_plan(raw)
 
+    def tex_monolithic_attempt(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        context: str,
+        prior_draft: str = "",
+        prior_feedback: str = "",
+    ) -> dict:
+        prompt = _build_tex_monolithic_attempt_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            context=context,
+            prior_draft=prior_draft,
+            prior_feedback=prior_feedback,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_monolithic_attempt(raw)
+
+    def tex_episode(
+        self,
+        theorem_name: str,
+        theorem_statement: str,
+        instruction: str,
+        state: dict,
+        context: str,
+    ) -> dict:
+        prompt = _build_tex_episode_prompt(
+            theorem_name=theorem_name,
+            theorem_statement=theorem_statement,
+            instruction=instruction,
+            state=state,
+            context=context,
+        )
+        raw = self._call(prompt)
+        return _parse_tex_episode(raw)
+
     def tex_claim_draft(
         self,
         theorem_name: str,
@@ -750,6 +788,136 @@ def _build_tex_action_prompt(
         prompt += "User guidance:\n" + instruction.strip() + "\n\n"
     if context:
         prompt += "Context files:\n" + _truncate_block(context, 9000) + "\n\n"
+    return prompt
+
+
+def _build_tex_monolithic_attempt_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    context: str,
+    prior_draft: str,
+    prior_feedback: str,
+) -> str:
+    prompt = (
+        "You are attempting a full informal LaTeX proof of a theorem.\n"
+        "This is a deep whole-theorem attempt. Do NOT decompose into subclaims yet.\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "summary": "short strategy summary",\n'
+        '  "whiteboard_note": "optional short note for future attempts",\n'
+        '  "repo_writes": [\n'
+        "    {\n"
+        '      "op": "upsert|delete",\n'
+        '      "slug": "short_slug",\n'
+        '      "kind": "note|observation|strategy|attempt|counterexample",\n'
+        '      "summary": "short summary",\n'
+        '      "content": "markdown/plain text content"\n'
+        "    }\n"
+        "  ],\n"
+        '  "proof_tex": "best full theorem/proof LaTeX draft",\n'
+        '  "open_questions": ["optional unresolved issue"],\n'
+        '  "notes": "optional extra notes"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Make a serious full-proof attempt.\n"
+        "- Prefer one coherent theorem/proof draft over decomposition.\n"
+        "- Even if uncertain, return your best draft and list the main blockers in open_questions.\n"
+        "- Do not include Lean code.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if prior_draft.strip():
+        prompt += "Previous full-proof draft:\n" + _truncate_block(prior_draft, 16000) + "\n\n"
+    if prior_feedback.strip():
+        prompt += "Feedback to address:\n" + _truncate_block(prior_feedback, 8000) + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 9000) + "\n\n"
+    return prompt
+
+
+def _build_tex_episode_prompt(
+    theorem_name: str,
+    theorem_statement: str,
+    instruction: str,
+    state: dict,
+    context: str,
+) -> str:
+    state_json = json.dumps(state, ensure_ascii=True, indent=2)
+    prompt = (
+        "You are running one deep proof episode for an informal LaTeX theorem proof.\n"
+        "Read the whole notebook, revise strategy if needed, and make the highest-leverage progress.\n"
+        "You may:\n"
+        "- return a revised full theorem/proof draft,\n"
+        "- introduce 2-5 bottleneck claims only if whole-proof progress is blocked,\n"
+        "- solve multiple claims in the same episode,\n"
+        "- update the whiteboard/repo memory.\n\n"
+        "Return ONLY JSON with schema:\n"
+        "{\n"
+        '  "status": "continue|compose|give_up",\n'
+        '  "summary": "short episode summary",\n'
+        '  "strategy": "overall strategy",\n'
+        '  "outline": ["step 1", "step 2"],\n'
+        '  "key_lemmas": ["lemma/fact"],\n'
+        '  "checks": ["what must be checked"],\n'
+        '  "whiteboard_note": "optional note for the persistent whiteboard",\n'
+        '  "repo_reads": ["slug_to_pull_next_time"],\n'
+        '  "repo_writes": [\n'
+        "    {\n"
+        '      "op": "upsert|delete",\n'
+        '      "slug": "short_slug",\n'
+        '      "kind": "note|observation|lemma|attempt|strategy|counterexample",\n'
+        '      "summary": "short summary",\n'
+        '      "content": "markdown/plain text content"\n'
+        "    }\n"
+        "  ],\n"
+        '  "claims": [\n'
+        "    {\n"
+        '      "id": "C1",\n'
+        '      "goal": "bottleneck subclaim",\n'
+        '      "depends_on": ["Ck"],\n'
+        '      "assumptions": ["explicit assumption"],\n'
+        '      "required_facts": ["fact/lemma"],\n'
+        '      "acceptance_checks": ["what completes this claim"]\n'
+        "    }\n"
+        "  ],\n"
+        '  "claim_drafts": [\n'
+        "    {\n"
+        '      "claim_id": "C1",\n'
+        '      "goal": "optional claim goal if introducing a new claim",\n'
+        '      "depends_on": ["Ck"],\n'
+        '      "assumptions": ["explicit assumption"],\n'
+        '      "required_facts": ["fact/lemma"],\n'
+        '      "acceptance_checks": ["what completes this claim"],\n'
+        '      "proof_tex": "subclaim proof text only",\n'
+        '      "assumptions_used": ["assumption used"],\n'
+        '      "depends_on_used": ["accepted claim id"],\n'
+        '      "cited_facts": ["fact cited"],\n'
+        '      "confidence": 0,\n'
+        '      "notes": "optional notes"\n'
+        "    }\n"
+        "  ],\n"
+        '  "proof_tex": "optional full theorem/proof LaTeX draft",\n'
+        '  "open_questions": ["optional unresolved issue"]\n'
+        "}\n\n"
+        "Policy:\n"
+        "- Prefer a direct whole-proof revision when plausible.\n"
+        "- Only decompose after the direct approach has materially failed.\n"
+        "- If you decompose, keep it tight: 2-5 bottleneck claims.\n"
+        "- Solve as many bottleneck claims as you can in this same episode.\n"
+        "- Use `compose` only when you believe the current material supports a coherent final draft.\n"
+        "- Use `give_up` only when further progress looks unlikely.\n\n"
+        f"Theorem name: {theorem_name}\n"
+        f"Theorem statement:\n{theorem_statement}\n\n"
+        "Current proof notebook state:\n"
+        f"{_truncate_block(state_json, 20000)}\n\n"
+    )
+    if instruction.strip():
+        prompt += "User guidance:\n" + instruction.strip() + "\n\n"
+    if context:
+        prompt += "Context files:\n" + _truncate_block(context, 10000) + "\n\n"
     return prompt
 
 
@@ -1448,6 +1616,135 @@ def _normalize_tex_repo_slug(raw: object) -> str:
     return text.strip("_")[:48]
 
 
+def _normalize_tex_repo_writes(repo_writes: object) -> list[dict]:
+    if not isinstance(repo_writes, list):
+        return []
+    normalized_writes: list[dict] = []
+    for item in repo_writes[:10]:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op", "upsert")).strip().lower()
+        if op not in {"upsert", "delete"}:
+            op = "upsert"
+        slug = _normalize_tex_repo_slug(item.get("slug", ""))
+        if not slug:
+            continue
+        if op == "delete":
+            normalized_writes.append({"op": "delete", "slug": slug})
+            continue
+        kind = str(item.get("kind", "note")).strip().lower() or "note"
+        summary = str(item.get("summary", "")).strip()[:220]
+        content = str(item.get("content", "")).strip()[:12000]
+        normalized_writes.append(
+            {
+                "op": "upsert",
+                "slug": slug,
+                "kind": kind[:40],
+                "summary": summary or f"{slug} note",
+                "content": content,
+            }
+        )
+    return normalized_writes
+
+
+def _normalize_tex_episode_claim_drafts(raw_claim_drafts: object) -> list[dict]:
+    if not isinstance(raw_claim_drafts, list):
+        return []
+    rows: list[dict] = []
+    for idx, item in enumerate(raw_claim_drafts[:8], start=1):
+        if not isinstance(item, dict):
+            continue
+        claim_id = str(item.get("claim_id", "") or item.get("id", "") or f"C{idx}").strip()[:24] or f"C{idx}"
+        proof_tex = _extract_tex_document(str(item.get("proof_tex", "")))
+        assumptions = item.get("assumptions", [])
+        depends_on = item.get("depends_on", [])
+        required_facts = item.get("required_facts", [])
+        acceptance_checks = item.get("acceptance_checks", [])
+        assumptions_used = item.get("assumptions_used", [])
+        depends_on_used = item.get("depends_on_used", [])
+        cited_facts = item.get("cited_facts", [])
+        if not isinstance(assumptions, list):
+            assumptions = []
+        if not isinstance(depends_on, list):
+            depends_on = []
+        if not isinstance(required_facts, list):
+            required_facts = []
+        if not isinstance(acceptance_checks, list):
+            acceptance_checks = []
+        if not isinstance(assumptions_used, list):
+            assumptions_used = []
+        if not isinstance(depends_on_used, list):
+            depends_on_used = []
+        if not isinstance(cited_facts, list):
+            cited_facts = []
+        confidence_raw = item.get("confidence", 0)
+        try:
+            confidence = int(float(confidence_raw))
+        except Exception:
+            confidence = 0
+        confidence = max(0, min(100, confidence))
+        rows.append(
+            {
+                "claim_id": claim_id,
+                "goal": str(item.get("goal", "") or item.get("statement", "") or "").strip()[:800],
+                "depends_on": [str(dep).strip()[:24] for dep in depends_on[:8] if str(dep).strip()],
+                "assumptions": [str(v).strip()[:240] for v in assumptions[:16] if str(v).strip()],
+                "required_facts": [str(v).strip()[:240] for v in required_facts[:16] if str(v).strip()],
+                "acceptance_checks": [
+                    str(v).strip()[:240] for v in acceptance_checks[:16] if str(v).strip()
+                ],
+                "proof_tex": proof_tex,
+                "assumptions_used": [str(v).strip()[:240] for v in assumptions_used[:20] if str(v).strip()],
+                "depends_on_used": [str(v).strip()[:24] for v in depends_on_used[:12] if str(v).strip()],
+                "cited_facts": [str(v).strip()[:240] for v in cited_facts[:20] if str(v).strip()],
+                "confidence": confidence,
+                "notes": str(item.get("notes", "")).strip()[:800],
+            }
+        )
+    return rows
+
+
+def _parse_tex_monolithic_attempt(raw: str) -> dict:
+    fallback = {
+        "summary": "whole-proof attempt",
+        "whiteboard_note": "",
+        "repo_reads": [],
+        "repo_writes": [],
+        "proof_tex": "",
+        "open_questions": [],
+        "notes": "",
+    }
+    if not raw.strip():
+        return fallback
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            **fallback,
+            "summary": "unparsed whole-proof attempt",
+            "proof_tex": _extract_tex_document(text),
+            "notes": _truncate_block(text, 800),
+        }
+    open_questions = payload.get("open_questions", [])
+    if not isinstance(open_questions, list):
+        open_questions = []
+    return {
+        "summary": str(payload.get("summary", "")).strip()[:600] or fallback["summary"],
+        "whiteboard_note": str(payload.get("whiteboard_note", "")).strip()[:1200],
+        "repo_reads": [],
+        "repo_writes": _normalize_tex_repo_writes(payload.get("repo_writes", [])),
+        "proof_tex": _extract_tex_document(str(payload.get("proof_tex", ""))),
+        "open_questions": [str(item).strip()[:300] for item in open_questions[:8] if str(item).strip()],
+        "notes": str(payload.get("notes", "")).strip()[:1200],
+    }
+
+
 def _parse_tex_action_plan(raw: str) -> dict:
     fallback = {
         "action": "solve",
@@ -1490,34 +1787,6 @@ def _parse_tex_action_plan(raw: str) -> dict:
     claim_focus = payload.get("claim_focus", [])
     if not isinstance(claim_focus, list):
         claim_focus = []
-    repo_writes = payload.get("repo_writes", [])
-    if not isinstance(repo_writes, list):
-        repo_writes = []
-    normalized_writes: list[dict] = []
-    for item in repo_writes[:10]:
-        if not isinstance(item, dict):
-            continue
-        op = str(item.get("op", "upsert")).strip().lower()
-        if op not in {"upsert", "delete"}:
-            op = "upsert"
-        slug = _normalize_tex_repo_slug(item.get("slug", ""))
-        if not slug:
-            continue
-        if op == "delete":
-            normalized_writes.append({"op": "delete", "slug": slug})
-            continue
-        kind = str(item.get("kind", "note")).strip().lower() or "note"
-        summary = str(item.get("summary", "")).strip()[:220]
-        content = str(item.get("content", "")).strip()[:12000]
-        normalized_writes.append(
-            {
-                "op": "upsert",
-                "slug": slug,
-                "kind": kind[:40],
-                "summary": summary or f"{slug} note",
-                "content": content,
-            }
-        )
     return {
         "action": action,
         "summary": str(payload.get("summary", "")).strip()[:600] or fallback["summary"],
@@ -1533,7 +1802,97 @@ def _parse_tex_action_plan(raw: str) -> dict:
             for item in claim_focus[:8]
             if str(item).strip()
         ],
-        "repo_writes": normalized_writes,
+        "repo_writes": _normalize_tex_repo_writes(payload.get("repo_writes", [])),
+    }
+
+
+def _parse_tex_episode(raw: str) -> dict:
+    fallback = {
+        "status": "continue",
+        "summary": "episode fallback",
+        "strategy": "",
+        "outline": [],
+        "key_lemmas": [],
+        "checks": [],
+        "whiteboard_note": "",
+        "repo_reads": [],
+        "repo_writes": [],
+        "claims": [],
+        "claim_drafts": [],
+        "proof_tex": "",
+        "open_questions": [],
+    }
+    if not raw.strip():
+        return fallback
+    text = raw.strip()
+    payload: dict | None = None
+    try:
+        parsed = json.loads(_extract_json(text))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = None
+    if payload is None:
+        return {
+            **fallback,
+            "summary": "unparsed episode response",
+            "proof_tex": _extract_tex_document(text),
+        }
+
+    status = str(payload.get("status", "continue")).strip().lower()
+    if status not in {"continue", "compose", "give_up"}:
+        status = "continue"
+    repo_reads = payload.get("repo_reads", [])
+    if not isinstance(repo_reads, list):
+        repo_reads = []
+    outline = payload.get("outline", [])
+    key_lemmas = payload.get("key_lemmas", [])
+    checks = payload.get("checks", [])
+    if not isinstance(outline, list):
+        outline = []
+    if not isinstance(key_lemmas, list):
+        key_lemmas = []
+    if not isinstance(checks, list):
+        checks = []
+    claim_drafts = _normalize_tex_episode_claim_drafts(payload.get("claim_drafts", []))
+    claims = _normalize_tex_claims(payload.get("claims", []), outline)
+    if (not claims or (len(claims) == 1 and claims[0].get("id") == "C1" and not payload.get("claims"))) and claim_drafts:
+        claims = _normalize_tex_claims(
+            [
+                {
+                    "id": item.get("claim_id", ""),
+                    "goal": item.get("goal", ""),
+                    "depends_on": item.get("depends_on", []),
+                    "assumptions": item.get("assumptions", []),
+                    "required_facts": item.get("required_facts", []),
+                    "acceptance_checks": item.get("acceptance_checks", []),
+                }
+                for item in claim_drafts
+                if str(item.get("goal", "")).strip()
+            ],
+            outline,
+        )
+    open_questions = payload.get("open_questions", [])
+    if not isinstance(open_questions, list):
+        open_questions = []
+    return {
+        "status": status,
+        "summary": str(payload.get("summary", "")).strip()[:600] or fallback["summary"],
+        "strategy": str(payload.get("strategy", "")).strip()[:400],
+        "outline": [str(item).strip()[:300] for item in outline[:12] if str(item).strip()],
+        "key_lemmas": [str(item).strip()[:200] for item in key_lemmas[:12] if str(item).strip()],
+        "checks": [str(item).strip()[:200] for item in checks[:12] if str(item).strip()],
+        "whiteboard_note": str(payload.get("whiteboard_note", "")).strip()[:1200],
+        "repo_reads": [
+            slug
+            for slug in (_normalize_tex_repo_slug(item) for item in repo_reads[:8])
+            if slug
+        ],
+        "repo_writes": _normalize_tex_repo_writes(payload.get("repo_writes", [])),
+        "claims": claims[:5],
+        "claim_drafts": claim_drafts[:8],
+        "proof_tex": _extract_tex_document(str(payload.get("proof_tex", ""))),
+        "open_questions": [str(item).strip()[:300] for item in open_questions[:8] if str(item).strip()],
     }
 
 
